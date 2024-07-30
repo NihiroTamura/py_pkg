@@ -22,6 +22,7 @@ setup(
         'console_scripts': [
             'pid_pub=py_pkg.pid_pub:main',
             'pid_sub=py_pkg.pid_sub:main',
+            'pot_desired_pub=py_pkg.pot_desired_pub:main',
         ],
     },
 )
