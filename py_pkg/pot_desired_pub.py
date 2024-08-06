@@ -6,7 +6,7 @@ class UInt16MultiArrayPublisher(Node):
     def __init__(self):
         super().__init__('u_int16_multi_array_publisher')
         self.publisher_ = self.create_publisher(UInt16MultiArray, '/POT/desired', 10)
-        timer_period = 1.0  # 秒
+        timer_period = 0.5  # 秒
         self.timer = self.create_timer(timer_period, self.publish_message)
 
     def publish_message(self):
@@ -21,7 +21,7 @@ class UInt16MultiArrayPublisher(Node):
         msg.layout.data_offset = 0
         
         # データ設定
-        msg.data = [1, 12, 345, 40, 76, 765, 321, 400, 11, 976, 450, 32]
+        msg.data = [0, 400, 400, 400, 400, 400, 400, 400, 0, 0, 0, 0]
         
         # メッセージ送信
         self.publisher_.publish(msg)
