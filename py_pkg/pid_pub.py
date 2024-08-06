@@ -37,7 +37,7 @@ class PIDControllerNode(Node):
         self.integral = [0.0] * 8
 
         # タイマーを設定して一定間隔でcalculate_and_publishを実行
-        self.timer_period = 0.1  # 秒
+        self.timer_period = 0.5  # 秒
         self.timer = self.create_timer(self.timer_period, self.calculate_and_publish)  # Nodeのメソッド
 
     def realized_callback(self, msg):
@@ -53,7 +53,7 @@ class PIDControllerNode(Node):
         realized_data = self.realized_queue[-1]
         desired_data = self.desired_queue[-1]
 
-        current_errors = [(realized_data[i] - desired_data[i]) for i in range(1, 8)]
+        current_errors = [(desired_data[i] - realized_data[i]) for i in range(1, 8)]
         pid_outputs = []
 
         for i, error in enumerate(current_errors):

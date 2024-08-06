@@ -5,7 +5,7 @@ from std_msgs.msg import UInt16MultiArray, MultiArrayDimension, MultiArrayLayout
 class UInt16MultiArrayPublisher(Node):
     def __init__(self):
         super().__init__('U_int16_multi_array_publisher')
-        self.publisher_ = self.create_publisher(UInt16MultiArray, '/POT/desired', 10)
+        self.publisher_ = self.create_publisher(UInt16MultiArray, '/POT/realized', 10)
         timer_period = 0.5  # 秒
         self.timer = self.create_timer(timer_period, self.publish_message)
 
@@ -21,7 +21,7 @@ class UInt16MultiArrayPublisher(Node):
         msg.layout.data_offset = 0
         
         # データ設定
-        msg.data = [0, 400, 400, 400, 400, 400, 400, 400, 0, 0, 0, 0]
+        msg.data = [0, 200, 200, 200, 200, 200, 200, 200, 0, 0, 0, 0]
         
         # メッセージ送信
         self.publisher_.publish(msg)

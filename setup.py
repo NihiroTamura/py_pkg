@@ -23,6 +23,7 @@ setup(
             'pid_pub=py_pkg.pid_pub:main',
             'pid_sub=py_pkg.pid_sub:main',
             'pot_desired_pub=py_pkg.pot_desired_pub:main',
+            'pot_realized_pub_test=py_pkg.pot_realized_pub_test:main',
         ],
     },
 )
