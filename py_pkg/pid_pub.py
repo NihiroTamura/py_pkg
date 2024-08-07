@@ -7,55 +7,67 @@ class PIDControllerNode(Node):
     def __init__(self):
         super().__init__('pid_controller')
 
-        # 各エラーチャネルごとにデフォルトのPIDゲインを設定
+        ## 各エラーチャネルごとにデフォルトのPIDゲインを設定
         self.kp = self.declare_parameter('kp', [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]).value
         self.ki = self.declare_parameter('ki', [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).value
         self.kd = self.declare_parameter('kd', [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).value
 
-        # サブスクリプション
+        ## サブスクリプション
+        # ポテンショメータの実現値を読み込む
         self.realized_subscription = self.create_subscription(
             UInt16MultiArray,
             '/POT/realized',
             self.realized_callback,
             10)
         
+        # ポテンショメータの目標値を読み込む
         self.desired_subscription = self.create_subscription(
             UInt16MultiArray,
             '/POT/desired',
             self.desired_callback,
             10)
-        
-        self.publisher1 = self.create_publisher(UInt16MultiArray, '/VEAB1/desired', 10)
-        self.publisher2 = self.create_publisher(UInt16MultiArray, '/VEAB2/desired', 10)
 
-        # データを保存するキュー
+        # ポテンショメータのデータ(実現値と目標値)を保存するキューを設定
         self.realized_queue = deque(maxlen=10)
         self.desired_queue = deque(maxlen=10)
 
-        # 各要素に対する前回のエラーと積分値
+        ## 各要素(自由度)に対する前回の誤差と誤差の積分値
         self.previous_errors = [0.0] * 8
         self.integral = [0.0] * 8
 
-        # タイマーを設定して一定間隔でcalculate_and_publishを実行
+        ## パブリッシャー作成
+        self.publisher1 = self.create_publisher(UInt16MultiArray, '/VEAB1/desired', 10)
+        self.publisher2 = self.create_publisher(UInt16MultiArray, '/VEAB2/desired', 10)
+
+        ## タイマーを設定して一定間隔でcalculate_and_publishを実行
         self.timer_period = 0.5  # 秒
         self.timer = self.create_timer(self.timer_period, self.calculate_and_publish)  # Nodeのメソッド
 
+    ## 時系列のポテンショメータの値をキューに追加
+    # 実現値をキューに追加
     def realized_callback(self, msg):
         self.realized_queue.append(msg.data)
 
+    # 実現値をキューに追加
     def desired_callback(self, msg):
         self.desired_queue.append(msg.data)
 
+    ## calculate_and_publish (VEAB1とVEAB2に送る圧力のPWMの値を計算しパブリッシュ)
     def calculate_and_publish(self):
         if not self.realized_queue or not self.desired_queue:
             return
 
+        # 最新のポテンショメータのキューに入っている値を取り出す
         realized_data = self.realized_queue[-1]
         desired_data = self.desired_queue[-1]
 
+        # 誤差を計算
         current_errors = [(desired_data[i] - realized_data[i]) for i in range(1, 8)]
+
+        # VEAB1とVEAB2に与える圧力差の初期化
         pid_outputs = []
 
+        # VEAB1とVEAB2に与える圧力差の計算
         for i, error in enumerate(current_errors):
             self.integral[i] += error
             derivative = error - self.previous_errors[i]
@@ -65,29 +77,41 @@ class PIDControllerNode(Node):
                           self.kd[i] * derivative)
 
             pid_outputs.append(pid_output)
+
+            # 計算に用いた誤差を前回の誤差に変更(次の誤差計算用)
             self.previous_errors[i] = error
 
+        # VEAB1とVEAB2に与えるPWMの値の初期化
         veab1_values = []
         veab2_values = []
 
+        # VEAB1とVEAB2に与えるPWMの値を計算し格納
         for i, val in enumerate(pid_outputs):
             if i < 6:
                 veab1_values.extend(self.calculate_veab_values(val))
             else:
                 veab2_values.extend(self.calculate_veab_values(val))
 
+        # publish_values関数を用いてVEAB1とVEAB2に与えるPWMの値をパブリッシュする
         self.publish_values(self.publisher1, veab1_values)
         self.publish_values(self.publisher2, veab2_values)
 
+    # VEAB1とVEAB2に与えるPWMの値を計算
     def calculate_veab_values(self, difference):
+        # 両ポートの圧力の平均を定義
         average = 128.0
+
+        # PWMの値を計算
         veab1 = average + difference / 2
         veab2 = average - difference / 2
-        # 値をクリップし、整数型にキャスト
+
+        # 値をクリップし、整数型に変換
         veab1 = max(0, min(65535, int(veab1)))
         veab2 = max(0, min(65535, int(veab2)))
+
         return [veab1, veab2]
 
+    # publish_values関数
     def publish_values(self, publisher, data):
         msg = UInt16MultiArray()
         msg.layout = MultiArrayLayout()

@@ -21,7 +21,7 @@ class UInt16MultiArrayPublisher(Node):
         msg.layout.data_offset = 0
         
         # データ設定
-        msg.data = [0, 400, 400, 400, 400, 400, 400, 400, 0, 0, 0, 0]
+        msg.data = [0, 800, 700, 600, 500, 400, 300, 200, 0, 0, 0, 0]
         
         # メッセージ送信
         self.publisher_.publish(msg)
