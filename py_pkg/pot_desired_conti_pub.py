@@ -1,13 +1,16 @@
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import UInt16MultiArray, MultiArrayDimension, MultiArrayLayout
+import numpy as np
 
 class UInt16MultiArrayPublisher(Node):
     def __init__(self):
-        super().__init__('U_int16_multi_array_publisher')
+        super().__init__('u_int16_multi_array_publisher')
         self.publisher_ = self.create_publisher(UInt16MultiArray, '/POT/desired', 10)
         timer_period = 0.0125  # 秒
         self.timer = self.create_timer(timer_period, self.publish_message)
+        self.increment = True
+        self.value = 200  # 初期値
 
     def publish_message(self):
         msg = UInt16MultiArray()
@@ -20,10 +23,33 @@ class UInt16MultiArrayPublisher(Node):
         msg.layout.dim = [dim]
         msg.layout.data_offset = 0
         
-        # データ設定
-        msg.data = [0, 450, 80, 600, 600, 900, 880, 300, 0, 0, 0, 0]
-        #ポテンショメータの値の範囲
-        #[0, 腕の閉223-482開, 腕の下344-619上, 上腕の旋回内95-605外, 肘の伸144-740曲, 前腕の旋回内111-962外, 小指側縮62-895伸, 親指側縮0-740伸, 0, 0, 0, 0]
+        # データ設定（連続的に変化させる）
+        base_data = [0, 800, 700, 600, 500, 400, 300, 200, 0, 0, 0, 0]
+        msg_data = []
+
+        # 値の増加・減少の管理
+        if self.increment:
+            self.value += 10
+            if self.value >= 600:
+                self.increment = False
+        else:
+            self.value -= 10
+            if self.value <= 300:
+                self.increment = True
+
+        # msg.dataの更新
+        for i in range(len(base_data)):
+            if i == 0:
+                msg_data.append(self.value)
+            elif base_data[i] != 0:
+                if self.increment:
+                    msg_data.append(min(base_data[i] + (self.value - 200), 600))
+                else:
+                    msg_data.append(max(base_data[i] - (800 - self.value), 300))
+            else:
+                msg_data.append(0)
+
+        msg.data = msg_data
         
         # メッセージ送信
         self.publisher_.publish(msg)

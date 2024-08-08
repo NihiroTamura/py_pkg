@@ -6,7 +6,7 @@ class UInt16MultiArrayPublisher(Node):
     def __init__(self):
         super().__init__('U_int16_multi_array_publisher')
         self.publisher_ = self.create_publisher(UInt16MultiArray, '/POT/realized', 10)
-        timer_period = 0.5  # 秒
+        timer_period = 0.0125  # 秒
         self.timer = self.create_timer(timer_period, self.publish_message)
 
     def publish_message(self):

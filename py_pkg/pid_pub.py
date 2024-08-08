@@ -8,7 +8,7 @@ class PIDControllerNode(Node):
         super().__init__('pid_controller')
 
         ## 各自由度ごとにデフォルトのPIDゲインを設定
-        self.kp = self.declare_parameter('kp', [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]).value
+        self.kp = self.declare_parameter('kp', [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.3]).value
         self.ki = self.declare_parameter('ki', [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).value
         self.kd = self.declare_parameter('kd', [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).value
 
@@ -43,7 +43,7 @@ class PIDControllerNode(Node):
         self.publisher2 = self.create_publisher(UInt16MultiArray, '/VEAB2/desired', 10)
 
         ## タイマーを設定して一定間隔でcalculate_and_publishを実行
-        self.timer_period = 0.03  # 秒(1/0.03=33.3333 Hz)
+        self.timer_period = 0.0125  # 秒(1/0.0125=80 Hz)
         self.timer = self.create_timer(self.timer_period, self.calculate_and_publish)  # Nodeのメソッド
 
     ## 時系列のポテンショメータの値をキューに追加
