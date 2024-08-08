@@ -7,11 +7,14 @@ class PIDControllerNode(Node):
     def __init__(self):
         super().__init__('pid_controller')
 
-        ## 各エラーチャネルごとにデフォルトのPIDゲインを設定
-        self.kp = self.declare_parameter('kp', [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]).value
-        self.ki = self.declare_parameter('ki', [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).value
-        self.kd = self.declare_parameter('kd', [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).value
+        ## 各自由度ごとにデフォルトのPIDゲインを設定
+        self.kp = self.declare_parameter('kp', [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]).value
+        self.ki = self.declare_parameter('ki', [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).value
+        self.kd = self.declare_parameter('kd', [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).value
 
+        ## 各自由度ごとの圧力の正方向とポテンショメータの正方向の対応を整理
+        self.sine = self.declare_parameter('sine', [-1.0, -1.0, 1.0, -1.0, -1.0, -1.0, -1.0]).value
+        
         ## サブスクリプション
         # ポテンショメータの実現値を読み込む
         self.realized_subscription = self.create_subscription(
@@ -40,7 +43,7 @@ class PIDControllerNode(Node):
         self.publisher2 = self.create_publisher(UInt16MultiArray, '/VEAB2/desired', 10)
 
         ## タイマーを設定して一定間隔でcalculate_and_publishを実行
-        self.timer_period = 0.5  # 秒
+        self.timer_period = 0.03  # 秒(1/0.03=33.3333 Hz)
         self.timer = self.create_timer(self.timer_period, self.calculate_and_publish)  # Nodeのメソッド
 
     ## 時系列のポテンショメータの値をキューに追加
@@ -75,6 +78,8 @@ class PIDControllerNode(Node):
             pid_output = (self.kp[i] * error +
                           self.ki[i] * self.integral[i] +
                           self.kd[i] * derivative)
+            
+            pid_output = self.sine[i] * pid_output
 
             pid_outputs.append(pid_output)
 
@@ -102,12 +107,12 @@ class PIDControllerNode(Node):
         average = 128.0
 
         # PWMの値を計算
-        veab1 = average + difference / 2
-        veab2 = average - difference / 2
+        veab1 = average + (difference / 2.0)
+        veab2 = average - (difference / 2.0)
 
         # 値をクリップし、整数型に変換
-        veab1 = max(0, min(65535, int(veab1)))
-        veab2 = max(0, min(65535, int(veab2)))
+        veab1 = max(0, min(255, int(veab1)))
+        veab2 = max(0, min(255, int(veab2)))
 
         return [veab1, veab2]
 
