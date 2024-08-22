@@ -8,9 +8,12 @@ class PIDControllerNode(Node):
         super().__init__('pid_controller')
 
         ## 各自由度ごとにデフォルトのPIDゲインを設定
-        self.kp = self.declare_parameter('kp', [0.15, 0.3, 0.25, 0.005, 0.25, 0.1, 0.1]).value
-        self.ki = self.declare_parameter('ki', [0.0005, 0.004, 0.0003, 0.0003, 0.0, 0.0, 0.001]).value
-        self.kd = self.declare_parameter('kd', [0.1, 0.2, 0.1, 0.1, 0.1, 0.1, 0.1]).value
+        self.kp = self.declare_parameter('kp', [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]).value
+        self.ki = self.declare_parameter('ki', [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).value
+        self.kd = self.declare_parameter('kd', [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).value
+        #self.kp = self.declare_parameter('kp', [0.15, 0.3, 0.25, 0.005, 0.25, 0.1, 0.1]).value
+        #self.ki = self.declare_parameter('ki', [0.0005, 0.004, 0.0003, 0.0003, 0.0, 0.0, 0.001]).value
+        #self.kd = self.declare_parameter('kd', [0.1, 0.2, 0.1, 0.1, 0.1, 0.1, 0.1]).value
 
         ## 各自由度ごとの圧力の正方向とポテンショメータの正方向の対応を整理
         self.sine = self.declare_parameter('sine', [-1.0, -1.0, 1.0, -1.0, -1.0, -1.0, -1.0]).value
@@ -43,7 +46,7 @@ class PIDControllerNode(Node):
         self.publisher2 = self.create_publisher(UInt16MultiArray, '/VEAB2/desired', 10)
 
         ## タイマーを設定して一定間隔でcalculate_and_publishを実行
-        self.timer_period = 0.0125  # 秒(1/0.0125=80 Hz)
+        self.timer_period = 1#0.0125  # 秒(1/0.0125=80 Hz)
         self.timer = self.create_timer(self.timer_period, self.calculate_and_publish)  # Nodeのメソッド
 
     ## 時系列のポテンショメータの値をキューに追加
@@ -51,7 +54,7 @@ class PIDControllerNode(Node):
     def realized_callback(self, msg):
         self.realized_queue.append(msg.data)
 
-    # 実現値をキューに追加
+    # 目標値をキューに追加
     def desired_callback(self, msg):
         self.desired_queue.append(msg.data)
 
