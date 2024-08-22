@@ -2,6 +2,21 @@ import rclpy
 from rclpy.node import Node
 from std_msgs.msg import UInt16MultiArray, MultiArrayLayout, MultiArrayDimension
 from collections import deque
+import numpy as np
+
+# ローパスフィルタ(移動平均法)関数
+def LPF_MAM(x, times, tau=0.01):
+    k = np.round(tau / (times[1] - times[0])).astype(int)
+    x_mean = np.zeros(x.shape)
+    N = x.shape[0]
+    for i in range(N):
+        if i - k // 2 < 0:
+            x_mean[i] = x[: i - k // 2 + k].mean()
+        elif i - k // 2 + k >= N:
+            x_mean[i] = x[i - k // 2 :].mean()
+        else:
+            x_mean[i] = x[i - k // 2 : i - k // 2 + k].mean()
+    return x_mean
 
 class PIDControllerNode(Node):
     def __init__(self):
@@ -45,6 +60,9 @@ class PIDControllerNode(Node):
         ## タイマーを設定して一定間隔でcalculate_and_publishを実行
         self.timer_period = 0.0125  # 秒 (1/0.0125=80 Hz)
         self.timer = self.create_timer(self.timer_period, self.calculate_and_publish)
+
+        ## タイマーの間隔からフィルタリングに使用する時間列を生成
+        self.times = np.arange(0, self.timer_period * 10, self.timer_period)  # 10回分の時間列
 
     ## 時系列のポテンショメータの値をキューに追加
     # 実現値をキューに追加
@@ -126,9 +144,17 @@ class PIDControllerNode(Node):
                 # 計算に用いた誤差を前回の誤差に変更(次の誤差計算用)
                 self.previous_errors[i] = error
 
+        # veab1_values と veab2_values にローパスフィルタを適用
+        filtered_veab1_values = LPF_MAM(np.array(veab1_values), self.times).astype(int)
+        filtered_veab2_values = LPF_MAM(np.array(veab2_values), self.times).astype(int)
+
+        # 各値を 0 から 65535 の範囲にクリップ
+        filtered_veab1_values = np.clip(filtered_veab1_values, 0, 65535).tolist()
+        filtered_veab2_values = np.clip(filtered_veab2_values, 0, 65535).tolist()
+
         # publish_values関数を用いてVEAB1とVEAB2に与えるPWMの値をパブリッシュする
-        self.publish_values(self.publisher1, veab1_values)
-        self.publish_values(self.publisher2, veab2_values)
+        self.publish_values(self.publisher1, filtered_veab1_values)
+        self.publish_values(self.publisher2, filtered_veab2_values)
 
     # VEAB1とVEAB2に与えるPWMの値を計算
     def calculate_veab_values(self, difference):
@@ -140,8 +166,8 @@ class PIDControllerNode(Node):
         veab2 = average - (difference / 2.0)
 
         # 値をクリップし、整数型に変換
-        veab1 = max(0, min(6000, int(veab1)))
-        veab2 = max(0, min(6000, int(veab2)))
+        veab1 = max(0, min(255, int(veab1)))
+        veab2 = max(0, min(255, int(veab2)))
 
         return [veab1, veab2]
 
@@ -163,11 +189,10 @@ def main(args=None):
     rclpy.init(args=args)
     #ノードの生成
     pid_controller = PIDControllerNode()
-    #ノード終了の待機
+    #ROSのスピン開始
     rclpy.spin(pid_controller)
-    #ノードの破棄
+    #ROSの終了処理
     pid_controller.destroy_node()
-    #ROS通信の終了
     rclpy.shutdown()
 
 if __name__ == '__main__':

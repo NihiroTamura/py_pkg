@@ -27,6 +27,7 @@ setup(
             'pot_desired_conti_pub=py_pkg.pot_desired_conti_pub:main',
             'pid_stop_pub=py_pkg.pid_stop_pub:main',
             'pot_realized_conti_pub_test=py_pkg.pot_realized_conti_pub_test:main',
+            'pid_stop_lpf_pub=py_pkg.pid_stop_lpf_pub:main',
         ],
     },
 )
