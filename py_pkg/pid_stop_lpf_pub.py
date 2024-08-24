@@ -5,18 +5,18 @@ from collections import deque
 import numpy as np
 
 # ローパスフィルタ(移動平均法)関数
-def LPF_MAM(x, times, tau=0.01):
-    k = np.round(tau / (times[1] - times[0])).astype(int)
-    x_mean = np.zeros(x.shape)
-    N = x.shape[0]
-    for i in range(N):
-        if i - k // 2 < 0:
-            x_mean[i] = x[: i - k // 2 + k].mean()
-        elif i - k // 2 + k >= N:
-            x_mean[i] = x[i - k // 2 :].mean()
-        else:
-            x_mean[i] = x[i - k // 2 : i - k // 2 + k].mean()
-    return x_mean
+def LPF_MAM(veab_values, previous_veab_values):
+    # 重み設定
+    a = 0.7
+
+    # ローパスフィルタ語の値を格納するリストを初期化
+    filtered_veab_values = [0] * len(veab_values)
+
+    # <１ステップ前のポートの値> × a + <今計算されたポートの値> × (1-a)
+    for i in range(len(veab_values)):
+        filtered_veab_values[i] = previous_veab_values[i] * a + veab_values[i]*(1-a)
+
+    return filtered_veab_values
 
 class PIDControllerNode(Node):
     def __init__(self):
@@ -49,6 +49,10 @@ class PIDControllerNode(Node):
         self.realized_queue = deque(maxlen=10)
         self.desired_queue = deque(maxlen=10)
 
+        ## veal1とveal2の値を保存するキューを設定
+        self.veal1_queue = deque(maxlen=10)
+        self.veal2_queue = deque(maxlen=10)
+
         ## 各要素(自由度)に対する前回の誤差と誤差の積分値
         self.previous_errors = [0.0] * 7
         self.integral = [0.0] * 7
@@ -60,9 +64,6 @@ class PIDControllerNode(Node):
         ## タイマーを設定して一定間隔でcalculate_and_publishを実行
         self.timer_period = 0.0125  # 秒 (1/0.0125=80 Hz)
         self.timer = self.create_timer(self.timer_period, self.calculate_and_publish)
-
-        ## タイマーの間隔からフィルタリングに使用する時間列を生成
-        self.times = np.arange(0, self.timer_period * 10, self.timer_period)  # 10回分の時間列
 
     ## 時系列のポテンショメータの値をキューに追加
     # 実現値をキューに追加
@@ -144,13 +145,17 @@ class PIDControllerNode(Node):
                 # 計算に用いた誤差を前回の誤差に変更(次の誤差計算用)
                 self.previous_errors[i] = error
 
-        # veab1_values と veab2_values にローパスフィルタを適用
-        filtered_veab1_values = LPF_MAM(np.array(veab1_values), self.times).astype(int)
-        filtered_veab2_values = LPF_MAM(np.array(veab2_values), self.times).astype(int)
+        ## veal1とveal2の値をキューに追加
+        self.veal1_queue.append(veab1_values)  
+        self.veal2_queue.append(veab2_values)       
 
-        # 各値を 0 から 65535 の範囲にクリップ
-        filtered_veab1_values = np.clip(filtered_veab1_values, 0, 65535).tolist()
-        filtered_veab2_values = np.clip(filtered_veab2_values, 0, 65535).tolist()
+        # 1ステップ前のveal1とveal2の値を取得
+        previous_veal1_values = self.veal1_queue[-2] if len(self.veal1_queue) > 1 else veab1_values
+        previous_veal2_values = self.veal2_queue[-2] if len(self.veal2_queue) > 1 else veab2_values  
+
+        # veab1_values と veab2_values にローパスフィルタを適用
+        filtered_veab1_values = [int(value) for value in LPF_MAM(veab1_values, previous_veal1_values)]
+        filtered_veab2_values = [int(value) for value in LPF_MAM(veab2_values, previous_veal2_values)]
 
         # publish_values関数を用いてVEAB1とVEAB2に与えるPWMの値をパブリッシュする
         self.publish_values(self.publisher1, filtered_veab1_values)
