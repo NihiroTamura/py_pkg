@@ -38,15 +38,15 @@ class PIDControllerNode(Node):
         self.desired_queue = deque(maxlen=10)
 
         ## 各要素(自由度)に対する前回の誤差と誤差の積分値
-        self.previous_errors = [0.0] * 8
-        self.integral = [0.0] * 8
+        self.previous_errors = [0.0] * 7
+        self.integral = [0.0] * 7
 
         ## パブリッシャー作成
         self.publisher1 = self.create_publisher(UInt16MultiArray, '/VEAB1/desired', 10)
         self.publisher2 = self.create_publisher(UInt16MultiArray, '/VEAB2/desired', 10)
 
         ## タイマーを設定して一定間隔でcalculate_and_publishを実行
-        self.timer_period = 1#0.0125  # 秒(1/0.0125=80 Hz)
+        self.timer_period = 0.0125  # 秒(1/0.0125=80 Hz)
         self.timer = self.create_timer(self.timer_period, self.calculate_and_publish)  # Nodeのメソッド
 
     ## 時系列のポテンショメータの値をキューに追加
