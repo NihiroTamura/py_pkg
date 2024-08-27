@@ -22,12 +22,14 @@ setup(
         'console_scripts': [
             'pid_pub=py_pkg.pid_pub:main',
             'pid_sub=py_pkg.pid_sub:main',
-            'pot_desired_pub=py_pkg.pot_desired_pub:main',
-            'pot_realized_pub_test=py_pkg.pot_realized_pub_test:main',
-            'pot_desired_conti_pub=py_pkg.pot_desired_conti_pub:main',
             'pid_stop_pub=py_pkg.pid_stop_pub:main',
-            'pot_realized_conti_pub_test=py_pkg.pot_realized_conti_pub_test:main',
             'pid_stop_lpf_pub=py_pkg.pid_stop_lpf_pub:main',
+            'pid_lpf_pub=py_pkg.pid_lpf_pub:main',
+            'pid_test=py_pkg.pid_test:main',
+            'pot_desired_pub=py_pkg.pot_desired_pub:main',
+            'pot_desired_conti_pub=py_pkg.pot_desired_conti_pub:main',
+            'pot_realized_conti_pub_test=py_pkg.pot_realized_conti_pub_test:main',
+            'pot_realized_pub_test=py_pkg.pot_realized_pub_test:main',
         ],
     },
 )
