@@ -7,7 +7,7 @@ import numpy as np
 # ローパスフィルタ(移動平均法)関数
 def LPF_MAM(veab_values, previous_veab_values):
     # 重み設定
-    a = 1.0
+    a = 0.0
 
     # ローパスフィルタ語の値を格納するリストを初期化
     filtered_veab_values = [0] * len(veab_values)
