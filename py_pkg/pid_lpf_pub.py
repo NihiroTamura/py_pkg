@@ -131,6 +131,10 @@ class PIDControllerNode(Node):
         filtered_veab1_values = [int(value) for value in LPF_MAM(veab1_values, previous_veal1_values)]
         filtered_veab2_values = [int(value) for value in LPF_MAM(veab2_values, previous_veal2_values)]
 
+        ## ローパスフィルタを適用したveal1とveal2の値をキューに追加
+        self.veal1_queue.append(filtered_veab1_values)  
+        self.veal2_queue.append(filtered_veab2_values)
+
         # publish_values関数を用いてVEAB1とVEAB2に与えるPWMの値をパブリッシュする
         self.publish_values(self.publisher1, filtered_veab1_values)
         self.publish_values(self.publisher2, filtered_veab2_values)
