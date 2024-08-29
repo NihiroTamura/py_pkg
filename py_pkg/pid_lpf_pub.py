@@ -23,12 +23,18 @@ class PIDControllerNode(Node):
         super().__init__('pid_controller')
 
         ## 各自由度ごとにデフォルトのPIDゲインを設定
+        #プログラム確認用
         #self.kp = self.declare_parameter('kp', [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]).value
         #self.ki = self.declare_parameter('ki', [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).value
         #self.kd = self.declare_parameter('kd', [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).value
-        self.kp = self.declare_parameter('kp', [0.15, 0.3, 0.25, 0.005, 0.25, 0.1, 0.1]).value
-        self.ki = self.declare_parameter('ki', [0.0005, 0.004, 0.0003, 0.0003, 0.0, 0.0, 0.001]).value
-        self.kd = self.declare_parameter('kd', [0.1, 0.2, 0.1, 0.1, 0.1, 0.1, 0.1]).value
+        #PIDゲインのみチューニング
+        #self.kp = self.declare_parameter('kp', [0.15, 0.3, 0.25, 0.005, 0.25, 0.1, 0.1]).value
+        #self.ki = self.declare_parameter('ki', [0.0005, 0.004, 0.0003, 0.0003, 0.0, 0.0, 0.001]).value
+        #self.kd = self.declare_parameter('kd', [0.1, 0.2, 0.1, 0.1, 0.1, 0.1, 0.1]).value
+        #ローパスフィルタ適用後(a=0.8)
+        self.kp = self.declare_parameter('kp', [0.4, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).value
+        self.ki = self.declare_parameter('ki', [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).value
+        self.kd = self.declare_parameter('kd', [0.8, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).value
 
         ## 各自由度ごとの圧力の正方向とポテンショメータの正方向の対応を整理
         self.sine = self.declare_parameter('sine', [-1.0, -1.0, 1.0, -1.0, -1.0, -1.0, -1.0]).value
@@ -97,6 +103,8 @@ class PIDControllerNode(Node):
             self.integral[i] += error
             derivative = error - self.previous_errors[i]
 
+            print(self.kp[i])
+
             pid_output = (self.kp[i] * error +
                           self.ki[i] * self.integral[i] +
                           self.kd[i] * derivative)
@@ -115,9 +123,9 @@ class PIDControllerNode(Node):
         # VEAB1とVEAB2に与えるPWMの値を計算し格納
         for i, val in enumerate(pid_outputs):
             if i < 6:
-                veab1_values.extend(self.calculate_veab_values(val))
+                veab1_values.extend(self.calculate_veab_values(val, i))
             else:
-                veab2_values.extend(self.calculate_veab_values(val))
+                veab2_values.extend(self.calculate_veab_values(val, i))
     
         ## veal1とveal2の値をキューに追加
         self.veal1_queue.append(veab1_values)  
@@ -140,19 +148,55 @@ class PIDControllerNode(Node):
         self.publish_values(self.publisher2, filtered_veab2_values)
 
     # VEAB1とVEAB2に与えるPWMの値を計算
-    def calculate_veab_values(self, difference):
-        # 両ポートの圧力の平均を定義
-        average = 128.0
-
-        # PWMの値を計算
-        veab1 = average + (difference / 2.0)
-        veab2 = average - (difference / 2.0)
-
+    def calculate_veab_values(self, difference, i):
+        if i == 0:
+            #腕の開閉
+            veab1 = 137 + (difference / 2.0)
+            veab2 = 119 - (difference / 2.0)
+        elif i == 1:
+            #腕の上下
+            veab1 = 159 + (difference / 2.0)
+            veab2 = 97 - (difference / 2.0)
+        elif i == 2:
+            #上腕の旋回
+            veab1 = 128 + (difference / 2.0)
+            veab2 = 128 - (difference / 2.0)
+        elif i == 3:
+            #肘の曲げ伸ばし
+            veab1 = 130 + (difference / 2.0)
+            veab2 = 126 - (difference / 2.0)
+        elif i == 4:
+            #前腕の旋回
+            veab1 = 128 + (difference / 2.0)
+            veab2 = 128 - (difference / 2.0)
+        elif i == 5:
+            #小指側伸縮
+            veab1 = 135 + (difference / 2.0)
+            veab2 = 121 - (difference / 2.0)
+        else:
+            #親指側伸縮
+            veab1 = 132 + (difference / 2.0)
+            veab2 = 124 - (difference / 2.0)
+        
         # 値をクリップし、整数型に変換
         veab1 = max(0, min(255, int(veab1)))
         veab2 = max(0, min(255, int(veab2)))
 
         return [veab1, veab2]
+
+    #def calculate_veab_values(self, difference):
+        # 両ポートの圧力の平均を定義
+        #average = 128.0
+
+        # PWMの値を計算
+        #veab1 = average + (difference / 2.0)
+        #veab2 = average - (difference / 2.0)
+
+        # 値をクリップし、整数型に変換
+        #veab1 = max(0, min(255, int(veab1)))
+        #veab2 = max(0, min(255, int(veab2)))
+
+        #return [veab1, veab2]
 
     # publish_values関数
     def publish_values(self, publisher, data):
