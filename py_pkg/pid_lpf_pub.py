@@ -51,9 +51,9 @@ class PIDControllerNode(Node):
         self.realized_queue = deque(maxlen=10)
         self.desired_queue = deque(maxlen=10)
 
-        ## veal1とveal2の値を保存するキューを設定
-        self.veal1_queue = deque(maxlen=10)
-        self.veal2_queue = deque(maxlen=10)
+        ## veab1とveab2の値を保存するキューを設定
+        self.veab1_queue = deque(maxlen=10)
+        self.veab2_queue = deque(maxlen=10)
 
         ## 各要素(自由度)に対する前回の誤差と誤差の積分値
         self.previous_errors = [0.0] * 7
@@ -125,11 +125,11 @@ class PIDControllerNode(Node):
             else:
                 veab2_values.extend(self.calculate_veab_values(val, i))
     
-        ## veal1とveal2の値をキューに追加
-        self.veal1_queue.append(veab1_values)  
-        self.veal2_queue.append(veab2_values)
+        ## veab1とveab2の値をキューに追加
+        self.veab1_queue.append(veab1_values)  
+        self.veab2_queue.append(veab2_values)
 
-        # 1ステップ前のveal1とveal2の値を取得
+        # 1ステップ前のveab1とveab2の値を取得
         previous_veal1_values = self.veal1_queue[-2] if len(self.veal1_queue) > 1 else veab1_values
         previous_veal2_values = self.veal2_queue[-2] if len(self.veal2_queue) > 1 else veab2_values
         
@@ -137,9 +137,9 @@ class PIDControllerNode(Node):
         filtered_veab1_values = [int(value) for value in LPF_MAM(veab1_values, previous_veal1_values)]
         filtered_veab2_values = [int(value) for value in LPF_MAM(veab2_values, previous_veal2_values)]
 
-        ## ローパスフィルタを適用したveal1とveal2の値をキューに追加
-        self.veal1_queue.append(filtered_veab1_values)  
-        self.veal2_queue.append(filtered_veab2_values)
+        ## ローパスフィルタを適用したveab1とveab2の値をキューに追加
+        self.veab1_queue.append(filtered_veab1_values)  
+        self.veab2_queue.append(filtered_veab2_values)
 
         # publish_values関数を用いてVEAB1とVEAB2に与えるPWMの値をパブリッシュする
         self.publish_values(self.publisher1, filtered_veab1_values)
@@ -181,7 +181,7 @@ class PIDControllerNode(Node):
         veab2 = max(0, min(255, int(veab2)))
 
         return [veab1, veab2]
-
+    
     # publish_values関数
     def publish_values(self, publisher, data):
         msg = UInt16MultiArray()
