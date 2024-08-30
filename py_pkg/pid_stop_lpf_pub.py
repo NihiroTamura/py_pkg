@@ -4,10 +4,10 @@ from std_msgs.msg import UInt16MultiArray, MultiArrayLayout, MultiArrayDimension
 from collections import deque
 import numpy as np
 
-# ローパスフィルタ(移動平均法)関数
+## ローパスフィルタ関数
 def LPF_MAM(veab_values, previous_veab_values):
     # 重み設定
-    a = 0.7
+    a = 0.8
 
     # ローパスフィルタ語の値を格納するリストを初期化
     filtered_veab_values = [0] * len(veab_values)
@@ -18,14 +18,19 @@ def LPF_MAM(veab_values, previous_veab_values):
 
     return filtered_veab_values
 
+### 以下のプログラムからスタート
 class PIDControllerNode(Node):
     def __init__(self):
         super().__init__('pid_controller')
 
         ## 各自由度ごとにデフォルトのPIDゲインを設定
-        self.kp = self.declare_parameter('kp', [0.15, 0.3, 0.25, 0.005, 0.25, 0.1, 0.1]).value
-        self.ki = self.declare_parameter('ki', [0.0005, 0.004, 0.0003, 0.0003, 0.0, 0.0, 0.001]).value
-        self.kd = self.declare_parameter('kd', [0.1, 0.2, 0.1, 0.1, 0.1, 0.1, 0.1]).value
+        #self.kp = self.declare_parameter('kp', [0.15, 0.3, 0.25, 0.005, 0.25, 0.1, 0.1]).value
+        #self.ki = self.declare_parameter('ki', [0.0005, 0.004, 0.0003, 0.0003, 0.0, 0.0, 0.001]).value
+        #self.kd = self.declare_parameter('kd', [0.1, 0.2, 0.1, 0.1, 0.1, 0.1, 0.1]).value
+        #ローパスフィルタ適用後(a=0.8)
+        self.kp = self.declare_parameter('kp', [0.32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).value
+        self.ki = self.declare_parameter('ki', [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).value
+        self.kd = self.declare_parameter('kd', [0.3, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).value
 
         ## 各自由度ごとの圧力の正方向とポテンショメータの正方向の対応を整理
         self.sine = self.declare_parameter('sine', [-1.0, -1.0, 1.0, -1.0, -1.0, -1.0, -1.0]).value
@@ -49,9 +54,9 @@ class PIDControllerNode(Node):
         self.realized_queue = deque(maxlen=10)
         self.desired_queue = deque(maxlen=10)
 
-        ## veal1とveal2の値を保存するキューを設定
-        self.veal1_queue = deque(maxlen=10)
-        self.veal2_queue = deque(maxlen=10)
+        ## veab1とveab2の値を保存するキューを設定
+        self.veab1_queue = deque(maxlen=10)
+        self.veab2_queue = deque(maxlen=10)
 
         ## 各要素(自由度)に対する前回の誤差と誤差の積分値
         self.previous_errors = [0.0] * 7
@@ -76,9 +81,9 @@ class PIDControllerNode(Node):
 
     ## 停止モードの条件を満たすか確認する関数
     def check_conditions(self, realized_value, previous_realized_value, desired_value):
-        error_margin = 30
+        error_margin = 70
         rate_of_change = abs(realized_value - previous_realized_value)
-        if abs(realized_value - desired_value) <= error_margin and rate_of_change >= 10:
+        if abs(realized_value - desired_value) <= error_margin and rate_of_change >= 5:
             return True
         return False
 
@@ -91,10 +96,10 @@ class PIDControllerNode(Node):
         realized_data = self.realized_queue[-1]
         desired_data = self.desired_queue[-1]
 
-        # 直前のポテンショメータの実測値を取得
+        # 直前のポテンショメータの実現値を取得
         previous_realized_data = self.realized_queue[-2] if len(self.realized_queue) > 1 else realized_data
 
-        # 誤差を計算
+        # 誤差を計算(目標値-実現値)
         current_errors = [(desired_data[i] - realized_data[i]) for i in range(1, 8)]
 
         # VEAB1とVEAB2に与える圧力差の初期化
@@ -106,7 +111,7 @@ class PIDControllerNode(Node):
 
         # 停止モードの値の設定
         conditions = [
-            (134, 122),
+            (137, 119),
             (159, 97),
             (128, 128),
             (130, 126),
@@ -127,16 +132,23 @@ class PIDControllerNode(Node):
             else:
                 # PID制御を行う(VEAB1とVEAB2に与える圧力差の計算)
                 error = current_errors[i]
+
+                #誤差の積分値計算
                 self.integral[i] += error
+
+                #誤差の微分値計算
                 derivative = error - self.previous_errors[i]
 
+                #PID制御計算
                 pid_output = (self.kp[i] * error +
                               self.ki[i] * self.integral[i] +
                               self.kd[i] * derivative)
-            
+
+                # 各自由度ごとの圧力の正方向とポテンショメータの正方向の対応を整理(32行目のself.sine[i])
                 pid_output = self.sine[i] * pid_output
 
-                veab_values = self.calculate_veab_values(pid_output)
+                # VEAB1とVEAB2に与えるPWMの値を計算し格納
+                veab_values = self.calculate_veab_values(pid_output, i)
                 if i < 6:
                     veab1_values.extend(veab_values)
                 else:
@@ -145,31 +157,57 @@ class PIDControllerNode(Node):
                 # 計算に用いた誤差を前回の誤差に変更(次の誤差計算用)
                 self.previous_errors[i] = error
 
-        ## veal1とveal2の値をキューに追加
-        self.veal1_queue.append(veab1_values)  
-        self.veal2_queue.append(veab2_values)       
+        ## veab1とveab2の値をキューに追加
+        self.veab1_queue.append(veab1_values)  
+        self.veab2_queue.append(veab2_values)      
 
-        # 1ステップ前のveal1とveal2の値を取得
-        previous_veal1_values = self.veal1_queue[-2] if len(self.veal1_queue) > 1 else veab1_values
-        previous_veal2_values = self.veal2_queue[-2] if len(self.veal2_queue) > 1 else veab2_values  
+        # 1ステップ前のveab1とveab2の値を取得
+        previous_veab1_values = self.veab1_queue[-2] if len(self.veab1_queue) > 1 else veab1_values
+        previous_veab2_values = self.veab2_queue[-2] if len(self.veab2_queue) > 1 else veab2_values  
 
         # veab1_values と veab2_values にローパスフィルタを適用
-        filtered_veab1_values = [int(value) for value in LPF_MAM(veab1_values, previous_veal1_values)]
-        filtered_veab2_values = [int(value) for value in LPF_MAM(veab2_values, previous_veal2_values)]
+        filtered_veab1_values = [int(value) for value in LPF_MAM(veab1_values, previous_veab1_values)]
+        filtered_veab2_values = [int(value) for value in LPF_MAM(veab2_values, previous_veab2_values)]
+
+        ## ローパスフィルタを適用したveab1とveab2の値をキューに追加
+        self.veab1_queue.append(filtered_veab1_values)  
+        self.veab2_queue.append(filtered_veab2_values)
 
         # publish_values関数を用いてVEAB1とVEAB2に与えるPWMの値をパブリッシュする
         self.publish_values(self.publisher1, filtered_veab1_values)
         self.publish_values(self.publisher2, filtered_veab2_values)
 
-    # VEAB1とVEAB2に与えるPWMの値を計算
-    def calculate_veab_values(self, difference):
-        # 両ポートの圧力の平均を定義
-        average = 128.0
-
-        # PWMの値を計算
-        veab1 = average + (difference / 2.0)
-        veab2 = average - (difference / 2.0)
-
+    # VEAB1とVEAB2に与えるPWMの値を計算(停止モードにおける両ポートの値を基準に足し引きを行う)
+    def calculate_veab_values(self, difference, i):
+        if i == 0:
+            #腕の開閉
+            veab1 = 137 + (difference / 2.0)
+            veab2 = 119 - (difference / 2.0)
+        elif i == 1:
+            #腕の上下
+            veab1 = 140 + (difference / 2.0)
+            veab2 = 116 - (difference / 2.0)
+        elif i == 2:
+            #上腕の旋回
+            veab1 = 128 + (difference / 2.0)
+            veab2 = 128 - (difference / 2.0)
+        elif i == 3:
+            #肘の曲げ伸ばし
+            veab1 = 130 + (difference / 2.0)
+            veab2 = 126 - (difference / 2.0)
+        elif i == 4:
+            #前腕の旋回
+            veab1 = 128 + (difference / 2.0)
+            veab2 = 128 - (difference / 2.0)
+        elif i == 5:
+            #小指側伸縮
+            veab1 = 135 + (difference / 2.0)
+            veab2 = 121 - (difference / 2.0)
+        else:
+            #親指側伸縮
+            veab1 = 132 + (difference / 2.0)
+            veab2 = 124 - (difference / 2.0)
+        
         # 値をクリップし、整数型に変換
         veab1 = max(0, min(255, int(veab1)))
         veab2 = max(0, min(255, int(veab2)))

@@ -25,9 +25,9 @@ class PIDControllerNode(Node):
 
         ## 各自由度ごとにデフォルトのPIDゲインを設定
         #ローパスフィルタ適用後(a=0.8)
-        self.kp = self.declare_parameter('kp', [0.4, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).value
+        self.kp = self.declare_parameter('kp', [0.32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).value
         self.ki = self.declare_parameter('ki', [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).value
-        self.kd = self.declare_parameter('kd', [0.8, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).value
+        self.kd = self.declare_parameter('kd', [0.3, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).value
 
         ## 各自由度ごとの圧力の正方向とポテンショメータの正方向の対応を整理
         self.sine = self.declare_parameter('sine', [-1.0, -1.0, 1.0, -1.0, -1.0, -1.0, -1.0]).value
@@ -87,7 +87,7 @@ class PIDControllerNode(Node):
         desired_data = self.desired_queue[-1]
 
         # 誤差を計算(目標値-実現値)
-        current_errors = [(desired_data[i] - realized_data[i]) for i in range(1, 8)] #ポテンショメータの実現値の配列のうち1番目から8番目までが各自由度に対応する
+        current_errors = [(desired_data[i] - realized_data[i]) for i in range(1, 8)] #ポテンショメータの実現値の配列のうち1番目から7番目までが各自由度に対応する
 
         # VEAB1とVEAB2に与える圧力差の初期化
         pid_outputs = []
@@ -153,8 +153,8 @@ class PIDControllerNode(Node):
             veab2 = 119 - (difference / 2.0)
         elif i == 1:
             #腕の上下
-            veab1 = 159 + (difference / 2.0)
-            veab2 = 97 - (difference / 2.0)
+            veab1 = 140 + (difference / 2.0)
+            veab2 = 116 - (difference / 2.0)
         elif i == 2:
             #上腕の旋回
             veab1 = 128 + (difference / 2.0)
@@ -180,7 +180,7 @@ class PIDControllerNode(Node):
         veab1 = max(0, min(255, int(veab1)))
         veab2 = max(0, min(255, int(veab2)))
 
-        return [veab1, veab2]
+        return [veab1, veab2]       
     
     # publish_values関数
     def publish_values(self, publisher, data):

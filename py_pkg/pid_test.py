@@ -25,10 +25,17 @@ class PIDControllerNode(Node):
 
         ## 各自由度ごとにデフォルトのPIDゲインを設定
         #プログラム確認用
+        #self.kp = self.declare_parameter('kp', [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]).value
+        #self.ki = self.declare_parameter('ki', [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).value
+        #self.kd = self.declare_parameter('kd', [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).value
+        #PIDゲインのみチューニング
+        #self.kp = self.declare_parameter('kp', [0.15, 0.3, 0.25, 0.005, 0.25, 0.1, 0.1]).value
+        #self.ki = self.declare_parameter('ki', [0.0005, 0.004, 0.0003, 0.0003, 0.0, 0.0, 0.001]).value
+        #self.kd = self.declare_parameter('kd', [0.1, 0.2, 0.1, 0.1, 0.1, 0.1, 0.1]).value
         #ローパスフィルタ適用後(a=0.8)
-        self.kp = self.declare_parameter('kp', [0.4, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).value
+        self.kp = self.declare_parameter('kp', [0.32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).value
         self.ki = self.declare_parameter('ki', [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).value
-        self.kd = self.declare_parameter('kd', [0.8, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).value
+        self.kd = self.declare_parameter('kd', [0.3, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).value
 
         ## 各自由度ごとの圧力の正方向とポテンショメータの正方向の対応を整理
         self.sine = self.declare_parameter('sine', [-1.0, -1.0, 1.0, -1.0, -1.0, -1.0, -1.0]).value
@@ -52,9 +59,9 @@ class PIDControllerNode(Node):
         self.realized_queue = deque(maxlen=10)
         self.desired_queue = deque(maxlen=10)
 
-        ## veal1とveal2の値を保存するキューを設定
-        self.veal1_queue = deque(maxlen=10)
-        self.veal2_queue = deque(maxlen=10)
+        ## veab1とveab2の値を保存するキューを設定
+        self.veab1_queue = deque(maxlen=10)
+        self.veab2_queue = deque(maxlen=10)
 
         ## 各要素(自由度)に対する前回の誤差と誤差の積分値
         self.previous_errors = [0.0] * 7
@@ -88,7 +95,14 @@ class PIDControllerNode(Node):
         desired_data = self.desired_queue[-1]
 
         # 誤差を計算(目標値-実現値)
-        current_errors = [(desired_data[i] - realized_data[i]) for i in range(1, 8)] #ポテンショメータの実現値の配列のうち1番目から8番目までが各自由度に対応する
+        current_errors = []
+        for i in range(1, 8): # ポテンショメータの実現値の配列のうち1番目から7番目までが各自由度に対応する
+            if i == 1:
+                error = (desired_data[i]+20) - realized_data[i]
+                current_errors.append(error)
+            else:
+                error = desired_data[i] - realized_data[i]
+                current_errors.append(error)
 
         # VEAB1とVEAB2に与える圧力差の初期化
         pid_outputs = []
@@ -126,21 +140,21 @@ class PIDControllerNode(Node):
             else:
                 veab2_values.extend(self.calculate_veab_values(val, i))
     
-        ## veal1とveal2の値をキューに追加
-        self.veal1_queue.append(veab1_values)  
-        self.veal2_queue.append(veab2_values)
+        ## veab1とveab2の値をキューに追加
+        self.veab1_queue.append(veab1_values)  
+        self.veab2_queue.append(veab2_values)
 
-        # 1ステップ前のveal1とveal2の値を取得
-        previous_veal1_values = self.veal1_queue[-2] if len(self.veal1_queue) > 1 else veab1_values
-        previous_veal2_values = self.veal2_queue[-2] if len(self.veal2_queue) > 1 else veab2_values
+        # 1ステップ前のveab1とveab2の値を取得
+        previous_veab1_values = self.veab1_queue[-2] if len(self.veab1_queue) > 1 else veab1_values
+        previous_veab2_values = self.veab2_queue[-2] if len(self.veab2_queue) > 1 else veab2_values
         
         # veab1_values と veab2_values にローパスフィルタを適用
-        filtered_veab1_values = [int(value) for value in LPF_MAM(veab1_values, previous_veal1_values)]
-        filtered_veab2_values = [int(value) for value in LPF_MAM(veab2_values, previous_veal2_values)]
+        filtered_veab1_values = [int(value) for value in LPF_MAM(veab1_values, previous_veab1_values)]
+        filtered_veab2_values = [int(value) for value in LPF_MAM(veab2_values, previous_veab2_values)]
 
-        ## ローパスフィルタを適用したveal1とveal2の値をキューに追加
-        self.veal1_queue.append(filtered_veab1_values)  
-        self.veal2_queue.append(filtered_veab2_values)
+        ## ローパスフィルタを適用したveab1とveab2の値をキューに追加
+        self.veab1_queue.append(filtered_veab1_values)  
+        self.veab2_queue.append(filtered_veab2_values)
 
         # publish_values関数を用いてVEAB1とVEAB2に与えるPWMの値をパブリッシュする
         self.publish_values(self.publisher1, filtered_veab1_values)
@@ -154,8 +168,8 @@ class PIDControllerNode(Node):
             veab2 = 119 - (difference / 2.0)
         elif i == 1:
             #腕の上下
-            veab1 = 159 + (difference / 2.0)
-            veab2 = 97 - (difference / 2.0)
+            veab1 = 140 + (difference / 2.0)
+            veab2 = 116 - (difference / 2.0)
         elif i == 2:
             #上腕の旋回
             veab1 = 128 + (difference / 2.0)
@@ -183,8 +197,7 @@ class PIDControllerNode(Node):
 
         return [veab1, veab2]
 
-
-    #def calculate_veab_values(self, difference):
+        #def calculate_veab_values(self, difference):
         # 両ポートの圧力の平均を定義
         #average = 128.0
 
