@@ -4,7 +4,7 @@ from std_msgs.msg import UInt16MultiArray, MultiArrayLayout, MultiArrayDimension
 from collections import deque
 import numpy as np
 
-# ローパスフィルタ(移動平均法)関数
+## ローパスフィルタ関数
 def LPF_MAM(veab_values, previous_veab_values):
     # 重み設定
     a = 0.8
@@ -18,19 +18,12 @@ def LPF_MAM(veab_values, previous_veab_values):
 
     return filtered_veab_values
 
+### 以下のプログラムからスタート
 class PIDControllerNode(Node):
     def __init__(self):
         super().__init__('pid_controller')
 
         ## 各自由度ごとにデフォルトのPIDゲインを設定
-        #プログラム確認用
-        #self.kp = self.declare_parameter('kp', [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]).value
-        #self.ki = self.declare_parameter('ki', [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).value
-        #self.kd = self.declare_parameter('kd', [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).value
-        #PIDゲインのみチューニング
-        #self.kp = self.declare_parameter('kp', [0.15, 0.3, 0.25, 0.005, 0.25, 0.1, 0.1]).value
-        #self.ki = self.declare_parameter('ki', [0.0005, 0.004, 0.0003, 0.0003, 0.0, 0.0, 0.001]).value
-        #self.kd = self.declare_parameter('kd', [0.1, 0.2, 0.1, 0.1, 0.1, 0.1, 0.1]).value
         #ローパスフィルタ適用後(a=0.8)
         self.kp = self.declare_parameter('kp', [0.4, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).value
         self.ki = self.declare_parameter('ki', [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).value
@@ -85,6 +78,7 @@ class PIDControllerNode(Node):
 
     ## calculate_and_publish (VEAB1とVEAB2に送る圧力のPWMの値を計算しパブリッシュ)
     def calculate_and_publish(self):
+        #実現値と目標値がパブリッシュされていなければ動かない
         if not self.realized_queue or not self.desired_queue:
             return
 
@@ -92,25 +86,29 @@ class PIDControllerNode(Node):
         realized_data = self.realized_queue[-1]
         desired_data = self.desired_queue[-1]
 
-        # 誤差を計算
-        current_errors = [(desired_data[i] - realized_data[i]) for i in range(1, 8)]
+        # 誤差を計算(目標値-実現値)
+        current_errors = [(desired_data[i] - realized_data[i]) for i in range(1, 8)] #ポテンショメータの実現値の配列のうち1番目から8番目までが各自由度に対応する
 
         # VEAB1とVEAB2に与える圧力差の初期化
         pid_outputs = []
 
         # VEAB1とVEAB2に与える圧力差の計算
         for i, error in enumerate(current_errors):
+            #誤差の積分値計算
             self.integral[i] += error
+
+            #誤差の微分値計算
             derivative = error - self.previous_errors[i]
 
-            print(self.kp[i])
-
+            #PID制御計算
             pid_output = (self.kp[i] * error +
                           self.ki[i] * self.integral[i] +
                           self.kd[i] * derivative)
             
+            # 各自由度ごとの圧力の正方向とポテンショメータの正方向の対応を整理(32行目のself.sine[i])
             pid_output = self.sine[i] * pid_output
 
+            # PID制御計算された値をVEAB1とVEAB2に与える圧力差の配列に追加
             pid_outputs.append(pid_output)
 
             # 計算に用いた誤差を前回の誤差に変更(次の誤差計算用)
@@ -147,7 +145,7 @@ class PIDControllerNode(Node):
         self.publish_values(self.publisher1, filtered_veab1_values)
         self.publish_values(self.publisher2, filtered_veab2_values)
 
-    # VEAB1とVEAB2に与えるPWMの値を計算
+    # VEAB1とVEAB2に与えるPWMの値を計算(停止モードにおける両ポートの値を基準に足し引きを行う)
     def calculate_veab_values(self, difference, i):
         if i == 0:
             #腕の開閉
@@ -183,20 +181,6 @@ class PIDControllerNode(Node):
         veab2 = max(0, min(255, int(veab2)))
 
         return [veab1, veab2]
-
-    #def calculate_veab_values(self, difference):
-        # 両ポートの圧力の平均を定義
-        #average = 128.0
-
-        # PWMの値を計算
-        #veab1 = average + (difference / 2.0)
-        #veab2 = average - (difference / 2.0)
-
-        # 値をクリップし、整数型に変換
-        #veab1 = max(0, min(255, int(veab1)))
-        #veab2 = max(0, min(255, int(veab2)))
-
-        #return [veab1, veab2]
 
     # publish_values関数
     def publish_values(self, publisher, data):
