@@ -130,12 +130,12 @@ class PIDControllerNode(Node):
         self.veab2_queue.append(veab2_values)
 
         # 1ステップ前のveab1とveab2の値を取得
-        previous_veal1_values = self.veal1_queue[-2] if len(self.veal1_queue) > 1 else veab1_values
-        previous_veal2_values = self.veal2_queue[-2] if len(self.veal2_queue) > 1 else veab2_values
+        previous_veab1_values = self.veab1_queue[-2] if len(self.veab1_queue) > 1 else veab1_values
+        previous_veab2_values = self.veab2_queue[-2] if len(self.veab2_queue) > 1 else veab2_values
         
         # veab1_values と veab2_values にローパスフィルタを適用
-        filtered_veab1_values = [int(value) for value in LPF_MAM(veab1_values, previous_veal1_values)]
-        filtered_veab2_values = [int(value) for value in LPF_MAM(veab2_values, previous_veal2_values)]
+        filtered_veab1_values = [int(value) for value in LPF_MAM(veab1_values, previous_veab1_values)]
+        filtered_veab2_values = [int(value) for value in LPF_MAM(veab2_values, previous_veab2_values)]
 
         ## ローパスフィルタを適用したveab1とveab2の値をキューに追加
         self.veab1_queue.append(filtered_veab1_values)  
