@@ -25,9 +25,9 @@ class PIDControllerNode(Node):
 
         ## 各自由度ごとにデフォルトのPIDゲインを設定
         #ローパスフィルタ適用後(a=0.8)
-        self.kp = self.declare_parameter('kp', [0.32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).value
+        self.kp = self.declare_parameter('kp', [0.32, 0.75, 0.3, 0.0, 0.35, 0.4, 0.3]).value
         self.ki = self.declare_parameter('ki', [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).value
-        self.kd = self.declare_parameter('kd', [0.3, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).value
+        self.kd = self.declare_parameter('kd', [0.3, 0.3, 0.3, 0.0, 0.1, 0.2, 0.1]).value
 
         ## 各自由度ごとの圧力の正方向とポテンショメータの正方向の対応を整理
         self.sine = self.declare_parameter('sine', [-1.0, -1.0, 1.0, -1.0, -1.0, -1.0, -1.0]).value
@@ -165,16 +165,16 @@ class PIDControllerNode(Node):
             veab2 = 126 - (difference / 2.0)
         elif i == 4:
             #前腕の旋回
-            veab1 = 128 + (difference / 2.0)
-            veab2 = 128 - (difference / 2.0)
+            veab1 = 132 + (difference / 2.0)
+            veab2 = 124 - (difference / 2.0)
         elif i == 5:
             #小指側伸縮
             veab1 = 135 + (difference / 2.0)
             veab2 = 121 - (difference / 2.0)
         else:
             #親指側伸縮
-            veab1 = 132 + (difference / 2.0)
-            veab2 = 124 - (difference / 2.0)
+            veab1 = 130 + (difference / 2.0)
+            veab2 = 126 - (difference / 2.0)
         
         # 値をクリップし、整数型に変換
         veab1 = max(0, min(255, int(veab1)))
