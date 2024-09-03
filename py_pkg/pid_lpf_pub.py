@@ -24,10 +24,14 @@ class PIDControllerNode(Node):
         super().__init__('pid_controller')
 
         ## 各自由度ごとにデフォルトのPIDゲインを設定
-        #ローパスフィルタ適用後(a=0.8)
-        self.kp = self.declare_parameter('kp', [0.32, 0.75, 0.3, 0.0, 0.35, 0.4, 0.3]).value
+        #ゲインチューニング用
+        self.kp = self.declare_parameter('kp', [0.0, 0.0, 0.0, 0.02, 0.0, 0.0, 0.0]).value
         self.ki = self.declare_parameter('ki', [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).value
-        self.kd = self.declare_parameter('kd', [0.3, 0.3, 0.3, 0.0, 0.1, 0.2, 0.1]).value
+        self.kd = self.declare_parameter('kd', [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).value
+        #ローパスフィルタ適用後(a=0.8)
+        #self.kp = self.declare_parameter('kp', [0.32, 0.75, 0.3, 0.0, 0.35, 0.4, 0.3]).value
+        #self.ki = self.declare_parameter('ki', [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).value
+        #self.kd = self.declare_parameter('kd', [0.3, 0.3, 0.3, 0.0, 0.1, 0.2, 0.1]).value
 
         ## 各自由度ごとの圧力の正方向とポテンショメータの正方向の対応を整理
         self.sine = self.declare_parameter('sine', [-1.0, -1.0, 1.0, -1.0, -1.0, -1.0, -1.0]).value

@@ -33,9 +33,9 @@ class PIDControllerNode(Node):
         #self.ki = self.declare_parameter('ki', [0.0005, 0.004, 0.0003, 0.0003, 0.0, 0.0, 0.001]).value
         #self.kd = self.declare_parameter('kd', [0.1, 0.2, 0.1, 0.1, 0.1, 0.1, 0.1]).value
         #ローパスフィルタ適用後(a=0.8)
-        self.kp = self.declare_parameter('kp', [0.32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).value
+        self.kp = self.declare_parameter('kp', [0.0, 0.0, 0.0, 0.02, 0.0, 0.0, 0.0]).value
         self.ki = self.declare_parameter('ki', [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).value
-        self.kd = self.declare_parameter('kd', [0.3, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).value
+        self.kd = self.declare_parameter('kd', [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).value
 
         ## 各自由度ごとの圧力の正方向とポテンショメータの正方向の対応を整理
         self.sine = self.declare_parameter('sine', [-1.0, -1.0, 1.0, -1.0, -1.0, -1.0, -1.0]).value
@@ -94,15 +94,8 @@ class PIDControllerNode(Node):
         realized_data = self.realized_queue[-1]
         desired_data = self.desired_queue[-1]
 
-        # 誤差を計算(目標値-実現値)
-        current_errors = []
-        for i in range(1, 8): # ポテンショメータの実現値の配列のうち1番目から7番目までが各自由度に対応する
-            if i == 1:
-                error = (desired_data[i]+20) - realized_data[i]
-                current_errors.append(error)
-            else:
-                error = desired_data[i] - realized_data[i]
-                current_errors.append(error)
+         # 誤差を計算(目標値-実現値)
+        current_errors = [(desired_data[i] - realized_data[i]) for i in range(1, 8)] #ポテンショメータの実現値の配列のうち1番目から7番目までが各自由度に対応する
 
         # VEAB1とVEAB2に与える圧力差の初期化
         pid_outputs = []
@@ -136,9 +129,9 @@ class PIDControllerNode(Node):
         # VEAB1とVEAB2に与えるPWMの値を計算し格納
         for i, val in enumerate(pid_outputs):
             if i < 6:
-                veab1_values.extend(self.calculate_veab_values(val, i))
+                veab1_values.extend(self.calculate_veab_values(val, i, realized_data))
             else:
-                veab2_values.extend(self.calculate_veab_values(val, i))
+                veab2_values.extend(self.calculate_veab_values(val, i, realized_data))
     
         ## veab1とveab2の値をキューに追加
         self.veab1_queue.append(veab1_values)  
@@ -161,7 +154,7 @@ class PIDControllerNode(Node):
         self.publish_values(self.publisher2, filtered_veab2_values)
 
     # VEAB1とVEAB2に与えるPWMの値を計算(停止モードにおける両ポートの値を基準に足し引きを行う)
-    def calculate_veab_values(self, difference, i):
+    def calculate_veab_values(self, difference, i, realized_data):
         if i == 0:
             #腕の開閉
             veab1 = 137 + (difference / 2.0)
@@ -176,20 +169,31 @@ class PIDControllerNode(Node):
             veab2 = 128 - (difference / 2.0)
         elif i == 3:
             #肘の曲げ伸ばし
+
+            # 重力補償
+            #上腕の角度を計算
+            current_angle = np.deg2rad((realized_data[i] - 94)/ 510 * 90)
+
+            #重力補償の追加
+            gravity_compensation = -1 * 12 * np.sin(current_angle)
+
+            # differenceに重力補償を加える
+            difference = difference + gravity_compensation
+
             veab1 = 130 + (difference / 2.0)
             veab2 = 126 - (difference / 2.0)
         elif i == 4:
             #前腕の旋回
-            veab1 = 128 + (difference / 2.0)
-            veab2 = 128 - (difference / 2.0)
+            veab1 = 132 + (difference / 2.0)
+            veab2 = 124 - (difference / 2.0)
         elif i == 5:
             #小指側伸縮
             veab1 = 135 + (difference / 2.0)
             veab2 = 121 - (difference / 2.0)
         else:
             #親指側伸縮
-            veab1 = 132 + (difference / 2.0)
-            veab2 = 124 - (difference / 2.0)
+            veab1 = 130 + (difference / 2.0)
+            veab2 = 126 - (difference / 2.0)
         
         # 値をクリップし、整数型に変換
         veab1 = max(0, min(255, int(veab1)))
