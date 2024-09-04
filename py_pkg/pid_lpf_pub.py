@@ -25,7 +25,7 @@ class PIDControllerNode(Node):
 
         ## 各自由度ごとにデフォルトのPIDゲインを設定
         #ゲインチューニング用
-        self.kp = self.declare_parameter('kp', [0.0, 0.0, 0.0, 0.02, 0.0, 0.0, 0.0]).value
+        self.kp = self.declare_parameter('kp', [0.0, 0.0, 0.0, 0.3, 0.0, 0.0, 0.0]).value
         self.ki = self.declare_parameter('ki', [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).value
         self.kd = self.declare_parameter('kd', [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).value
         #ローパスフィルタ適用後(a=0.8)
