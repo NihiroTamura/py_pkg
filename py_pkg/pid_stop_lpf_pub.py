@@ -24,18 +24,18 @@ class PIDControllerNode(Node):
         super().__init__('pid_controller')
 
         ## 各自由度ごとにデフォルトのPIDゲインを設定
-        #PIDゲインのみチューニング
-        self.kp = self.declare_parameter('kp', [0.15, 0.3, 0.25, 0.005, 0.25, 0.1, 0.1]).value
-        self.ki = self.declare_parameter('ki', [0.0005, 0.004, 0.0003, 0.0003, 0.0, 0.0, 0.001]).value
-        self.kd = self.declare_parameter('kd', [0.1, 0.2, 0.1, 0.1, 0.1, 0.1, 0.1]).value
+        #ゲインチューニング用
+        #self.kp = self.declare_parameter('kp', [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.65]).value
+        #self.ki = self.declare_parameter('ki', [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).value
+        #self.kd = self.declare_parameter('kd', [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).value
         #ローパスフィルタ適用後(a=0.8)
         #self.kp = self.declare_parameter('kp', [0.32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).value
         #self.ki = self.declare_parameter('ki', [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).value
         #self.kd = self.declare_parameter('kd', [0.3, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).value
-        #ローパスフィルタ適用＆PWM周波数変更(a=0.8)
-        #self.kp = self.declare_parameter('kp', [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).value
-        #self.ki = self.declare_parameter('ki', [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).value
-        #self.kd = self.declare_parameter('kd', [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).value
+        #ローパスフィルタ適用＆PWM周波数変更(VEAB300kHz,POT1kHz)(a=0.8)
+        self.kp = self.declare_parameter('kp', [0.4, 1.5, 0.7, 0.25, 1.3, 0.8, 0.65]).value
+        self.ki = self.declare_parameter('ki', [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).value
+        self.kd = self.declare_parameter('kd', [0.0, 0.0, 0.0, 0.3, 0.0, 0.0, 0.0]).value
 
         ## 各自由度ごとの圧力の正方向とポテンショメータの正方向の対応を整理
         self.sine = self.declare_parameter('sine', [-1.0, -1.0, 1.0, -1.0, -1.0, -1.0, -1.0]).value
@@ -121,12 +121,12 @@ class PIDControllerNode(Node):
         # 停止モードの値の設定
         conditions = [
             (137, 119),
-            (159, 97),
+            (150, 106),
             (128, 128),
-            (130, 126),
-            (128, 128),
-            (135, 121),
-            (132, 124)
+            (133, 123),
+            (138, 118),
+            (152, 104),
+            (144, 112)
         ]
 
         for i in range(len(conditions)):
@@ -204,28 +204,28 @@ class PIDControllerNode(Node):
             veab2 = 119 - (difference / 2.0)
         elif i == 1:
             #腕の上下
-            veab1 = 140 + (difference / 2.0)
-            veab2 = 116 - (difference / 2.0)
+            veab1 = 150 + (difference / 2.0)
+            veab2 = 106 - (difference / 2.0)
         elif i == 2:
             #上腕の旋回
             veab1 = 128 + (difference / 2.0)
             veab2 = 128 - (difference / 2.0)
         elif i == 3:
             #肘の曲げ伸ばし
-            veab1 = 130 + (difference / 2.0)
-            veab2 = 126 - (difference / 2.0)
+            veab1 = 133 + (difference / 2.0)
+            veab2 = 123 - (difference / 2.0)
         elif i == 4:
             #前腕の旋回
-            veab1 = 132 + (difference / 2.0)
-            veab2 = 124 - (difference / 2.0)
+            veab1 = 138 + (difference / 2.0)
+            veab2 = 118 - (difference / 2.0)
         elif i == 5:
             #小指側伸縮
-            veab1 = 135 + (difference / 2.0)
-            veab2 = 121 - (difference / 2.0)
+            veab1 = 152 + (difference / 2.0)
+            veab2 = 104 - (difference / 2.0)
         else:
             #親指側伸縮
-            veab1 = 130 + (difference / 2.0)
-            veab2 = 126 - (difference / 2.0)
+            veab1 = 144 + (difference / 2.0)
+            veab2 = 112 - (difference / 2.0)
         
         # 値をクリップし、整数型に変換
         veab1 = max(0, min(255, int(veab1)))
