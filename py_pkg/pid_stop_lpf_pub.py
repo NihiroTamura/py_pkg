@@ -24,13 +24,18 @@ class PIDControllerNode(Node):
         super().__init__('pid_controller')
 
         ## 各自由度ごとにデフォルトのPIDゲインを設定
-        #self.kp = self.declare_parameter('kp', [0.15, 0.3, 0.25, 0.005, 0.25, 0.1, 0.1]).value
-        #self.ki = self.declare_parameter('ki', [0.0005, 0.004, 0.0003, 0.0003, 0.0, 0.0, 0.001]).value
-        #self.kd = self.declare_parameter('kd', [0.1, 0.2, 0.1, 0.1, 0.1, 0.1, 0.1]).value
+        #PIDゲインのみチューニング
+        self.kp = self.declare_parameter('kp', [0.15, 0.3, 0.25, 0.005, 0.25, 0.1, 0.1]).value
+        self.ki = self.declare_parameter('ki', [0.0005, 0.004, 0.0003, 0.0003, 0.0, 0.0, 0.001]).value
+        self.kd = self.declare_parameter('kd', [0.1, 0.2, 0.1, 0.1, 0.1, 0.1, 0.1]).value
         #ローパスフィルタ適用後(a=0.8)
-        self.kp = self.declare_parameter('kp', [0.32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).value
-        self.ki = self.declare_parameter('ki', [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).value
-        self.kd = self.declare_parameter('kd', [0.3, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).value
+        #self.kp = self.declare_parameter('kp', [0.32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).value
+        #self.ki = self.declare_parameter('ki', [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).value
+        #self.kd = self.declare_parameter('kd', [0.3, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).value
+        #ローパスフィルタ適用＆PWM周波数変更(a=0.8)
+        #self.kp = self.declare_parameter('kp', [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).value
+        #self.ki = self.declare_parameter('ki', [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).value
+        #self.kd = self.declare_parameter('kd', [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).value
 
         ## 各自由度ごとの圧力の正方向とポテンショメータの正方向の対応を整理
         self.sine = self.declare_parameter('sine', [-1.0, -1.0, 1.0, -1.0, -1.0, -1.0, -1.0]).value
@@ -65,6 +70,7 @@ class PIDControllerNode(Node):
         ## パブリッシャー作成
         self.publisher1 = self.create_publisher(UInt16MultiArray, '/VEAB1/desired', 10)
         self.publisher2 = self.create_publisher(UInt16MultiArray, '/VEAB2/desired', 10)
+        self.publisher3 = self.create_publisher(UInt16MultiArray, '/CheckMode', 10)
 
         ## タイマーを設定して一定間隔でcalculate_and_publishを実行
         self.timer_period = 0.0125  # 秒 (1/0.0125=80 Hz)
@@ -100,7 +106,7 @@ class PIDControllerNode(Node):
         previous_realized_data = self.realized_queue[-2] if len(self.realized_queue) > 1 else realized_data
 
         # 誤差を計算(目標値-実現値)
-        current_errors = [(desired_data[i] - realized_data[i]) for i in range(1, 8)]
+        current_errors = [(desired_data[i] - realized_data[i]) for i in range(1, 8)] #ポテンショメータの実現値の配列のうち1番目から7番目までが各自由度に対応する
 
         # VEAB1とVEAB2に与える圧力差の初期化
         pid_outputs = []
@@ -108,6 +114,9 @@ class PIDControllerNode(Node):
         # VEAB1とVEAB2に与えるPWMの値の初期化
         veab1_values = []
         veab2_values = []
+
+        # VEABの停止モードかPID制御の判定値の初期化
+        veab_check = []
 
         # 停止モードの値の設定
         conditions = [
@@ -129,6 +138,10 @@ class PIDControllerNode(Node):
                     veab1_values.extend([veab_val1, veab_val2])
                 else:
                     veab2_values.extend([veab_val1, veab_val2])
+                
+                # publish_check関数を用いて停止モードになっていれば「１」
+                veab_check.append(1)
+                
             else:
                 # PID制御を行う(VEAB1とVEAB2に与える圧力差の計算)
                 error = current_errors[i]
@@ -157,6 +170,9 @@ class PIDControllerNode(Node):
                 # 計算に用いた誤差を前回の誤差に変更(次の誤差計算用)
                 self.previous_errors[i] = error
 
+                # publish_check関数を用いてPID制御になっていれば「0」
+                veab_check.append(0)
+
         ## veab1とveab2の値をキューに追加
         self.veab1_queue.append(veab1_values)  
         self.veab2_queue.append(veab2_values)      
@@ -176,6 +192,9 @@ class PIDControllerNode(Node):
         # publish_values関数を用いてVEAB1とVEAB2に与えるPWMの値をパブリッシュする
         self.publish_values(self.publisher1, filtered_veab1_values)
         self.publish_values(self.publisher2, filtered_veab2_values)
+
+        # publish_check関数を用いて各自由度の停止モードかPID制御かの判定値をパブリッシュする
+        self.publish_check(self.publisher3, veab_check)
 
     # VEAB1とVEAB2に与えるPWMの値を計算(停止モードにおける両ポートの値を基準に足し引きを行う)
     def calculate_veab_values(self, difference, i):
@@ -197,16 +216,16 @@ class PIDControllerNode(Node):
             veab2 = 126 - (difference / 2.0)
         elif i == 4:
             #前腕の旋回
-            veab1 = 128 + (difference / 2.0)
-            veab2 = 128 - (difference / 2.0)
+            veab1 = 132 + (difference / 2.0)
+            veab2 = 124 - (difference / 2.0)
         elif i == 5:
             #小指側伸縮
             veab1 = 135 + (difference / 2.0)
             veab2 = 121 - (difference / 2.0)
         else:
             #親指側伸縮
-            veab1 = 132 + (difference / 2.0)
-            veab2 = 124 - (difference / 2.0)
+            veab1 = 130 + (difference / 2.0)
+            veab2 = 126 - (difference / 2.0)
         
         # 値をクリップし、整数型に変換
         veab1 = max(0, min(255, int(veab1)))
@@ -222,6 +241,19 @@ class PIDControllerNode(Node):
         dim.label = 'example'
         dim.size = 12
         dim.stride = 12
+        msg.layout.dim = [dim]
+        msg.layout.data_offset = 0
+        msg.data = data
+        publisher.publish(msg)
+    
+    # publish_check関数
+    def publish_check(self, publisher, data):
+        msg = UInt16MultiArray()
+        msg.layout = MultiArrayLayout()
+        dim = MultiArrayDimension()
+        dim.label = 'example1'
+        dim.size = 7
+        dim.stride = 7
         msg.layout.dim = [dim]
         msg.layout.data_offset = 0
         msg.data = data
