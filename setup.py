@@ -30,6 +30,7 @@ setup(
             'pot_desired_conti_pub=py_pkg.pot_desired_conti_pub:main',
             'pot_realized_conti_pub_test=py_pkg.pot_realized_conti_pub_test:main',
             'pot_realized_pub_test=py_pkg.pot_realized_pub_test:main',
+            'write_data_csv=py_pkg.write_data_csv:main',
         ],
     },
 )

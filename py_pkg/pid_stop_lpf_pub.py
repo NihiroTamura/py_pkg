@@ -25,17 +25,17 @@ class PIDControllerNode(Node):
 
         ## 各自由度ごとにデフォルトのPIDゲインを設定
         #ゲインチューニング用
-        #self.kp = self.declare_parameter('kp', [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.65]).value
-        #self.ki = self.declare_parameter('ki', [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).value
-        #self.kd = self.declare_parameter('kd', [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).value
+        self.kp = self.declare_parameter('kp', [0.4, 0.0, 0.0, 0.0, 0.0, 0.0, 0.65]).value
+        self.ki = self.declare_parameter('ki', [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).value
+        self.kd = self.declare_parameter('kd', [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).value
         #ローパスフィルタ適用後(a=0.8)
         #self.kp = self.declare_parameter('kp', [0.32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).value
         #self.ki = self.declare_parameter('ki', [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).value
         #self.kd = self.declare_parameter('kd', [0.3, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).value
         #ローパスフィルタ適用＆PWM周波数変更(VEAB300kHz,POT1kHz)(a=0.8)
-        self.kp = self.declare_parameter('kp', [0.4, 1.5, 0.7, 0.25, 1.3, 0.8, 0.65]).value
-        self.ki = self.declare_parameter('ki', [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).value
-        self.kd = self.declare_parameter('kd', [0.0, 0.0, 0.0, 0.3, 0.0, 0.0, 0.0]).value
+        #self.kp = self.declare_parameter('kp', [0.4, 1.5, 0.7, 0.25, 1.3, 0.8, 0.65]).value
+        #self.ki = self.declare_parameter('ki', [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).value
+        #self.kd = self.declare_parameter('kd', [0.0, 0.0, 0.0, 0.3, 0.0, 0.0, 0.0]).value
 
         ## 各自由度ごとの圧力の正方向とポテンショメータの正方向の対応を整理
         self.sine = self.declare_parameter('sine', [-1.0, -1.0, 1.0, -1.0, -1.0, -1.0, -1.0]).value
@@ -67,6 +67,12 @@ class PIDControllerNode(Node):
         self.previous_errors = [0.0] * 7
         self.integral = [0.0] * 7
 
+        ## 停止モードになった回数(Trueが出力された回数)をカウントするための変数
+        self.true_counter = [0] * 7  # 各自由度ごとにカウンターを用意
+
+        ## 前回のdesired_valueを記録しておくための変数
+        self.previous_desired_values = [0] * 7  # 各自由度ごとに記録
+
         ## パブリッシャー作成
         self.publisher1 = self.create_publisher(UInt16MultiArray, '/VEAB1/desired', 10)
         self.publisher2 = self.create_publisher(UInt16MultiArray, '/VEAB2/desired', 10)
@@ -86,11 +92,32 @@ class PIDControllerNode(Node):
         self.desired_queue.append(msg.data)
 
     ## 停止モードの条件を満たすか確認する関数
-    def check_conditions(self, realized_value, previous_realized_value, desired_value):
-        error_margin = 70
+    def check_conditions(self, realized_value, previous_realized_value, desired_value, index):
+        error_margin = 130
+        change = desired_value - realized_value #abs(realized_value - desired_value)
         rate_of_change = abs(realized_value - previous_realized_value)
-        if abs(realized_value - desired_value) <= error_margin and rate_of_change >= 5:
+        times = 20
+
+        # desired_valueが変わった場合にカウンターをリセット
+        if abs(desired_value - self.previous_desired_values[index]) > 50:
+            self.true_counter[index] = 0
+            self.previous_desired_values[index] = desired_value  # 新しいdesired_valueを記録
+
+        # times回目以降は常にFalseを返す
+        if self.true_counter[index] > times:
+            return False
+
+        # 初めてTrueを返した後、次のステップも(times回まで)Trueにする
+        if self.true_counter[index] > 0:
+            self.true_counter[index] += 1
+            if self.true_counter[index] <= times:
+                return True
+
+        # 条件を満たしているかどうかを判定
+        if change <= error_margin and rate_of_change >= 20:
+            self.true_counter[index] = 1  # 条件を満たした場合、カウンターをリセット
             return True
+        
         return False
 
     ## calculate_and_publish (VEAB1とVEAB2に送る圧力のPWMの値を計算しパブリッシュ)
@@ -133,7 +160,7 @@ class PIDControllerNode(Node):
             veab_val1, veab_val2 = conditions[i]
 
             # 停止モードの条件を満たすか確認
-            if self.check_conditions(realized_data[i+1], previous_realized_data[i+1], desired_data[i+1]):
+            if self.check_conditions(realized_data[i+1], previous_realized_data[i+1], desired_data[i+1], i):
                 if i < 6:
                     veab1_values.extend([veab_val1, veab_val2])
                 else:
