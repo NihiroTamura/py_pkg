@@ -25,17 +25,17 @@ class PIDControllerNode(Node):
 
         ## 各自由度ごとにデフォルトのPIDゲインを設定
         #ゲインチューニング用
-        #self.kp = self.declare_parameter('kp', [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.65]).value
-        #self.ki = self.declare_parameter('ki', [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).value
-        #self.kd = self.declare_parameter('kd', [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).value
+        self.kp = self.declare_parameter('kp', [0.4, 0.0, 0.0, 0.0, 0.0, 0.0, 0.65]).value
+        self.ki = self.declare_parameter('ki', [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).value
+        self.kd = self.declare_parameter('kd', [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).value
         #ローパスフィルタ適用後(a=0.8)
         #self.kp = self.declare_parameter('kp', [0.32, 0.75, 0.3, 0.0, 0.35, 0.4, 0.3]).value
         #self.ki = self.declare_parameter('ki', [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).value
         #self.kd = self.declare_parameter('kd', [0.3, 0.3, 0.3, 0.0, 0.1, 0.2, 0.1]).value
         #ローパスフィルタ適用＆PWM周波数変更(VEAB300kHz,POT1kHz)(a=0.8)
-        self.kp = self.declare_parameter('kp', [0.4, 1.5, 0.7, 0.25, 1.3, 0.8, 0.65]).value
-        self.ki = self.declare_parameter('ki', [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).value
-        self.kd = self.declare_parameter('kd', [0.0, 0.0, 0.0, 0.3, 0.0, 0.0, 0.0]).value
+        #self.kp = self.declare_parameter('kp', [0.4, 1.5, 0.7, 0.25, 1.3, 0.8, 0.65]).value
+        #self.ki = self.declare_parameter('ki', [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).value
+        #self.kd = self.declare_parameter('kd', [0.0, 0.0, 0.0, 0.3, 0.0, 0.0, 0.0]).value
 
         ## 各自由度ごとの圧力の正方向とポテンショメータの正方向の対応を整理
         self.sine = self.declare_parameter('sine', [-1.0, -1.0, 1.0, -1.0, -1.0, -1.0, -1.0]).value
