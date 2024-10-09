@@ -129,9 +129,9 @@ class PIDControllerNode(Node):
         # VEAB1とVEAB2に与えるPWMの値を計算し格納
         for i, val in enumerate(pid_outputs):
             if i < 6:
-                veab1_values.extend(self.calculate_veab_values(val, i))
+                veab1_values.extend(self.calculate_veab_values(val, i, realized_data[i+1]))
             else:
-                veab2_values.extend(self.calculate_veab_values(val, i))
+                veab2_values.extend(self.calculate_veab_values(val, i, realized_data[i+1]))
     
         ## veab1とveab2の値をキューに追加
         self.veab1_queue.append(veab1_values)  
@@ -154,9 +154,15 @@ class PIDControllerNode(Node):
         self.publish_values(self.publisher2, filtered_veab2_values)
 
     # VEAB1とVEAB2に与えるPWMの値を計算(停止モードにおける両ポートの値を基準に足し引きを行う)
-    def calculate_veab_values(self, difference, i):
+    def calculate_veab_values(self, difference, i, realized):
         if i == 0:
             #腕の開閉
+
+            # 重力補償
+            gravity = (realized / 4) * self.kp[i]
+
+            difference = difference - gravity
+
             veab1 = 137 + (difference / 2.0)
             veab2 = 119 - (difference / 2.0)
         elif i == 1:

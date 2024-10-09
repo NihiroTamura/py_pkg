@@ -93,10 +93,12 @@ class PIDControllerNode(Node):
 
     ## 停止モードの条件を満たすか確認する関数
     def check_conditions(self, realized_value, previous_realized_value, desired_value, index):
-        error_margin = 130
+        error_margin = 90
+        change_limit = 20
+        times = 23
+
         change = desired_value - realized_value #abs(realized_value - desired_value)
         rate_of_change = abs(realized_value - previous_realized_value)
-        times = 20
 
         # desired_valueが変わった場合にカウンターをリセット
         if abs(desired_value - self.previous_desired_values[index]) > 50:
@@ -114,7 +116,7 @@ class PIDControllerNode(Node):
                 return True
 
         # 条件を満たしているかどうかを判定
-        if change <= error_margin and rate_of_change >= 20:
+        if change <= error_margin and rate_of_change >= change_limit:
             self.true_counter[index] = 1  # 条件を満たした場合、カウンターをリセット
             return True
         
@@ -227,6 +229,13 @@ class PIDControllerNode(Node):
     def calculate_veab_values(self, difference, i):
         if i == 0:
             #腕の開閉
+
+            # 重力補償
+            gravity = (realized / 4) * self.kp[i]
+            #gravity = (desired - 320) * self.kp[i]
+
+            difference = difference - gravity
+            
             veab1 = 137 + (difference / 2.0)
             veab2 = 119 - (difference / 2.0)
         elif i == 1:
