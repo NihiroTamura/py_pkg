@@ -5,8 +5,8 @@ from std_msgs.msg import UInt16MultiArray, MultiArrayDimension, MultiArrayLayout
 class UInt16MultiArrayPublisher(Node):
     def __init__(self):
         super().__init__('U_int16_multi_array_publisher')
-        self.publisher_ = self.create_publisher(UInt16MultiArray, '/POT/desired', 10)
-        timer_period = 0.0125  # 秒
+        self.publisher_ = self.create_publisher(UInt16MultiArray, '/board/sub', 10)
+        timer_period = 5  # 秒
         self.timer = self.create_timer(timer_period, self.publish_message)
 
     def publish_message(self):
@@ -15,13 +15,13 @@ class UInt16MultiArrayPublisher(Node):
         msg.layout = MultiArrayLayout()
         dim = MultiArrayDimension()
         dim.label = 'example'
-        dim.size = 12
-        dim.stride = 12
+        dim.size = 7
+        dim.stride = 7
         msg.layout.dim = [dim]
         msg.layout.data_offset = 0
         
         # データ設定
-        msg.data = [0, 450, 390, 150, 300, 900, 390, 510, 0, 0, 0, 0]
+        msg.data = [400, 400, 150, 300, 900, 390, 300]
         #ポテンショメータの値の範囲
         #[0, 腕の閉223-482開, 腕の下344-619上, 上腕の旋回内95-605外, 肘の伸144-740曲, 前腕の旋回内111-962外, 小指側縮62-895伸, 親指側縮0-740伸, 0, 0, 0, 0]
         #小指側のdesired = 親指側のdesired+70

@@ -9,7 +9,7 @@ class UInt16MultiArrayPublisher(Node):
         self.values = [0] + [100] * 7  # 2番目から8番目の初期値は100、1番目は固定値0
         self.increment = 20
         self.direction = [1] * 7  # 各要素の増加・減少の方向
-        timer_period = 0.0125  # 秒
+        timer_period = 1#0.0125  # 秒
         self.timer = self.create_timer(timer_period, self.publish_message)
 
     def publish_message(self):

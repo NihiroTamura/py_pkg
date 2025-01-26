@@ -6,8 +6,8 @@ import numpy as np
 class UInt16MultiArrayPublisher(Node):
     def __init__(self):
         super().__init__('u_int16_multi_array_publisher')
-        self.publisher_ = self.create_publisher(UInt16MultiArray, '/POT/desired', 10)
-        timer_period = 0.0125  # 秒
+        self.publisher_ = self.create_publisher(UInt16MultiArray, '/board1/sub', 10)
+        timer_period = 5  # 秒
         self.timer = self.create_timer(timer_period, self.publish_message)
         self.increment = True
         self.value = 200  # 初期値
@@ -18,13 +18,13 @@ class UInt16MultiArrayPublisher(Node):
         msg.layout = MultiArrayLayout()
         dim = MultiArrayDimension()
         dim.label = 'example'
-        dim.size = 12
-        dim.stride = 12
+        dim.size = 7
+        dim.stride = 7
         msg.layout.dim = [dim]
         msg.layout.data_offset = 0
         
         # データ設定（連続的に変化させる）
-        base_data = [0, 800, 700, 600, 500, 400, 300, 200, 0, 0, 0, 0]
+        base_data = [800, 700, 600, 500, 400, 300, 10]
         msg_data = []
 
         # 値の増加・減少の管理

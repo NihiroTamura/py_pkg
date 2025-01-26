@@ -26,11 +26,14 @@ setup(
             'pid_stop_lpf_pub=py_pkg.pid_stop_lpf_pub:main',
             'pid_lpf_pub=py_pkg.pid_lpf_pub:main',
             'pid_test=py_pkg.pid_test:main',
+            'pid_stop_lpf_pub_optimize=py_pkg.pid_stop_lpf_pub_optimize:main',
             'pot_desired_pub=py_pkg.pot_desired_pub:main',
             'pot_desired_conti_pub=py_pkg.pot_desired_conti_pub:main',
             'pot_realized_conti_pub_test=py_pkg.pot_realized_conti_pub_test:main',
             'pot_realized_pub_test=py_pkg.pot_realized_pub_test:main',
             'write_data_csv=py_pkg.write_data_csv:main',
+            'write_data_Ballistic_csv=py_pkg.write_data_Ballistic_csv:main',
+            'optimize_pid=py_pkg.optimize_pid:main'
         ],
     },
 )

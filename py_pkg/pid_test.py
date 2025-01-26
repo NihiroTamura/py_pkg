@@ -5,18 +5,18 @@ from collections import deque
 import numpy as np
 
 ## ローパスフィルタ関数
-def LPF_MAM(veab_values, previous_veab_values):
+def LPF_MAM(new_values, previous_values):
     # 重み設定
     a = 0.8
 
     # ローパスフィルタ語の値を格納するリストを初期化
-    filtered_veab_values = [0] * len(veab_values)
+    filtered_values = [0] * len(new_values)
 
     # <１ステップ前のポートの値> × a + <今計算されたポートの値> × (1-a)
-    for i in range(len(veab_values)):
-        filtered_veab_values[i] = previous_veab_values[i] * a + veab_values[i]*(1-a)
+    for i in range(len(new_values)):
+        filtered_values[i] = previous_values[i] * a + new_values[i]*(1-a)
 
-    return filtered_veab_values
+    return filtered_values
 
 ### 以下のプログラムからスタート
 class PIDControllerNode(Node):
@@ -28,10 +28,6 @@ class PIDControllerNode(Node):
         self.kp = self.declare_parameter('kp', [0.4, 0.0, 0.0, 0.0, 0.0, 0.0, 0.65]).value
         self.ki = self.declare_parameter('ki', [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).value
         self.kd = self.declare_parameter('kd', [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).value
-        #ローパスフィルタ適用後(a=0.8)
-        #self.kp = self.declare_parameter('kp', [0.32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).value
-        #self.ki = self.declare_parameter('ki', [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).value
-        #self.kd = self.declare_parameter('kd', [0.3, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).value
         #ローパスフィルタ適用＆PWM周波数変更(VEAB300kHz,POT1kHz)(a=0.8)
         #self.kp = self.declare_parameter('kp', [0.4, 1.5, 0.7, 0.25, 1.3, 0.8, 0.65]).value
         #self.ki = self.declare_parameter('ki', [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).value
@@ -93,11 +89,70 @@ class PIDControllerNode(Node):
 
     ## 停止モードの条件を満たすか確認する関数
     def check_conditions(self, realized_value, previous_realized_value, desired_value, index):
-        error_margin = 90
-        change_limit = 20
-        times = 23
 
-        change = desired_value - realized_value #abs(realized_value - desired_value)
+        if index == 0:
+            error_margin1 = 90
+            change_limit1 = 20
+            times1 = 23
+
+            error_margin = error_margin1
+            change_limit = change_limit1
+            times = times1
+        elif index ==1:
+            error_margin2 = 90
+            change_limit2 = 20
+            times2 = 23
+
+            error_margin = error_margin2
+            change_limit = change_limit2
+            times = times2
+        elif index ==2:
+            error_margin3 = 90
+            change_limit3 = 20
+            times3 = 23
+
+            error_margin = error_margin3
+            change_limit = change_limit3
+            times = times3
+        elif index == 3:
+            error_margin4 = 90
+            change_limit4 = 20
+            times4 = 23
+
+            error_margin = error_margin4
+            change_limit = change_limit4
+            times = times4
+        elif index == 4:
+            error_margin5 = 90
+            change_limit5 = 20
+            times5 = 23
+
+            error_margin = error_margin5
+            change_limit = change_limit5
+            times = times5
+        elif index == 5:
+            error_margin6 = 90
+            change_limit6 = 20
+            times6 = 23
+
+            error_margin = error_margin6
+            change_limit = change_limit6
+            times = times6
+        else:
+            error_margin7 = 90
+            change_limit7 = 20
+            times7 = 23
+
+            error_margin = error_margin7
+            change_limit = change_limit7
+            times = times7
+        
+        #目標値までの距離changeと実現値の変化率rate_of_change
+        if desired_value - self.previous_desired_values[index] >= 0:
+            change = desired_value - realized_value #abs(realized_value - desired_value)
+        else:
+            change = realized_value - desired_value
+
         rate_of_change = abs(realized_value - previous_realized_value)
 
         # desired_valueが変わった場合にカウンターをリセット

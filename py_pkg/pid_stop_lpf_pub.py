@@ -25,7 +25,7 @@ class PIDControllerNode(Node):
 
         ## 各自由度ごとにデフォルトのPIDゲインを設定
         #ゲインチューニング用
-        self.kp = self.declare_parameter('kp', [0.4, 0.0, 0.0, 0.0, 0.0, 0.0, 0.65]).value
+        self.kp = self.declare_parameter('kp', [0.4, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).value
         self.ki = self.declare_parameter('ki', [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).value
         self.kd = self.declare_parameter('kd', [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).value
         #ローパスフィルタ適用後(a=0.8)
@@ -190,7 +190,7 @@ class PIDControllerNode(Node):
                 pid_output = self.sine[i] * pid_output
 
                 # VEAB1とVEAB2に与えるPWMの値を計算し格納
-                veab_values = self.calculate_veab_values(pid_output, i)
+                veab_values = self.calculate_veab_values(pid_output, i, realized_data[i+1])
                 if i < 6:
                     veab1_values.extend(veab_values)
                 else:
@@ -226,7 +226,7 @@ class PIDControllerNode(Node):
         self.publish_check(self.publisher3, veab_check)
 
     # VEAB1とVEAB2に与えるPWMの値を計算(停止モードにおける両ポートの値を基準に足し引きを行う)
-    def calculate_veab_values(self, difference, i):
+    def calculate_veab_values(self, difference, i, realized):
         if i == 0:
             #腕の開閉
 
@@ -234,8 +234,8 @@ class PIDControllerNode(Node):
             gravity = (realized / 4) * self.kp[i]
             #gravity = (desired - 320) * self.kp[i]
 
-            difference = difference - gravity
-            
+            difference = difference - gravity        
+
             veab1 = 137 + (difference / 2.0)
             veab2 = 119 - (difference / 2.0)
         elif i == 1:
