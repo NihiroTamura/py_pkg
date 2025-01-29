@@ -34,6 +34,7 @@ setup(
             'write_data_csv=py_pkg.write_data_csv:main',
             'write_data_Ballistic_csv=py_pkg.write_data_Ballistic_csv:main',
             'optimize_pid=py_pkg.optimize_pid:main',
+            'optimize_test=py_pkg.optimize_test:main',
             'optimize_Ballistic_ROS2=py_pkg.optimize_Ballistic_ROS2:main'
         ],
     },
