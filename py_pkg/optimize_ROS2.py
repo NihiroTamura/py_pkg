@@ -1,6 +1,6 @@
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import UInt16MultiArray
+from std_msgs.msg import UInt16MultiArray, MultiArrayDimension, MultiArrayLayout
 import optuna
 import random
 import time
@@ -29,8 +29,8 @@ class OptimizationNode(Node):
         self.sse_accumulator = [0] * 7
 
         #   目標値を切り替えるrepeat回数と最適化のtrial回数
-        self.num_repeats = 5
-        self.num_trials = 100
+        self.num_repeats = 2
+        self.num_trials = 2
 
         #   Ballistic Modeパラメータの初期化
         self.ballistic_values = None
@@ -51,32 +51,46 @@ class OptimizationNode(Node):
             self.get_logger().info('Subscribed to topic.')
 
     def stop_subscribers(self):
-        if self.is_subscribing and self.sub_board1 is not None and self.sub_board2 is not None:
-            self.destroy_subscription(self.sub_board1)
-            self.destroy_subscription(self.sub_board2)
+        if self.is_subscribing:
+            #   subscriberの削除
+            if self.sub_board1 is not None:
+                self.destroy_subscription(self.sub_board1)
+                self.sub_board1 = None
+            
+            if self.sub_board2 is not None:
+                self.destroy_subscription(self.sub_board2)
+                self.sub_board2 = None
 
-            self.sub_board1 = None
-            self.sub_board2 = None
             self.is_subscribing = False
 
             self.get_logger().info('Unsubscribed from topic.')
     
     def board1_callback(self, msg):
+        #   /board1/pubのsubscribe
         self.pot_realized_board1 = msg.data[:6]
+
+        #   自由度ごとにSSEを計算
         for i in range(6):
             sse_per_dof = (self.pot_desired[i] - self.pot_realized_board1[i]) ** 2
-            self.sse_accumulator[i] += sse_per_dof[i]
+            self.sse_accumulator[i] += sse_per_dof
+
+        self.get_logger().info(f"Received board1: {self.sse_accumulator}")
     
     def board2_callback(self, msg):
+        #   /board2/pubのsubscribe
         self.pot_realized_board2 = msg.data[0]
+
+        #   自由度ごとにSSEを計算
         sse_per_dof_6 = (self.pot_desired[6] - self.pot_realized_board2) ** 2
         self.sse_accumulator[6] += sse_per_dof_6
+
+        self.get_logger().info(f"Received board2: {self.sse_accumulator[6]}")
 
     def publish_function(self, repeat):
         msg = UInt16MultiArray()
         msg.layout = MultiArrayLayout()
         dim = MultiArrayDimension()
-        dim.label = 'publish_params'
+        dim.label = 'param'
         dim.size = 35
         dim.stride = 35
         msg.layout.dim = [dim]
@@ -87,20 +101,22 @@ class OptimizationNode(Node):
         else:
             self.get_logger().info(f"repeat{repeat}: 目標値のみ更新して送信")
         
+        #   目標値とBallistic Modeパラメータのpublish
         msg.data = self.pot_desired + self.ballistic_values
         self.publisher.publish(msg)
 
     def update_pot_desired(self):
+        #   目標値をランダムに変更
         self.pot_desired = [random.randint(r[0], r[1]) for r in self.pot_desired_range]
-    
+
     def objective(self, trial):
         params = []
 
         #   各自由度で独自の探索範囲を設定
-        error_range = [(2, 200), (2, 228), (2, 414), (2, 500), (2, 800), (2, 774), (2, 648)]
-        delta_error_range = [(2, 200), (2, 228), (2, 414), (2, 500), (2, 800), (2, 774), (2, 648)]
-        omega_range = [(2, 200), (2, 228), (2, 414), (2, 500), (2, 800), (2, 774), (2, 648)]
-        delta_omega_range = [(2, 200), (2, 228), (2, 414), (2, 500), (2, 800), (2, 774), (2, 648)]
+        error_range = [(50, 150), (50, 150), (50, 150), (50, 150), (50, 150), (50, 150), (50, 150)]
+        delta_error_range = [(20, 50), (20, 50), (20, 50), (20, 50), (20, 50), (20, 50), (20, 50)]
+        omega_range = [(800, 3000), (800, 3000), (800, 3000), (800, 3000), (800, 3000), (800, 3000), (800, 3000)]
+        delta_omega_range = [(100, 800), (100, 800), (100, 800), (100, 800), (100, 800), (100, 800), (100, 800)]
 
         #   各自由度ごとに最適化対象パラメータとBallistic Modeパラメータの決定
         for i in range(7):
@@ -111,13 +127,13 @@ class OptimizationNode(Node):
 
                 delta_error_min, delta_error_max = delta_error_range[i]
                 delta_error = trial.suggest_int(f'delta_error_{i+1}', delta_error_min, delta_error_max)
-                
+                    
                 #   error_startとerror_stopの計算
                 error_start = error + (delta_error // 2)
                 error_stop = error - (delta_error // 2)
 
                 #   制約条件を満たすか確認
-                if error_stop > 0 and error_start < error_stop:
+                if error_stop > 0 and error_start > error_stop:
                     break
             
             while True:
@@ -145,8 +161,10 @@ class OptimizationNode(Node):
         # SSE 計算の初期化
         total_sse_sum = 0
 
-        # 繰り返し最適化試行
         for repeat in range(1, self.num_repeats + 1):
+            # SSE 計算の初期化
+            total_sse = 0
+
             #   目標値を更新
             self.update_pot_desired()
 
@@ -157,7 +175,13 @@ class OptimizationNode(Node):
             self.start_subscribers()
 
             #   メッセージの受信
-            time.sleep(5)
+            self.start_time = time.time()
+            while True:
+                rclpy.spin_once(self, timeout_sec=0.01)
+                self.current_time = time.time()
+
+                if (self.current_time - self.start_time >= 5):
+                    break
 
             #   subscribeの停止
             self.stop_subscribers()
@@ -169,7 +193,7 @@ class OptimizationNode(Node):
 
             #   repeatごとに各自由度ごとのSSEを初期化
             self.sse_accumulator = [0] * 7
-
+        
         return total_sse_sum
 
     def optimize(self):
@@ -190,7 +214,6 @@ class OptimizationNode(Node):
                 f'POT{i + 1}: error_start = {error_start}, error_stop = {error_stop}, '
                 f'omega_start = {omega_start}, omega_stop = {omega_stop}'
             )
-
 
 def main(args=None):
     #   ROS通信の初期化
