@@ -15,13 +15,14 @@ class UInt16MultiArrayPublisher(Node):
         msg.layout = MultiArrayLayout()
         dim = MultiArrayDimension()
         dim.label = 'example'
-        dim.size = 35
-        dim.stride = 35
+        dim.size = 7
+        dim.stride = 7
         msg.layout.dim = [dim]
         msg.layout.data_offset = 0
         
         # データ設定
-        msg.data = [400, 400, 150, 300, 900, 390, 300, 140, 100, 1500, 1000, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 100, 200, 300, 400]
+        #msg.data = [250, 550, 400, 400, 500, 600, 500]
+        msg.data = [400, 550, 400, 400, 500, 600, 500, 130, 90, 1400, 900, 100, 50, 8000, 6000, 1, 1, 1, 1, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
         #ポテンショメータの値の範囲
         #[0, 腕の閉223-482開, 腕の下344-619上, 上腕の旋回内95-605外, 肘の伸144-740曲, 前腕の旋回内111-962外, 小指側縮62-895伸, 親指側縮0-740伸, 0, 0, 0, 0]
         #小指側のdesired = 親指側のdesired+70

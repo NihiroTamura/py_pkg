@@ -88,19 +88,19 @@ class OptimizationNode(Node):
     def callback_board1(self, msg):
         with self.lock:
             self.pot_realized_board1 = msg.data[:6]
-            self.get_logger().info("Received data from /board1/pub")
+            #self.get_logger().info("Received data from /board1/pub")
             sse_per_dof = [(self.targets[i] - self.pot_realized_board1[i]) ** 2 for i in range(6)]
             for i in range(6):
                 self.sse_accumulator[i] += sse_per_dof[i]
-            self.get_logger().info(f"SSE for /board1/pub updated: {self.sse_accumulator[:6]}")
+            #self.get_logger().info(f"SSE for /board1/pub updated: {self.sse_accumulator[:6]}")
 
     def callback_board2(self, msg):
         with self.lock:
             self.pot_realized_board2 = msg.data[0]
-            self.get_logger().info("Received data from /board2/pub")
+            #self.get_logger().info("Received data from /board2/pub")
             sse_per_dof_6 = (self.targets[6] - self.pot_realized_board2) ** 2
             self.sse_accumulator[6] += sse_per_dof_6
-            self.get_logger().info(f"SSE for /board2/pub updated: {self.sse_accumulator[6]}")
+            #self.get_logger().info(f"SSE for /board2/pub updated: {self.sse_accumulator[6]}")
 
     def publish_targets(self, repeat):
         msg = UInt16MultiArray()
@@ -114,7 +114,7 @@ class OptimizationNode(Node):
     def update_targets(self):
         with self.lock:
             self.targets = [random.randint(r[0], r[1]) for r in self.target_ranges]
-            self.get_logger().info(f"Targets updated: {self.targets}")
+            #self.get_logger().info(f"Targets updated: {self.targets}")
 
     def evaluate(self, trial):
         params = []
@@ -167,7 +167,7 @@ class OptimizationNode(Node):
             with self.lock:
                 total_sse = sum(self.sse_accumulator)
                 total_sse_sum += total_sse
-                self.get_logger().info(f'Total SSE at repeat {repeat}: {total_sse}')
+                self.get_logger().info(f'Total SSE at repeat {repeat}: {total_sse_sum}')
                 self.sse_accumulator = [0] * 7
 
         return total_sse_sum
