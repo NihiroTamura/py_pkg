@@ -28,6 +28,7 @@ setup(
             'pid_test=py_pkg.pid_test:main',
             'pid_stop_lpf_pub_optimize=py_pkg.pid_stop_lpf_pub_optimize:main',
             'pot_desired_pub=py_pkg.pot_desired_pub:main',
+            'pot_desired_float_pub=py_pkg.pot_desired_float_pub:main',
             'pot_desired_conti_pub=py_pkg.pot_desired_conti_pub:main',
             'pot_realized_conti_pub_test=py_pkg.pot_realized_conti_pub_test:main',
             'pot_realized_pub_test=py_pkg.pot_realized_pub_test:main',
