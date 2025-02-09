@@ -6,7 +6,7 @@ class UInt16MultiArrayPublisher(Node):
     def __init__(self):
         super().__init__('U_int16_multi_array_publisher')
         self.publisher_ = self.create_publisher(UInt16MultiArray, '/board/sub', 10)
-        timer_period = 5  # 秒
+        timer_period = 2  # 秒
         self.timer = self.create_timer(timer_period, self.publish_message)
 
     def publish_message(self):
@@ -22,12 +22,9 @@ class UInt16MultiArrayPublisher(Node):
         
         # データ設定
         #msg.data = [250, 550, 400, 400, 500, 600, 500]
-        msg.data = [400, 550, 400, 400, 500, 600, 500, 130, 90, 1400, 900, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24]
+        msg.data = [250, 550, 400, 400, 500, 600, 500, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,25, 26, 27, 28]
         #ポテンショメータの値の範囲
-        #[0, 腕の閉223-482開, 腕の下344-619上, 上腕の旋回内95-605外, 肘の伸144-740曲, 前腕の旋回内111-962外, 小指側縮62-895伸, 親指側縮0-740伸, 0, 0, 0, 0]
-        #小指側のdesired = 親指側のdesired+70
-        # [0, 350, 380, 150, 300, 900, 670, 600, 0, 0, 0, 0]
-        # [0, 800, 700, 600, 500, 400, 300, 200, 0, 0, 0, 0]
+        #[腕の閉190-390開, 腕の下286-514上, 上腕の旋回内86-500外, 肘の伸123-628曲, 前腕の旋回内98-900外, 小指側縮48-822伸, 親指側縮1-649伸]
 
         # メッセージ送信
         self.publisher_.publish(msg)

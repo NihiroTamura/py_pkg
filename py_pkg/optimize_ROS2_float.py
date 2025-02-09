@@ -1,20 +1,21 @@
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import UInt16MultiArray, MultiArrayDimension, MultiArrayLayout
+from std_msgs.msg import UInt16MultiArray, Float32MultiArray, MultiArrayDimension, MultiArrayLayout
 import optuna
 import random
 import time
+import numpy as np
 
 class OptimizationNode(Node):
     def __init__(self):
-        super().__init__('optimization_node')
+        super().__init__('optimization_node_float')
 
         #   publisherの作成
-        self.publisher = self.create_publisher(UInt16MultiArray, '/board/sub', 10)
+        self.publisher = self.create_publisher(Float32MultiArray, '/board_float/sub', 10)
 
         #   目標値の範囲と目標値の決定
         self.pot_desired_range = [(190, 390), (286, 514), (86, 500), (123, 628), (98, 900), (48, 822), (1, 649)]
-        self.pot_desired =  [random.randint(r[0], r[1]) for r in self.pot_desired_range]
+        self.pot_desired =  [float(random.randint(r[0], r[1])) for r in self.pot_desired_range]
 
         #   ポテンショメータの値の配列
         self.pot_realized_board1 = [0] * 6
@@ -29,8 +30,8 @@ class OptimizationNode(Node):
         self.sse_accumulator = [0] * 7
 
         #   目標値を切り替えるrepeat回数と最適化のtrial回数
-        self.num_repeats = 5
-        self.num_trials = 100
+        self.num_repeats = 2
+        self.num_trials = 2
 
         #   Ballistic Modeパラメータの初期化
         self.ballistic_values = None
@@ -74,7 +75,7 @@ class OptimizationNode(Node):
             sse_per_dof = (self.pot_desired[i] - self.pot_realized_board1[i]) ** 2
             self.sse_accumulator[i] += sse_per_dof
 
-        #self.get_logger().info(f"Received board1: {self.sse_accumulator}")
+        self.get_logger().info(f"Received board1: {self.sse_accumulator}")
     
     def board2_callback(self, msg):
         #   /board2/pubのsubscribe
@@ -84,15 +85,15 @@ class OptimizationNode(Node):
         sse_per_dof_6 = (self.pot_desired[6] - self.pot_realized_board2) ** 2
         self.sse_accumulator[6] += sse_per_dof_6
 
-        #self.get_logger().info(f"Received board2: {self.sse_accumulator[6]}")
+        self.get_logger().info(f"Received board2: {self.sse_accumulator[6]}")
 
     def publish_function(self, repeat):
-        msg = UInt16MultiArray()
+        msg = Float32MultiArray()
         msg.layout = MultiArrayLayout()
         dim = MultiArrayDimension()
         dim.label = 'param'
-        dim.size = 35
-        dim.stride = 35
+        dim.size = 63
+        dim.stride = 63
         msg.layout.dim = [dim]
         msg.layout.data_offset = 0
 
@@ -107,53 +108,53 @@ class OptimizationNode(Node):
 
     def update_pot_desired(self):
         #   目標値をランダムに変更
-        self.pot_desired = [random.randint(r[0], r[1]) for r in self.pot_desired_range]
+        self.pot_desired = [float(random.randint(r[0], r[1])) for r in self.pot_desired_range]
 
     def objective(self, trial):
         params = []
 
         #   各自由度で独自の探索範囲を設定
-        error_range = [(50, 150), (50, 150), (50, 150), (50, 150), (50, 150), (50, 150), (50, 150)]
-        delta_error_range = [(20, 50), (20, 50), (20, 50), (20, 50), (20, 50), (20, 50), (20, 50)]
-        omega_range = [(800, 3000), (800, 3000), (800, 3000), (800, 3000), (800, 3000), (800, 3000), (800, 3000)]
-        delta_omega_range = [(100, 800), (100, 800), (100, 800), (100, 800), (100, 800), (100, 800), (100, 800)]
+        param_func_AE_range = [(-10, 10), (-10, 10), (-10, 10), (-10, 10), (-10, 10), (-10, 10), (-10, 10)]
+        param_func_AdeltaE_range = [(-5, 5), (-5, 5), (-5, 5), (-5, 5), (-5, 5), (-5, 5), (-5, 5)]
+        param_func_AV_range = [(-10, 10), (-10, 10), (-10, 10), (-10, 10), (-10, 10), (-10, 10), (-10, 10)]
+        param_func_AdeltaV_range = [(-5, 5), (-5, 5), (-5, 5), (-5, 5), (-5, 5), (-5, 5), (-5, 5)]
 
-        #   各自由度ごとに最適化対象パラメータとBallistic Modeパラメータの決定
+        param_func_BE_range = [(-10, 10), (-10, 10), (-10, 10), (-10, 10), (-10, 10), (-10, 10), (-10, 10)]
+        param_func_BdeltaE_range = [(-5, 5), (-5, 5), (-5, 5), (-5, 5), (-5, 5), (-5, 5), (-5, 5)]
+        param_func_BV_range = [(-10, 10), (-10, 10), (-10, 10), (-10, 10), (-10, 10), (-10, 10), (-10, 10)]
+        param_func_BdeltaV_range = [(-5, 5), (-5, 5), (-5, 5), (-5, 5), (-5, 5), (-5, 5), (-5, 5)]
+
+        #   各自由度ごとに最適化対象パラメータの決定
         for i in range(7):
-            while True:
-                #   errorとdelta_errorの決定
-                error_min, error_max = error_range[i]
-                error = trial.suggest_int(f'error_{i+1}', error_min, error_max)
+            #   A*POT_desired + B*POT_realized = P
+            #   Aについて
+            param_func_AE_min, param_func_AE_max = param_func_AE_range[i]
+            param_func_AE = trial.suggest_float(f'param_func_AE_{i+1}', param_func_AE_min, param_func_AE_max, step=0.001)
 
-                delta_error_min, delta_error_max = delta_error_range[i]
-                delta_error = trial.suggest_int(f'delta_error_{i+1}', delta_error_min, delta_error_max)
-                    
-                #   error_startとerror_stopの計算
-                error_start = error + (delta_error // 2)
-                error_stop = error - (delta_error // 2)
+            param_func_AdeltaE_min, param_func_AdeltaE_max = param_func_AdeltaE_range[i]
+            param_func_AdeltaE = trial.suggest_float(f'param_func_AdeltaE_{i+1}', param_func_AdeltaE_min, param_func_AdeltaE_max, step=0.001)
 
-                #   制約条件を満たすか確認
-                if error_stop > 0 and error_start > error_stop:
-                    break
-            
-            while True:
-                #   omegaとdelta_omegaの決定
-                omega_min, omega_max = omega_range[i]
-                omega = trial.suggest_int(f'omega_{i+1}', omega_min, omega_max)
+            param_func_AV_min, param_func_AV_max = param_func_AV_range[i]
+            param_func_AV = trial.suggest_float(f'param_func_AV_{i+1}', param_func_AV_min, param_func_AV_max)
 
-                delta_omega_min, delta_omega_max = delta_omega_range[i]
-                delta_omega = trial.suggest_int(f'delta_omega_{i+1}', delta_omega_min, delta_omega_max)
+            param_func_AdeltaV_min, param_func_AdeltaV_max = param_func_AdeltaV_range[i]
+            param_func_AdeltaV = trial.suggest_float(f'param_func_AdeltaV_{i+1}', param_func_AdeltaV_min, param_func_AdeltaV_max, step=0.001)
 
-                #   omega_startとomega_stopの計算
-                omega_start = omega + (delta_omega // 2)
-                omega_stop = omega - (delta_omega // 2)
+            #   Bについて
+            param_func_BE_min, param_func_BE_max = param_func_BE_range[i]
+            param_func_BE = trial.suggest_float(f'param_func_BE_{i+1}', param_func_BE_min, param_func_BE_max, step=0.001)
 
-                #   制約条件を満たすか確認
-                if omega_stop > 0 and omega_start > omega_stop:
-                    break
+            param_func_BdeltaE_min, param_func_BdeltaE_max = param_func_BdeltaE_range[i]
+            param_func_BdeltaE = trial.suggest_float(f'param_func_BdeltaE_{i+1}', param_func_BdeltaE_min, param_func_BdeltaE_max, step=0.001)
+
+            param_func_BV_min, param_func_BV_max = param_func_BV_range[i]
+            param_func_BV = trial.suggest_float(f'param_func_BV_{i+1}', param_func_BV_min, param_func_BV_max, step=0.001)
+
+            param_func_BdeltaV_min, param_func_BdeltaV_max = param_func_BdeltaV_range[i]
+            param_func_BdeltaV = trial.suggest_float(f'param_func_BdeltaV_{i+1}', param_func_BdeltaV_min, param_func_BdeltaV_max, step=0.001)
 
             #   探索結果をリストに追加
-            params.append((error_start, error_stop, omega_start, omega_stop))
+            params.append((param_func_AE, param_func_AdeltaE, param_func_AV, param_func_AdeltaV, param_func_BE, param_func_BdeltaE, param_func_BV, param_func_BdeltaV))
         
         #   Ballistic Modeパラメータのタプルを解放
         self.ballistic_values = [val for p in params for val in p]
@@ -206,13 +207,21 @@ class OptimizationNode(Node):
         self.get_logger().info(f'最適化終了。試行回数中の最小評価関数値: {study.best_value:.2f}')
         self.get_logger().info(f'最適な試行回数（trial number）は: {study.best_trial.number}')
         for i in range(7):
-            error_start = self.best_params[f'error_{i+1}'] + (self.best_params[f'delta_error_{i+1}'] // 2)
-            error_stop = self.best_params[f'error_{i+1}'] - (self.best_params[f'delta_error_{i+1}'] // 2)
-            omega_start = self.best_params[f'omega_{i+1}'] + (self.best_params[f'delta_omega_{i+1}'] // 2)
-            omega_stop = self.best_params[f'omega_{i+1}'] - (self.best_params[f'delta_omega_{i+1}'] // 2)
+            param_func_AE = np.round(self.best_params[f'param_func_AE_{i+1}'], 3)
+            param_func_AdeltaE = np.round(self.best_params[f'param_func_AdeltaE_{i+1}'], 3)
+            param_func_AV = np.round(self.best_params[f'param_func_AV_{i+1}'], 3)
+            param_func_AdeltaV = np.round(self.best_params[f'param_func_AdeltaV_{i+1}'], 3)
+
+            param_func_BE = np.round(self.best_params[f'param_func_BE_{i+1}'], 3)
+            param_func_BdeltaE = np.round(self.best_params[f'param_func_BdeltaE_{i+1}'], 3)
+            param_func_BV = np.round(self.best_params[f'param_func_BV_{i+1}'], 3)
+            param_func_BdeltaV = np.round(self.best_params[f'param_func_BdeltaV_{i+1}'], 3)
+
             self.get_logger().info(
-                f'POT{i + 1}: error_start = {error_start}, error_stop = {error_stop}, '
-                f'omega_start = {omega_start}, omega_stop = {omega_stop}'
+                f'POT{i + 1}: param_func_AE = {param_func_AE}, param_func_AdeltaE = {param_func_AdeltaE}, '
+                f'param_func_AV = {param_func_AV}, param_func_AdeltaV = {param_func_AdeltaV}, '
+                f'param_func_BE = {param_func_BE}, param_func_BdeltaE = {param_func_BdeltaE}, '
+                f'param_func_BV = {param_func_BV}, param_func_BdeltaV = {param_func_BdeltaV}'
             )
 
 def main(args=None):

@@ -38,6 +38,7 @@ setup(
             'optimize_pid=py_pkg.optimize_pid:main',
             'optimize_test=py_pkg.optimize_test:main',
             'optimize_ROS2=py_pkg.optimize_ROS2:main',
+            'optimize_ROS2_float=py_pkg.optimize_ROS2_float:main',
             'optimize_Ballistic_ROS2=py_pkg.optimize_Ballistic_ROS2:main'
         ],
     },
