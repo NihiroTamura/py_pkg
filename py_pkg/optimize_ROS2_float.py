@@ -30,8 +30,8 @@ class OptimizationNode(Node):
         self.sse_accumulator = [0] * 7
 
         #   目標値を切り替えるrepeat回数と最適化のtrial回数
-        self.num_repeats = 2
-        self.num_trials = 2
+        self.num_repeats = 5
+        self.num_trials = 100
 
         #   Ballistic Modeパラメータの初期化
         self.ballistic_values = None
