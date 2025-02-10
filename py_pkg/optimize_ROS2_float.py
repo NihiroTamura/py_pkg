@@ -75,7 +75,7 @@ class OptimizationNode(Node):
             sse_per_dof = (self.pot_desired[i] - self.pot_realized_board1[i]) ** 2
             self.sse_accumulator[i] += sse_per_dof
 
-        self.get_logger().info(f"Received board1: {self.sse_accumulator}")
+        #self.get_logger().info(f"Received board1: {self.sse_accumulator}")
     
     def board2_callback(self, msg):
         #   /board2/pubのsubscribe
@@ -85,7 +85,7 @@ class OptimizationNode(Node):
         sse_per_dof_6 = (self.pot_desired[6] - self.pot_realized_board2) ** 2
         self.sse_accumulator[6] += sse_per_dof_6
 
-        self.get_logger().info(f"Received board2: {self.sse_accumulator[6]}")
+        #self.get_logger().info(f"Received board2: {self.sse_accumulator[6]}")
 
     def publish_function(self, repeat):
         msg = Float32MultiArray()
