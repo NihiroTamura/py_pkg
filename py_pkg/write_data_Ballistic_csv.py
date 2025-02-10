@@ -1,6 +1,6 @@
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import UInt16MultiArray
+from std_msgs.msg import UInt16MultiArray, Float32MultiArray
 import csv
 import time
 import threading
@@ -11,8 +11,11 @@ class DataRecorderNode(Node):
         super().__init__('data_recorder_node')
 
         # トリガートピックのサブスクライバ
+        #self.sub_trigger = self.create_subscription(
+            #UInt16MultiArray, '/board/sub', self.trigger_callback, 10)
+        
         self.sub_trigger = self.create_subscription(
-            UInt16MultiArray, '/board/sub', self.trigger_callback, 10)
+            Float32MultiArray, '/board_float/sub', self.trigger_callback, 10)
 
         # 動作トリガーフラグと記録開始時刻
         self.recording_active = False
