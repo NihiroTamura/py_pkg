@@ -31,7 +31,7 @@ class OptimizationNode(Node):
 
         #   目標値を切り替えるrepeat回数と最適化のtrial回数
         self.num_repeats = 5
-        self.num_trials = 150
+        self.num_trials = 300
 
         #   Ballistic Modeパラメータの初期化
         self.ballistic_values = None
