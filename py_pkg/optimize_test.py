@@ -1,201 +1,239 @@
 import rclpy
 from rclpy.node import Node
-from rclpy.executors import MultiThreadedExecutor
-from rclpy.context import Context
-from std_msgs.msg import UInt16MultiArray
+from std_msgs.msg import UInt16MultiArray, Float32MultiArray, MultiArrayDimension, MultiArrayLayout
 import optuna
 import random
-import threading
 import time
-
+import numpy as np
 
 class OptimizationNode(Node):
     def __init__(self):
-        super().__init__('optimization_node')
-        self.publisher = self.create_publisher(UInt16MultiArray, '/board/sub', 10)
-        self.pot_realized_board1 = [0] * 6  # /board1/pubからのデータ
-        self.pot_realized_board2 = 0       # /board2/pubからのデータ
-        self.target_ranges = [
-            (190, 390),
-            (286, 514),
-            (86, 500),
-            (123, 628),
-            (98, 900),
-            (48, 822),
-            (1, 649)
-        ]
-        self.num_trials = 100
-        self.num_repeats = 5
-        self.best_params = None
-        self.lock = threading.Lock()
+        super().__init__('optimization_node_float')
+
+        #   publisherの作成
+        self.publisher = self.create_publisher(Float32MultiArray, '/board_float/sub', 10)
+
+        #   目標値の範囲と目標値の決定
+        self.pot_desired_range = [(190, 390), (286, 514), (86, 500), (123, 628), (98, 900), (48, 822), (1, 649)]
+        self.pot_desired =  [float(random.randint(r[0], r[1])) for r in self.pot_desired_range]
+
+        #   ポテンショメータの値の配列
+        self.pot_realized_board1 = [0] * 6
+        self.pot_realized_board2 = 0
+
+        #   subscribeの初期化および開始と停止のフラグ
+        self.sub_board1 = None
+        self.sub_board2 = None
+        self.is_subscribing = False
+
+        #   各自由度ごとのSSE（二乗和誤差）
         self.sse_accumulator = [0] * 7
-        self.targets = [random.randint(r[0], r[1]) for r in self.target_ranges]
-        self.ballistic_values = None  # 初回のみランダムに設定
 
-        # スレッド制御用
-        self.stop_event = threading.Event()
+        #   目標値を切り替えるrepeat回数と最適化のtrial回数
+        self.num_repeats = 5
+        self.num_trials = 300
 
+        #   Ballistic Modeパラメータの初期化
+        self.ballistic_values = None
+
+        #   最適化パラメータの初期化
+        self.best_params = None
+    
     def start_subscribers(self):
-        """トピック /board1/pub と /board2/pub の購読を開始 (マルチスレッド)"""
-        self.stop_event.clear()
-        self.board1_thread = threading.Thread(target=self.subscribe_to_board1, daemon=True)
-        self.board2_thread = threading.Thread(target=self.subscribe_to_board2, daemon=True)
-        self.board1_thread.start()
-        self.board2_thread.start()
-        self.get_logger().info("Subscribed to /board1/pub and /board2/pub in separate threads")
+        if not self.is_subscribing:
+            #   subscriberの作成
+            self.sub_board1 = self.create_subscription(
+                UInt16MultiArray, '/board1/pub', self.board1_callback, 10)
+            self.sub_board2 = self.create_subscription(
+                UInt16MultiArray, '/board2/pub', self.board2_callback, 10)
+            
+            #   subscribe開始フラグに変更
+            self.is_subscribing = True
+            self.get_logger().info('Subscribed to topic.')
 
     def stop_subscribers(self):
-        """トピック /board1/pub と /board2/pub の購読を停止"""
-        self.stop_event.set()
-        if self.board1_thread and self.board1_thread.is_alive():
-            self.board1_thread.join()
-        if self.board2_thread and self.board2_thread.is_alive():
-            self.board2_thread.join()
-        self.get_logger().info("Unsubscribed from /board1/pub and /board2/pub")
+        if self.is_subscribing:
+            #   subscriberの削除
+            if self.sub_board1 is not None:
+                self.destroy_subscription(self.sub_board1)
+                self.sub_board1 = None
+            
+            if self.sub_board2 is not None:
+                self.destroy_subscription(self.sub_board2)
+                self.sub_board2 = None
 
-    def subscribe_to_board1(self):
-        """トピック /board1/pub の購読 (独立ノード)"""
-        context = Context()
-        rclpy.init(context=context)
-        board1_node = rclpy.create_node('board1_node', context=context)
-        subscription = board1_node.create_subscription(UInt16MultiArray, '/board1/pub', self.callback_board1, 10)
-        executor = MultiThreadedExecutor(context=context)
-        executor.add_node(board1_node)
-        try:
-            while not self.stop_event.is_set():
-                executor.spin_once(timeout_sec=0.1)
-        finally:
-            board1_node.destroy_subscription(subscription)
-            board1_node.destroy_node()
-            rclpy.shutdown(context=context)
+            self.is_subscribing = False
 
-    def subscribe_to_board2(self):
-        """トピック /board2/pub の購読 (独立ノード)"""
-        context = Context()
-        rclpy.init(context=context)
-        board2_node = rclpy.create_node('board2_node', context=context)
-        subscription = board2_node.create_subscription(UInt16MultiArray, '/board2/pub', self.callback_board2, 10)
-        executor = MultiThreadedExecutor(context=context)
-        executor.add_node(board2_node)
-        try:
-            while not self.stop_event.is_set():
-                executor.spin_once(timeout_sec=0.1)
-        finally:
-            board2_node.destroy_subscription(subscription)
-            board2_node.destroy_node()
-            rclpy.shutdown(context=context)
+            self.get_logger().info('Unsubscribed from topic.')
+    
+    def board1_callback(self, msg):
+        #   /board1/pubのsubscribe
+        self.pot_realized_board1 = msg.data[:6]
 
-    def callback_board1(self, msg):
-        with self.lock:
-            self.pot_realized_board1 = msg.data[:6]
-            #self.get_logger().info("Received data from /board1/pub")
-            sse_per_dof = [(self.targets[i] - self.pot_realized_board1[i]) ** 2 for i in range(6)]
-            for i in range(6):
-                self.sse_accumulator[i] += sse_per_dof[i]
-            #self.get_logger().info(f"SSE for /board1/pub updated: {self.sse_accumulator[:6]}")
+        #   自由度ごとにSSEを計算
+        for i in range(6):
+            sse_per_dof = (self.pot_desired[i] - self.pot_realized_board1[i]) ** 2
+            self.sse_accumulator[i] += sse_per_dof
 
-    def callback_board2(self, msg):
-        with self.lock:
-            self.pot_realized_board2 = msg.data[0]
-            #self.get_logger().info("Received data from /board2/pub")
-            sse_per_dof_6 = (self.targets[6] - self.pot_realized_board2) ** 2
-            self.sse_accumulator[6] += sse_per_dof_6
-            #self.get_logger().info(f"SSE for /board2/pub updated: {self.sse_accumulator[6]}")
+        #self.get_logger().info(f"Received board1: {self.sse_accumulator}")
+    
+    def board2_callback(self, msg):
+        #   /board2/pubのsubscribe
+        self.pot_realized_board2 = msg.data[0]
 
-    def publish_targets(self, repeat):
-        msg = UInt16MultiArray()
+        #   自由度ごとにSSEを計算
+        sse_per_dof_6 = (self.pot_desired[6] - self.pot_realized_board2) ** 2
+        self.sse_accumulator[6] += sse_per_dof_6
+
+        #self.get_logger().info(f"Received board2: {self.sse_accumulator[6]}")
+
+    def publish_function(self, repeat):
+        msg = Float32MultiArray()
+        msg.layout = MultiArrayLayout()
+        dim = MultiArrayDimension()
+        dim.label = 'param'
+        dim.size = 63
+        dim.stride = 63
+        msg.layout.dim = [dim]
+        msg.layout.data_offset = 0
+
         if repeat == 1:
-            self.get_logger().info("repeat1: 目標値とBallistic パラメータ送信")
+            self.get_logger().info("repeat1: 目標値とBallistic Modeパラメータ送信")
         else:
             self.get_logger().info(f"repeat{repeat}: 目標値のみ更新して送信")
-        msg.data = self.targets + self.ballistic_values
+        
+        #   目標値とBallistic Modeパラメータのpublish
+        msg.data = self.pot_desired + self.ballistic_values
         self.publisher.publish(msg)
 
-    def update_targets(self):
-        with self.lock:
-            self.targets = [random.randint(r[0], r[1]) for r in self.target_ranges]
-            #self.get_logger().info(f"Targets updated: {self.targets}")
+    def update_pot_desired(self):
+        #   目標値をランダムに変更
+        self.pot_desired = [float(random.randint(r[0], r[1])) for r in self.pot_desired_range]
 
-    def evaluate(self, trial):
+    def objective(self, trial):
         params = []
 
-        # 各要素で独自の探索範囲を設定
-        error_start_ranges = [
-            (2, 200), (2, 228), (2, 414), (2, 500), (2, 800), (2, 774), (2, 648)
-        ]
-        omega_ranges = [
-            (1, 8500), (1, 10000), (1, 13500), (1, 17000), (1, 26000), (1, 30000), (1, 33000)
-        ]
+        #   各自由度で独自の探索範囲を設定
+        param_func_AE_range = [(0, 0.3), (0, 0.2), (0, 0.4), (0, 0.4), (0, 0.4), (0, 0.5), (0, 0.5)]
+        param_func_AdeltaE_range = [(0, 0.2), (0, 0.1), (0, 0.3), (0, 0.3), (0, 0.3), (0, 0.4), (0, 0.4)]
+        param_func_AV_range = [(0, 4), (0, 3), (0, 4), (0, 3), (0, 3), (0, 4), (0, 4)]
+        param_func_AdeltaV_range = [(-2, 2), (-2, 2), (-3, 3), (-2, 2), (-2, 2), (-3, 3), (-3, 3)]
 
+        param_func_BE_range = [(0, 0.3), (0, 0.2), (0, 0.4), (0, 0.4), (0, 0.4), (0, 0.5), (0, 0.5)]
+        param_func_BdeltaE_range = [(0, 0.2), (0, 0.1), (0, 0.3), (0, 0.3), (0, 0.3), (0, 0.4), (0, 0.4)]
+        param_func_BV_range = [(0, 4), (0, 3), (0, 4), (0, 3), (0, 3), (0, 4), (0, 4)]
+        param_func_BdeltaV_range = [(-2, 2), (-2, 2), (-3, 3), (-2, 2), (-2, 2), (-3, 3), (-3, 3)]
+
+        #   各自由度ごとに最適化対象パラメータの決定
         for i in range(7):
-            # error_start を error_start_ranges から決定
-            error_start_min, error_start_max = error_start_ranges[i]
-            error_start = trial.suggest_int(f'error_start_{i+1}', error_start_min, error_start_max)
+            #   A*POT_desired + B*POT_realized = P
+            #   Aについて
+            param_func_AE_min, param_func_AE_max = param_func_AE_range[i]
+            param_func_AE = trial.suggest_float(f'param_func_AE_{i+1}', param_func_AE_min, param_func_AE_max, step=0.001)
 
-            # error_stop を error_start に基づいて決定
-            error_stop = trial.suggest_int(f'error_stop_{i+1}', 1, error_start - 1)
+            param_func_AdeltaE_min, param_func_AdeltaE_max = param_func_AdeltaE_range[i]
+            param_func_AdeltaE = trial.suggest_float(f'param_func_AdeltaE_{i+1}', param_func_AdeltaE_min, param_func_AdeltaE_max, step=0.001)
 
-            # omega を omega_ranges から決定
-            omega_min, omega_max = omega_ranges[i]
-            omega = trial.suggest_int(f'omega_{i+1}', omega_min, omega_max)
+            param_func_AV_min, param_func_AV_max = param_func_AV_range[i]
+            param_func_AV = trial.suggest_float(f'param_func_AV_{i+1}', param_func_AV_min, param_func_AV_max)
 
-            # delta_omega を omega に基づいて決定
-            delta_omega = trial.suggest_int(f'delta_omega_{i+1}', 1, 2 * omega - 1)
+            param_func_AdeltaV_min, param_func_AdeltaV_max = param_func_AdeltaV_range[i]
+            param_func_AdeltaV = trial.suggest_float(f'param_func_AdeltaV_{i+1}', param_func_AdeltaV_min, param_func_AdeltaV_max, step=0.001)
 
-            # omega_start と omega_stop を計算
-            omega_start = omega + (delta_omega // 2)
-            omega_stop = omega - (delta_omega // 2)
+            #   Bについて
+            param_func_BE_min, param_func_BE_max = param_func_BE_range[i]
+            param_func_BE = trial.suggest_float(f'param_func_BE_{i+1}', param_func_BE_min, param_func_BE_max, step=0.001)
 
-            # 探索結果をリストに追加
-            params.append((error_start, error_stop, omega_start, omega_stop))
+            param_func_BdeltaE_min, param_func_BdeltaE_max = param_func_BdeltaE_range[i]
+            param_func_BdeltaE = trial.suggest_float(f'param_func_BdeltaE_{i+1}', param_func_BdeltaE_min, param_func_BdeltaE_max, step=0.001)
 
-        # Ballistic パラメータの計算
+            param_func_BV_min, param_func_BV_max = param_func_BV_range[i]
+            param_func_BV = trial.suggest_float(f'param_func_BV_{i+1}', param_func_BV_min, param_func_BV_max, step=0.001)
+
+            param_func_BdeltaV_min, param_func_BdeltaV_max = param_func_BdeltaV_range[i]
+            param_func_BdeltaV = trial.suggest_float(f'param_func_BdeltaV_{i+1}', param_func_BdeltaV_min, param_func_BdeltaV_max, step=0.001)
+
+            #   探索結果をリストに追加
+            params.append((param_func_AE, param_func_AdeltaE, param_func_AV, param_func_AdeltaV, param_func_BE, param_func_BdeltaE, param_func_BV, param_func_BdeltaV))
+        
+        #   Ballistic Modeパラメータのタプルを解放
         self.ballistic_values = [val for p in params for val in p]
 
         # SSE 計算の初期化
         total_sse_sum = 0
 
-        # 繰り返し最適化試行
         for repeat in range(1, self.num_repeats + 1):
-            self.update_targets()
-            self.publish_targets(repeat)
+            # SSE 計算の初期化
+            total_sse = 0
 
+            #   目標値を更新
+            self.update_pot_desired()
+
+            #   目標値とBallistic Modeパラメータのpublish
+            self.publish_function(repeat)
+
+            #   subscribeの開始
             self.start_subscribers()
-            time.sleep(5)  # 実験データを取得するまで待機
+
+            #   メッセージの受信
+            self.start_time = time.time()
+            while True:
+                rclpy.spin_once(self, timeout_sec=0.01)
+                self.current_time = time.time()
+
+                if (self.current_time - self.start_time >= 10):
+                    break
+
+            #   subscribeの停止
             self.stop_subscribers()
 
-            with self.lock:
-                total_sse = sum(self.sse_accumulator)
-                total_sse_sum += total_sse
-                self.get_logger().info(f'Total SSE at repeat {repeat}: {total_sse_sum}')
-                self.sse_accumulator = [0] * 7
+            #   SSEを計算
+            total_sse = sum(self.sse_accumulator)
+            total_sse_sum += total_sse
+            self.get_logger().info(f'Total SSE at repeat {repeat}: {total_sse_sum}')
 
+            #   repeatごとに各自由度ごとのSSEを初期化
+            self.sse_accumulator = [0] * 7
+        
         return total_sse_sum
 
-
-
     def optimize(self):
-        study = optuna.create_study(direction='minimize')
-        study.optimize(self.evaluate, n_trials=self.num_trials)
-        self.best_params = study.best_params
+        sampler = optuna.samplers.CmaEsSampler()
+        study = optuna.create_study(sampler = sampler, direction='minimize')
+        study.optimize(self.objective, n_trials = self.num_trials)
 
+        #最適化パラメータの表示
+        self.best_params = study.best_params
         self.get_logger().info(f'最適化終了。試行回数中の最小評価関数値: {study.best_value:.2f}')
         self.get_logger().info(f'最適な試行回数（trial number）は: {study.best_trial.number}')
         for i in range(7):
-            error_start = self.best_params[f'error_start_{i+1}']
-            error_stop = self.best_params[f'error_stop_{i+1}']
-            omega_start = self.best_params[f'omega_{i+1}'] + (self.best_params[f'delta_omega_{i+1}'] // 2)
-            omega_stop = self.best_params[f'omega_{i+1}'] - (self.best_params[f'delta_omega_{i+1}'] // 2)
+            param_func_AE = np.round(self.best_params[f'param_func_AE_{i+1}'], 3)
+            param_func_AdeltaE = np.round(self.best_params[f'param_func_AdeltaE_{i+1}'], 3)
+            param_func_AV = np.round(self.best_params[f'param_func_AV_{i+1}'], 3)
+            param_func_AdeltaV = np.round(self.best_params[f'param_func_AdeltaV_{i+1}'], 3)
+
+            param_func_BE = np.round(self.best_params[f'param_func_BE_{i+1}'], 3)
+            param_func_BdeltaE = np.round(self.best_params[f'param_func_BdeltaE_{i+1}'], 3)
+            param_func_BV = np.round(self.best_params[f'param_func_BV_{i+1}'], 3)
+            param_func_BdeltaV = np.round(self.best_params[f'param_func_BdeltaV_{i+1}'], 3)
+
             self.get_logger().info(
-                f'POT{i + 1}: error_start = {error_start}, error_stop = {error_stop}, '
-                f'omega_start = {omega_start}, omega_stop = {omega_stop}'
+                f'POT{i + 1}: param_func_AE = {param_func_AE}, param_func_AdeltaE = {param_func_AdeltaE}, '
+                f'param_func_AV = {param_func_AV}, param_func_AdeltaV = {param_func_AdeltaV}, '
+                f'param_func_BE = {param_func_BE}, param_func_BdeltaE = {param_func_BdeltaE}, '
+                f'param_func_BV = {param_func_BV}, param_func_BdeltaV = {param_func_BdeltaV}'
             )
 
-
 def main(args=None):
+    #   ROS通信の初期化
     rclpy.init(args=args)
+    #   インスタンスの生成
     node = OptimizationNode()
     try:
         node.optimize()
     finally:
+        node.destroy_node()
         rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()

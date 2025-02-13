@@ -21,6 +21,14 @@ class OptimizationNode(Node):
         self.pot_realized_board1 = [0] * 6
         self.pot_realized_board2 = 0
 
+        #   ポテンショメータの角速度の配列
+        self.omega_board1 = [0] * 6
+        self.omega_board2 = 0
+
+        #   Ballistic Modeチェック値の配列
+        self.check_board1 = [0] * 6
+        self.check_board2 = 0
+
         #   subscribeの初期化および開始と停止のフラグ
         self.sub_board1 = None
         self.sub_board2 = None
@@ -29,9 +37,16 @@ class OptimizationNode(Node):
         #   各自由度ごとのSSE（二乗和誤差）
         self.sse_accumulator = [0] * 7
 
+        #   各自由度ごとの角速度の積分値
+        self.sum_omega = [0] * 7
+
+        #   各自由度ごとのBallistic Modeチェック値の合計
+        self.sum_check1 = [0] * 7
+        self.sum_check0 = [0] * 7
+
         #   目標値を切り替えるrepeat回数と最適化のtrial回数
-        self.num_repeats = 5
-        self.num_trials = 300
+        self.num_repeats = 2
+        self.num_trials = 2
 
         #   Ballistic Modeパラメータの初期化
         self.ballistic_values = None
@@ -69,23 +84,48 @@ class OptimizationNode(Node):
     def board1_callback(self, msg):
         #   /board1/pubのsubscribe
         self.pot_realized_board1 = msg.data[:6]
+        self.omega_board1 = msg.data[6:12]
+        self.check_board1 = msg.data[12:]
 
-        #   自由度ごとにSSEを計算
+        #   自由度ごとに「SSE」,「角速度の積分値」、「PID&BallisticMode回数」を計算
         for i in range(6):
+            #   SSE
             sse_per_dof = (self.pot_desired[i] - self.pot_realized_board1[i]) ** 2
             self.sse_accumulator[i] += sse_per_dof
 
-        #self.get_logger().info(f"Received board1: {self.sse_accumulator}")
+            #   角速度の積分値
+            self.sum_omega[i] += self.omega_board1[i]
+
+            #   PID&BallisticMode回数
+            if self.check_board1[i] == 1:
+                self.sum_check1[i] += 1
+            else:
+                self.sum_check0[i] += 1
+
+        #self.get_logger().info(f"Received board1: {self.check_board1}")
     
     def board2_callback(self, msg):
         #   /board2/pubのsubscribe
         self.pot_realized_board2 = msg.data[0]
+        self.omega_board2 = msg.data[6]
+        self.check_board2 = msg.data[12]
 
-        #   自由度ごとにSSEを計算
+
+        #   自由度ごとに「SSE」,「角速度の積分値」、「PID&BallisticMode回数」を計算
+        #   SSE
         sse_per_dof_6 = (self.pot_desired[6] - self.pot_realized_board2) ** 2
         self.sse_accumulator[6] += sse_per_dof_6
 
-        #self.get_logger().info(f"Received board2: {self.sse_accumulator[6]}")
+        #   角速度の積分値
+        self.sum_omega[6] += self.omega_board2
+
+        #   PID&BallisticMode回数
+        if self.check_board2 == 1:
+            self.sum_check1[6] += 1
+        else:
+            self.sum_check0[6] += 1
+
+        #self.get_logger().info(f"Received board2: {self.check_board2}")
 
     def publish_function(self, repeat):
         msg = Float32MultiArray()
@@ -114,15 +154,15 @@ class OptimizationNode(Node):
         params = []
 
         #   各自由度で独自の探索範囲を設定
-        param_func_AE_range = [(0, 0.3), (0, 0.2), (0, 0.4), (0, 0.4), (0, 0.4), (0, 0.5), (0, 0.5)]
-        param_func_AdeltaE_range = [(0, 0.2), (0, 0.1), (0, 0.3), (0, 0.3), (0, 0.3), (0, 0.4), (0, 0.4)]
-        param_func_AV_range = [(0, 4), (0, 3), (0, 4), (0, 3), (0, 3), (0, 4), (0, 4)]
-        param_func_AdeltaV_range = [(-2, 2), (-2, 2), (-3, 3), (-2, 2), (-2, 2), (-3, 3), (-3, 3)]
+        param_func_AE_range = [(0.2, 0.5), (0.2, 0.4), (0.2, 0.6), (0.2, 0.6), (0.2, 0.6), (0.2, 0.7), (0.2, 0.7)]
+        param_func_AdeltaE_range = [(0.1, 0.3), (0.1, 0.2), (0.1, 0.4), (0.1, 0.4), (0.1, 0.4), (0.1, 0.5), (0.1, 0.5)]
+        param_func_AV_range = [(2, 6), (2, 6), (2, 6), (2, 6), (2, 6), (2, 6), (2, 6)]
+        param_func_AdeltaV_range = [(-3, 3), (-3, 3), (-3, 3), (-3, 3), (-3, 3), (-3, 3), (-3, 3)]
 
-        param_func_BE_range = [(0, 0.3), (0, 0.2), (0, 0.4), (0, 0.4), (0, 0.4), (0, 0.5), (0, 0.5)]
-        param_func_BdeltaE_range = [(0, 0.2), (0, 0.1), (0, 0.3), (0, 0.3), (0, 0.3), (0, 0.4), (0, 0.4)]
-        param_func_BV_range = [(0, 4), (0, 3), (0, 4), (0, 3), (0, 3), (0, 4), (0, 4)]
-        param_func_BdeltaV_range = [(-2, 2), (-2, 2), (-3, 3), (-2, 2), (-2, 2), (-3, 3), (-3, 3)]
+        param_func_BE_range = [(0.2, 0.5), (0.2, 0.4), (0.2, 0.6), (0.2, 0.6), (0.2, 0.6), (0.2, 0.7), (0.2, 0.7)]
+        param_func_BdeltaE_range = [(0.1, 0.3), (0.1, 0.2), (0.1, 0.4), (0.1, 0.4), (0.1, 0.4), (0.1, 0.5), (0.1, 0.5)]
+        param_func_BV_range = [(2, 6), (2, 6), (2, 6), (2, 6), (2, 6), (2, 6), (2, 6)]
+        param_func_BdeltaV_range = [(-3, 3), (-3, 3), (-3, 3), (-3, 3), (-3, 3), (-3, 3), (-3, 3)]
 
         #   各自由度ごとに最適化対象パラメータの決定
         for i in range(7):
@@ -159,12 +199,22 @@ class OptimizationNode(Node):
         #   Ballistic Modeパラメータのタプルを解放
         self.ballistic_values = [val for p in params for val in p]
 
-        # SSE 計算の初期化
+        # 評価関数の初期化
         total_sse_sum = 0
 
         for repeat in range(1, self.num_repeats + 1):
-            # SSE 計算の初期化
+            # SSE計算の初期化
             total_sse = 0
+
+            #   角速度の積分値計算の初期化
+            total_omega = [0] * 7
+            omega_penalty = [0] * 7
+            total_omega_penalty = 0
+            threshold_omega = [200000, 250000, 440000, 550000, 880000, 880000, 660000]
+
+            #   PID&BallisticMode回数計算の初期化
+            check_penalty = [0] * 7
+            total_check_penalty = 0
 
             #   目標値を更新
             self.update_pot_desired()
@@ -189,11 +239,31 @@ class OptimizationNode(Node):
 
             #   SSEを計算
             total_sse = sum(self.sse_accumulator)
-            total_sse_sum += total_sse
+            total_sse_sum += total_sse/2
+
+            #   角速度の積分値を計算
+            for i in range(7):
+                total_omega[i] = self.sum_omega[i] - threshold_omega[i]
+                omega_penalty[i] = max(0, total_omega[i])
+            total_omega_penalty = sum(omega_penalty)
+            total_sse_sum += total_omega_penalty*10000000
+
+            #   PID&BallisticMode回数の計算
+            for i in range(7):
+                if self.sum_check1[i] > self.sum_check0[i]:
+                    check_penalty[i] += 1
+                else:
+                    check_penalty[i] += 0
+            total_check_penalty = sum(check_penalty)
+            total_sse_sum += total_check_penalty*100000000
+
             self.get_logger().info(f'Total SSE at repeat {repeat}: {total_sse_sum}')
 
-            #   repeatごとに各自由度ごとのSSEを初期化
+            #   repeatごとに各自由度ごとの「SSE」,「角速度の積分値」、「PID&BallisticMode回数」を初期化
             self.sse_accumulator = [0] * 7
+            self.sum_omega = [0] * 7
+            self.sum_check1 = [0] * 7
+            self.sum_check0 = [0] * 7
         
         return total_sse_sum
 
