@@ -39,6 +39,7 @@ setup(
             'optimize_test=py_pkg.optimize_test:main',
             'optimize_ROS2=py_pkg.optimize_ROS2:main',
             'optimize_ROS2_float=py_pkg.optimize_ROS2_float:main',
+            'optimize_ADRC_ROS2_float=py_pkg.optimize_ADRC_ROS2_float:main',
             'optimize_Ballistic_ROS2=py_pkg.optimize_Ballistic_ROS2:main'
         ],
     },
