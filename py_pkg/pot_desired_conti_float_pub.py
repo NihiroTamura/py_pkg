@@ -1,13 +1,16 @@
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import Float32MultiArray, MultiArrayDimension, MultiArrayLayout
+import random
 
 class Float32MultiArrayPublisher(Node):
     def __init__(self):
         super().__init__('Float32_multi_array_publisher')
         self.publisher_ = self.create_publisher(Float32MultiArray, '/board_float/sub', 10)
-        timer_period = 2  # 秒
-        self.timer = self.create_timer(timer_period, self.publish_message)
+        self.get_logger().info('Press Enter to publish desired Angle')
+
+        #   目標値の範囲
+        self.pot_desired_range = [(210, 370), (300, 500), (100, 480), (140, 600), (120, 880), (70, 800), (20, 620)]
 
     def publish_message(self):
         msg = Float32MultiArray()
@@ -21,21 +24,8 @@ class Float32MultiArrayPublisher(Node):
         msg.layout.data_offset = 0
         
         # データ設定
-        # 初期値
-        #msg.data = [260.0, 400.0, 180.0, 500.0, 600.0, 500.0, 500.0]
-        # 目標値1
-        msg.data = [350.0, 300.0, 380.0, 300.0, 450.0, 300.0, 300.0]
-        # 目標値2
-        #msg.data = [200.0, 400.0, 120.0, 450.0, 420.0, 200.0, 200.0]
-        # 目標値3
-        #msg.data = [230.0, 370.0, 150.0, 520.0, 600.0, 500.0, 500.0]
-        # 目標値4
-        #msg.data = [300.0, 460.0, 420.0, 200.0, 100.0, 100.0, 100.0]
-        # 目標値5
-        #msg.data = [260.0, 300.0, 480.0, 150.0, 800.0, 300.0, 400.0]
-        
-        #ポテンショメータの値の範囲
-        #[腕の閉190-390開, 腕の下286-514上, 上腕の旋回内86-500外, 肘の伸123-628曲, 前腕の旋回内98-900外, 小指側縮48-822伸, 親指側縮1-649伸]
+        self.pot_desired = [float(random.randint(r[0], r[1])) for r in self.pot_desired_range]
+        msg.data = self.pot_desired
 
         # メッセージ送信
         self.publisher_.publish(msg)
@@ -45,7 +35,9 @@ def main(args=None):
     rclpy.init(args=args)
     node = Float32MultiArrayPublisher()
     try:
-        rclpy.spin(node)
+        while rclpy.ok():
+            input()  # エンターキー待ち
+            node.publish_message()
     except KeyboardInterrupt:
         pass
     finally:
