@@ -1,0 +1,309 @@
+import rclpy
+from rclpy.node import Node
+from std_msgs.msg import UInt16MultiArray, Float32MultiArray, MultiArrayDimension, MultiArrayLayout
+import optuna
+import random
+import time
+import numpy as np
+
+class OptimizationNode(Node):
+    def __init__(self):
+        super().__init__('optimization_node_float')
+
+        #   publisherの作成
+        self.publisher = self.create_publisher(Float32MultiArray, '/board_float/sub', 10)
+
+        #   目標値の範囲と目標値の決定
+        self.pot_desired_range = [(190, 390), (286, 514), (86, 500), (123, 628), (98, 900), (48, 822), (1, 649)]
+        self.pot_desired =  [float(random.randint(r[0], r[1])) for r in self.pot_desired_range]
+
+        #   ポテンショメータの値の配列
+        self.pot_realized_board1 = [0] * 6
+        self.pot_realized_board2 = 0
+
+        #   ポテンショメータの角速度の配列
+        self.omega_board1 = [0] * 6
+        self.omega_board2 = 0
+
+        #   Ballistic Modeチェック値の配列
+        self.check_board1 = [0] * 6
+        self.check_board2 = 0
+
+        #   subscribeの初期化および開始と停止のフラグ
+        self.sub_board1 = None
+        self.sub_board2 = None
+        self.is_subscribing = False
+
+        #   各自由度ごとのSSE（二乗和誤差）
+        self.sse_accumulator = [0] * 7
+
+        #   各自由度ごとの角速度の積分値
+        self.sum_omega = [0] * 7
+
+        #   各自由度ごとのBallistic Modeチェック値の合計
+        self.sum_check1 = [0] * 7
+        self.sum_check0 = [0] * 7
+
+        #   目標値を切り替えるrepeat回数と最適化のtrial回数
+        self.num_repeats = 5
+        self.num_trials = 150
+
+        #   Ballistic Modeパラメータの初期化
+        self.ballistic_values = None
+
+        #   最適化パラメータの初期化
+        self.best_params = None
+    
+    def start_subscribers(self):
+        if not self.is_subscribing:
+            #   subscriberの作成
+            self.sub_board1 = self.create_subscription(
+                UInt16MultiArray, '/board1/pub', self.board1_callback, 10)
+            self.sub_board2 = self.create_subscription(
+                UInt16MultiArray, '/board2/pub', self.board2_callback, 10)
+            
+            #   subscribe開始フラグに変更
+            self.is_subscribing = True
+            self.get_logger().info('Subscribed to topic.')
+
+    def stop_subscribers(self):
+        if self.is_subscribing:
+            #   subscriberの削除
+            if self.sub_board1 is not None:
+                self.destroy_subscription(self.sub_board1)
+                self.sub_board1 = None
+            
+            if self.sub_board2 is not None:
+                self.destroy_subscription(self.sub_board2)
+                self.sub_board2 = None
+
+            self.is_subscribing = False
+
+            self.get_logger().info('Unsubscribed from topic.')
+    
+    def board1_callback(self, msg):
+        #   /board1/pubのsubscribe
+        self.pot_realized_board1 = msg.data[:6]
+        self.omega_board1 = msg.data[6:12]
+        self.check_board1 = msg.data[12:]
+
+        #   自由度ごとに「SSE」,「角速度の積分値」、「PID&BallisticMode回数」を計算
+        for i in range(6):
+            #   SSE
+            sse_per_dof = (self.pot_desired[i] - self.pot_realized_board1[i]) ** 2
+            self.sse_accumulator[i] += sse_per_dof
+
+            #   角速度の積分値
+            self.sum_omega[i] += self.omega_board1[i]
+
+            #   PID&BallisticMode回数
+            if self.check_board1[i] == 1:
+                self.sum_check1[i] += 1
+            else:
+                self.sum_check0[i] += 1
+
+        #self.get_logger().info(f"Received board1: {self.check_board1}")
+    
+    def board2_callback(self, msg):
+        #   /board2/pubのsubscribe
+        self.pot_realized_board2 = msg.data[0]
+        self.omega_board2 = msg.data[6]
+        self.check_board2 = msg.data[12]
+
+
+        #   自由度ごとに「SSE」,「角速度の積分値」、「PID&BallisticMode回数」を計算
+        #   SSE
+        sse_per_dof_6 = (self.pot_desired[6] - self.pot_realized_board2) ** 2
+        self.sse_accumulator[6] += sse_per_dof_6
+
+        #   角速度の積分値
+        self.sum_omega[6] += self.omega_board2
+
+        #   PID&BallisticMode回数
+        if self.check_board2 == 1:
+            self.sum_check1[6] += 1
+        else:
+            self.sum_check0[6] += 1
+
+        #self.get_logger().info(f"Received board2: {self.check_board2}")
+
+    def publish_function(self, repeat):
+        msg = Float32MultiArray()
+        msg.layout = MultiArrayLayout()
+        dim = MultiArrayDimension()
+        dim.label = 'param'
+        dim.size = 63
+        dim.stride = 63
+        msg.layout.dim = [dim]
+        msg.layout.data_offset = 0
+
+        if repeat == 1:
+            self.get_logger().info("repeat1: 目標値とBallistic Modeパラメータ送信")
+        else:
+            self.get_logger().info(f"repeat{repeat}: 目標値のみ更新して送信")
+        
+        #   目標値とBallistic Modeパラメータのpublish
+        msg.data = self.pot_desired + self.ballistic_values
+        self.publisher.publish(msg)
+
+    def update_pot_desired(self):
+        #   目標値をランダムに変更
+        self.pot_desired = [float(random.randint(r[0], r[1])) for r in self.pot_desired_range]
+
+    def objective(self, trial):
+        params = []
+
+        #   各自由度で独自の探索範囲を設定
+        param_func_AE_range = [(0.2, 0.5), (0.2, 0.4), (0.2, 0.6), (0.2, 0.6), (0.2, 0.6), (0.2, 0.7), (0.2, 0.7)]
+        param_func_AdeltaE_range = [(0.1, 0.3), (0.1, 0.2), (0.1, 0.4), (0.1, 0.4), (0.1, 0.4), (0.1, 0.5), (0.1, 0.5)]
+        param_func_AV_range = [(2, 6), (2, 6), (2, 6), (2, 6), (2, 6), (2, 6), (2, 6)]
+        param_func_AdeltaV_range = [(-3, 3), (-3, 3), (-3, 3), (-3, 3), (-3, 3), (-3, 3), (-3, 3)]
+
+        param_func_BE_range = [(0.2, 0.5), (0.2, 0.4), (0.2, 0.6), (0.2, 0.6), (0.2, 0.6), (0.2, 0.7), (0.2, 0.7)]
+        param_func_BdeltaE_range = [(0.1, 0.3), (0.1, 0.2), (0.1, 0.4), (0.1, 0.4), (0.1, 0.4), (0.1, 0.5), (0.1, 0.5)]
+        param_func_BV_range = [(2, 6), (2, 6), (2, 6), (2, 6), (2, 6), (2, 6), (2, 6)]
+        param_func_BdeltaV_range = [(-3, 3), (-3, 3), (-3, 3), (-3, 3), (-3, 3), (-3, 3), (-3, 3)]
+
+        #   各自由度ごとに最適化対象パラメータの決定
+        for i in range(7):
+            #   A*POT_desired + B*POT_realized = P
+            #   Aについて
+            param_func_AE_min, param_func_AE_max = param_func_AE_range[i]
+            param_func_AE = trial.suggest_float(f'param_func_AE_{i+1}', param_func_AE_min, param_func_AE_max, step=0.001)
+
+            param_func_AdeltaE_min, param_func_AdeltaE_max = param_func_AdeltaE_range[i]
+            param_func_AdeltaE = trial.suggest_float(f'param_func_AdeltaE_{i+1}', param_func_AdeltaE_min, param_func_AdeltaE_max, step=0.001)
+
+            param_func_AV_min, param_func_AV_max = param_func_AV_range[i]
+            param_func_AV = trial.suggest_float(f'param_func_AV_{i+1}', param_func_AV_min, param_func_AV_max)
+
+            param_func_AdeltaV_min, param_func_AdeltaV_max = param_func_AdeltaV_range[i]
+            param_func_AdeltaV = trial.suggest_float(f'param_func_AdeltaV_{i+1}', param_func_AdeltaV_min, param_func_AdeltaV_max, step=0.001)
+
+            #   Bについて
+            param_func_BE_min, param_func_BE_max = param_func_BE_range[i]
+            param_func_BE = trial.suggest_float(f'param_func_BE_{i+1}', param_func_BE_min, param_func_BE_max, step=0.001)
+
+            param_func_BdeltaE_min, param_func_BdeltaE_max = param_func_BdeltaE_range[i]
+            param_func_BdeltaE = trial.suggest_float(f'param_func_BdeltaE_{i+1}', param_func_BdeltaE_min, param_func_BdeltaE_max, step=0.001)
+
+            param_func_BV_min, param_func_BV_max = param_func_BV_range[i]
+            param_func_BV = trial.suggest_float(f'param_func_BV_{i+1}', param_func_BV_min, param_func_BV_max, step=0.001)
+
+            param_func_BdeltaV_min, param_func_BdeltaV_max = param_func_BdeltaV_range[i]
+            param_func_BdeltaV = trial.suggest_float(f'param_func_BdeltaV_{i+1}', param_func_BdeltaV_min, param_func_BdeltaV_max, step=0.001)
+
+            #   探索結果をリストに追加
+            params.append((param_func_AE, param_func_AdeltaE, param_func_AV, param_func_AdeltaV, param_func_BE, param_func_BdeltaE, param_func_BV, param_func_BdeltaV))
+        
+        #   Ballistic Modeパラメータのタプルを解放
+        self.ballistic_values = [val for p in params for val in p]
+
+        # 評価関数の初期化
+        total_sse_sum = 0
+
+        for repeat in range(1, self.num_repeats + 1):
+            # SSE計算の初期化
+            total_sse = 0
+
+            #   角速度の積分値計算の初期化
+            total_omega = [0] * 7
+            omega_penalty = [0] * 7
+            total_omega_penalty = 0
+            threshold_omega = [200000, 250000, 440000, 550000, 880000, 880000, 660000]
+
+            #   PID&BallisticMode回数計算の初期化
+            check_penalty = [0] * 7
+            total_check_penalty = 0
+
+            #   目標値を更新
+            self.update_pot_desired()
+
+            #   目標値とBallistic Modeパラメータのpublish
+            self.publish_function(repeat)
+
+            #   subscribeの開始
+            self.start_subscribers()
+
+            #   メッセージの受信
+            self.start_time = time.time()
+            while True:
+                rclpy.spin_once(self, timeout_sec=0.01)
+                self.current_time = time.time()
+
+                if (self.current_time - self.start_time >= 10):
+                    break
+
+            #   subscribeの停止
+            self.stop_subscribers()
+
+            #   SSEを計算
+            total_sse = sum(self.sse_accumulator)
+            total_sse_sum += total_sse/2
+
+            #   角速度の積分値を計算
+            for i in range(7):
+                total_omega[i] = self.sum_omega[i] - threshold_omega[i]
+                omega_penalty[i] = max(0, total_omega[i])
+            total_omega_penalty = sum(omega_penalty)
+            total_sse_sum += total_omega_penalty*10000000
+
+            #   PID&BallisticMode回数の計算
+            for i in range(7):
+                if self.sum_check1[i] > self.sum_check0[i]:
+                    check_penalty[i] += 1
+                else:
+                    check_penalty[i] += 0
+            total_check_penalty = sum(check_penalty)
+            total_sse_sum += total_check_penalty*100000000
+
+            self.get_logger().info(f'Total SSE at repeat {repeat}: {total_sse_sum}')
+
+            #   repeatごとに各自由度ごとの「SSE」,「角速度の積分値」、「PID&BallisticMode回数」を初期化
+            self.sse_accumulator = [0] * 7
+            self.sum_omega = [0] * 7
+            self.sum_check1 = [0] * 7
+            self.sum_check0 = [0] * 7
+        
+        return total_sse_sum
+
+    def optimize(self):
+        sampler = optuna.samplers.CmaEsSampler()
+        study = optuna.create_study(sampler = sampler, direction='minimize')
+        study.optimize(self.objective, n_trials = self.num_trials)
+
+        #最適化パラメータの表示
+        self.best_params = study.best_params
+        self.get_logger().info(f'最適化終了。試行回数中の最小評価関数値: {study.best_value:.2f}')
+        self.get_logger().info(f'最適な試行回数（trial number）は: {study.best_trial.number}')
+        for i in range(7):
+            param_func_AE = np.round(self.best_params[f'param_func_AE_{i+1}'], 3)
+            param_func_AdeltaE = np.round(self.best_params[f'param_func_AdeltaE_{i+1}'], 3)
+            param_func_AV = np.round(self.best_params[f'param_func_AV_{i+1}'], 3)
+            param_func_AdeltaV = np.round(self.best_params[f'param_func_AdeltaV_{i+1}'], 3)
+
+            param_func_BE = np.round(self.best_params[f'param_func_BE_{i+1}'], 3)
+            param_func_BdeltaE = np.round(self.best_params[f'param_func_BdeltaE_{i+1}'], 3)
+            param_func_BV = np.round(self.best_params[f'param_func_BV_{i+1}'], 3)
+            param_func_BdeltaV = np.round(self.best_params[f'param_func_BdeltaV_{i+1}'], 3)
+
+            self.get_logger().info(
+                f'POT{i + 1}: param_func_AE = {param_func_AE}, param_func_AdeltaE = {param_func_AdeltaE}, '
+                f'param_func_AV = {param_func_AV}, param_func_AdeltaV = {param_func_AdeltaV}, '
+                f'param_func_BE = {param_func_BE}, param_func_BdeltaE = {param_func_BdeltaE}, '
+                f'param_func_BV = {param_func_BV}, param_func_BdeltaV = {param_func_BdeltaV}'
+            )
+
+def main(args=None):
+    #   ROS通信の初期化
+    rclpy.init(args=args)
+    #   インスタンスの生成
+    node = OptimizationNode()
+    try:
+        node.optimize()
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()

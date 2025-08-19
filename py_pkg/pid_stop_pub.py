@@ -8,12 +8,9 @@ class PIDControllerNode(Node):
         super().__init__('pid_controller')
 
         ## 各自由度ごとにデフォルトのPIDゲインを設定
-        #self.kp = self.declare_parameter('kp', [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]).value
-        #self.ki = self.declare_parameter('ki', [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).value
-        #self.kd = self.declare_parameter('kd', [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).value
-        self.kp = self.declare_parameter('kp', [0.15, 0.3, 0.25, 0.005, 0.25, 0.1, 0.1]).value
-        self.ki = self.declare_parameter('ki', [0.0005, 0.004, 0.0003, 0.0003, 0.0, 0.0, 0.001]).value
-        self.kd = self.declare_parameter('kd', [0.1, 0.2, 0.1, 0.1, 0.1, 0.1, 0.1]).value
+        self.kp = self.declare_parameter('kp', [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]).value
+        self.ki = self.declare_parameter('ki', [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).value
+        self.kd = self.declare_parameter('kd', [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).value
 
         ## 各自由度ごとの圧力の正方向とポテンショメータの正方向の対応を整理
         self.sine = self.declare_parameter('sine', [-1.0, -1.0, 1.0, -1.0, -1.0, -1.0, -1.0]).value
@@ -46,8 +43,8 @@ class PIDControllerNode(Node):
         self.publisher2 = self.create_publisher(UInt16MultiArray, '/VEAB2/desired', 10)
 
         ## タイマーを設定して一定間隔でcalculate_and_publishを実行
-        self.timer_period = 0.0125  # 秒(1/0.0125=80 Hz)
-        self.timer = self.create_timer(self.timer_period, self.calculate_and_publish)  # Nodeのメソッド
+        self.timer_period = 0.0125  # 秒 (1/0.0125=80 Hz)
+        self.timer = self.create_timer(self.timer_period, self.calculate_and_publish)
 
     ## 時系列のポテンショメータの値をキューに追加
     # 実現値をキューに追加
@@ -58,6 +55,14 @@ class PIDControllerNode(Node):
     def desired_callback(self, msg):
         self.desired_queue.append(msg.data)
 
+    ## 停止モードの条件を満たすか確認する関数
+    def check_conditions(self, realized_value, previous_realized_value, desired_value):
+        error_margin = 30
+        rate_of_change = abs(realized_value - previous_realized_value)
+        if abs(realized_value - desired_value) <= error_margin and rate_of_change >= 10:
+            return True
+        return False
+
     ## calculate_and_publish (VEAB1とVEAB2に送る圧力のPWMの値を計算しパブリッシュ)
     def calculate_and_publish(self):
         if not self.realized_queue or not self.desired_queue:
@@ -67,38 +72,59 @@ class PIDControllerNode(Node):
         realized_data = self.realized_queue[-1]
         desired_data = self.desired_queue[-1]
 
+        # 直前のポテンショメータの実測値を取得
+        previous_realized_data = self.realized_queue[-2] if len(self.realized_queue) > 1 else realized_data
+
         # 誤差を計算
         current_errors = [(desired_data[i] - realized_data[i]) for i in range(1, 8)]
 
         # VEAB1とVEAB2に与える圧力差の初期化
         pid_outputs = []
 
-        # VEAB1とVEAB2に与える圧力差の計算
-        for i, error in enumerate(current_errors):
-            self.integral[i] += error
-            derivative = error - self.previous_errors[i]
-
-            pid_output = (self.kp[i] * error +
-                          self.ki[i] * self.integral[i] +
-                          self.kd[i] * derivative)
-            
-            pid_output = self.sine[i] * pid_output
-
-            pid_outputs.append(pid_output)
-
-            # 計算に用いた誤差を前回の誤差に変更(次の誤差計算用)
-            self.previous_errors[i] = error
-
         # VEAB1とVEAB2に与えるPWMの値の初期化
         veab1_values = []
         veab2_values = []
 
-        # VEAB1とVEAB2に与えるPWMの値を計算し格納
-        for i, val in enumerate(pid_outputs):
-            if i < 6:
-                veab1_values.extend(self.calculate_veab_values(val))
+        # 停止モードの値の設定
+        conditions = [
+            (134, 122),
+            (159, 97),
+            (128, 128),
+            (130, 126),
+            (128, 128),
+            (135, 121),
+            (132, 124)
+        ]
+
+        for i in range(len(conditions)):
+            veab_val1, veab_val2 = conditions[i]
+
+            # 停止モードの条件を満たすか確認
+            if self.check_conditions(realized_data[i+1], previous_realized_data[i+1], desired_data[i+1]):
+                if i < 6:
+                    veab1_values.extend([veab_val1, veab_val2])
+                else:
+                    veab2_values.extend([veab_val1, veab_val2])
             else:
-                veab2_values.extend(self.calculate_veab_values(val))
+                # PID制御を行う(VEAB1とVEAB2に与える圧力差の計算)
+                error = current_errors[i]
+                self.integral[i] += error
+                derivative = error - self.previous_errors[i]
+
+                pid_output = (self.kp[i] * error +
+                              self.ki[i] * self.integral[i] +
+                              self.kd[i] * derivative)
+            
+                pid_output = self.sine[i] * pid_output
+
+                veab_values = self.calculate_veab_values(pid_output)
+                if i < 6:
+                    veab1_values.extend(veab_values)
+                else:
+                    veab2_values.extend(veab_values)
+
+                # 計算に用いた誤差を前回の誤差に変更(次の誤差計算用)
+                self.previous_errors[i] = error
 
         # publish_values関数を用いてVEAB1とVEAB2に与えるPWMの値をパブリッシュする
         self.publish_values(self.publisher1, veab1_values)
@@ -114,8 +140,8 @@ class PIDControllerNode(Node):
         veab2 = average - (difference / 2.0)
 
         # 値をクリップし、整数型に変換
-        veab1 = max(0, min(255, int(veab1)))
-        veab2 = max(0, min(255, int(veab2)))
+        veab1 = max(0, min(6000, int(veab1)))
+        veab2 = max(0, min(6000, int(veab2)))
 
         return [veab1, veab2]
 

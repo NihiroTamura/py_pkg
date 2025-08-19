@@ -9,6 +9,19 @@
 
   <exec_depend>rclpy</exec_depend>
   <exec_depend>std_msgs</exec_depend>
+  <exec_depend>collections</exec_depend>
+  <exec_depend>numpy</exec_depend>
+  <exec_depend>csv</exec_depend>
+  <exec_depend>datetime</exec_depend>
+  <exec_depend>time</exec_depend>
+  <exec_depend>optuna</exec_depend>
+  <exec_depend>random</exec_depend>
+  <exec_depend>rcl_interfaces</exec_depend>
+  <exec_depend>std_srvs</exec_depend>
+  <exec_depend>threading</exec_depend>
+  <exec_depend>queue</exec_depend>
+  <exec_depend>os</exec_depend>
+
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>
