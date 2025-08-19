@@ -21,8 +21,8 @@ class GoalPublisher(Node):
         self.first_time = True  # 初回かどうかのフラグ
 
         # 自由度ごとの目標値制限
-        self.min_limits = [210.0, 300.0, 100.0, 140.0, 120.0, 70.0, 20.0]
-        self.max_limits = [370.0, 500.0, 480.0, 600.0, 880.0, 800.0, 620.0]
+        self.min_limits = [210.0, 310.0, 120.0, 160.0, 140.0, 80.0, 40.0]
+        self.max_limits = [330.0, 430.0, 430.0, 560.0, 810.0, 700.0, 570.0]
 
         # 自由度有効フラグ（True=動かす, False=固定）
         self.enable_dof = [True] * 7

@@ -10,7 +10,7 @@ class Float32MultiArrayPublisher(Node):
         self.get_logger().info('Press Enter to publish desired Angle')
 
         #   目標値の範囲
-        self.pot_desired_range = [(210, 370), (300, 500), (100, 480), (140, 600), (120, 880), (70, 800), (20, 620)]
+        self.pot_desired_range = [(210, 330), (310, 430), (120, 430), (160, 560), (140, 810), (80, 700), (40, 570)]
 
     def publish_message(self):
         msg = Float32MultiArray()

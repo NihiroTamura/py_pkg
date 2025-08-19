@@ -66,9 +66,9 @@ class DataRecorderNode(Node):
             self.start_time = time.time()
 
             self.sub_board1 = self.create_subscription(
-                UInt16MultiArray, '/board1/pub', self.board1_callback, 10)
+                Float32MultiArray, '/board1/pub', self.board1_callback, 10)
             self.sub_board2 = self.create_subscription(
-                UInt16MultiArray, '/board2/pub', self.board2_callback, 10)
+                Float32MultiArray, '/board2/pub', self.board2_callback, 10)
 
             # 書き込みスレッドを起動
             self.thread_board1 = threading.Thread(
