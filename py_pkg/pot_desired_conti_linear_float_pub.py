@@ -15,14 +15,14 @@ class GoalPublisher(Node):
         self.current_goal = self.initial_goal.copy()
 
         # 自由度ごとの目標値制限
-        self.min_limits = [210.0, 300.0, 100.0, 140.0, 120.0, 70.0, 20.0]
-        self.max_limits = [370.0, 500.0, 480.0, 600.0, 880.0, 800.0, 620.0]
+        self.min_limits = [210.0, 310.0, 120.0, 160.0, 140.0, 80.0, 40.0]
+        self.max_limits = [330.0, 430.0, 430.0, 560.0, 810.0, 700.0, 570.0]
 
         # 10回分の目標値と傾き設定
         # それぞれ「[目標値のリスト]」「[傾きのリスト]」
         self.goal_sequence = [
-            [289.0, 427.0, 324.0, 188.0, 130.0, 118.0, 355.0],
-            [344.0, 323.0, 164.0, 460.0, 325.0, 572.0, 95.0],
+            [330.0, 330.0, 250.0, 430.0, 530.0, 430.0, 430.0],
+            [260.0, 400.0, 180.0, 500.0, 600.0, 500.0, 500.0],
             [219.0, 486.0, 122.0, 239.0, 627.0, 732.0, 297.0],
             [248.0, 315.0, 304.0, 556.0, 122.0, 427.0, 76.0],
             [253.0, 410.0, 216.0, 586.0, 746.0, 641.0, 144.0],
@@ -34,7 +34,7 @@ class GoalPublisher(Node):
         ]
 
         self.slope_sequence = [
-            [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+            [0.07, 0.07, 0.07, 0.07, 0.07, 0.07, 0.07]
         ] * 10  # 全て同じ傾きならこう書ける
 
         self.current_step = -1  # まだ開始していない
@@ -75,20 +75,28 @@ class GoalPublisher(Node):
                 else:
                     self.current_goal[i] += step if diff > 0 else -step
                     done = False
+            
+            # --- slopeを決定 ---
+            if done:
+                slope_data = [0.0] * 7   # 到達直前は0を送る
+            else:
+                slope_data = [s * 1000.0 for s in self.slope]
 
             # メッセージ作成
+            combined_data = self.current_goal + slope_data
+
             msg = Float32MultiArray()
             msg.layout = MultiArrayLayout()
             dim = MultiArrayDimension()
-            dim.label = 'goal'
-            dim.size = 7
-            dim.stride = 7
+            dim.label = 'goal_and_slope'
+            dim.size = 14
+            dim.stride = 14
             msg.layout.dim = [dim]
             msg.layout.data_offset = 0
-            msg.data = self.current_goal
+            msg.data = combined_data
 
             self.publisher_.publish(msg)
-            self.get_logger().info(f'Published goal: {msg.data}')
+            self.get_logger().info(f'Published goal+speed: {msg.data}')
 
             if done:
                 print("✔ すべての自由度が目標値に到達しました。")
