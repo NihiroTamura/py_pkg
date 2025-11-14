@@ -34,7 +34,7 @@ class GoalPublisher(Node):
         ]
 
         self.slope_sequence = [
-            [0.07, 0.07, 0.07, 0.07, 0.07, 0.07, 0.07]
+            [0.7, 0.7, 0.7, 0.7, 0.7, 0.7, 0.7]
         ] * 10  # 全て同じ傾きならこう書ける
 
         self.current_step = -1  # まだ開始していない
@@ -67,20 +67,24 @@ class GoalPublisher(Node):
                 return
 
             done = True
+            slope_data = [0.0] * 7  # 初期化
+
             for i in range(7):
                 diff = self.target_goal[i] - self.current_goal[i]
                 step = self.slope[i]
                 if abs(diff) <= abs(step):
+                    direction = 1.0 if diff > 0 else -1.0
                     self.current_goal[i] = self.target_goal[i]
+                    slope_data[i] = step * direction * 1000.0
                 else:
-                    self.current_goal[i] += step if diff > 0 else -step
+                    direction = 1.0 if diff > 0 else -1.0
+                    self.current_goal[i] += step * direction
+                    slope_data[i] = step * direction * 1000.0
                     done = False
             
             # --- slopeを決定 ---
             if done:
                 slope_data = [0.0] * 7   # 到達直前は0を送る
-            else:
-                slope_data = [s * 1000.0 for s in self.slope]
 
             # メッセージ作成
             combined_data = self.current_goal + slope_data
