@@ -1,13 +1,16 @@
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import Float32MultiArray, MultiArrayDimension, MultiArrayLayout
+import random
 
 class Float32MultiArrayPublisher(Node):
     def __init__(self):
         super().__init__('Float32_multi_array_publisher')
         self.publisher_ = self.create_publisher(Float32MultiArray, '/board_android_float/sub', 10)
-        timer_period = 2  # 秒
-        self.timer = self.create_timer(timer_period, self.publish_message)
+        self.get_logger().info('Press Enter to publish desired Angle')
+
+        #   目標値の範囲
+        self.pot_desired_range = [(400, 650), (150, 900), (120, 220), (200, 370), (240, 400), (350, 500), (150, 250), (150, 700), (300, 400), (170, 350), (500, 500), (500, 500), (550, 660), (550, 620), (640, 900), (600, 750), (300, 350), (550, 650), (150, 700), (50, 650), (120, 600), (120, 800), (180, 500), (160, 430), (350, 580), (250, 530)]
 
     def publish_message(self):
         msg = Float32MultiArray()
@@ -21,10 +24,8 @@ class Float32MultiArrayPublisher(Node):
         msg.layout.data_offset = 0
         
         # データ設定
-        # 初期値
-        #msg.data = [10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0, 90.0, 100.0, 110.0, 120.0, 130.0, 140.0, 150.0, 160.0, 170.0, 180.0, 190.0, 200.0, 210.0, 220.0, 230.0, 240.0, 250.0, 260.0]
-        # 目標値1
-        msg.data = [500.0, 300.0, 170.0, 300.0, 280.0, 420.0, 200.0, 500.0, 350.0, 180.0, 600.0, 500.0, 600.0, 580.0, 650.0, 675.0, 325.0, 600.0, 550.0, 600.0, 160.0, 370.0, 200.0, 410.0, 360.0, 530.0]
+        self.pot_desired = [float(random.randint(r[0], r[1])) for r in self.pot_desired_range]
+        msg.data = self.pot_desired
 
         # メッセージ送信
         self.publisher_.publish(msg)
@@ -34,7 +35,9 @@ def main(args=None):
     rclpy.init(args=args)
     node = Float32MultiArrayPublisher()
     try:
-        rclpy.spin(node)
+        while rclpy.ok():
+            input()  # エンターキー待ち
+            node.publish_message()
     except KeyboardInterrupt:
         pass
     finally:
