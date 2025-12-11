@@ -37,6 +37,7 @@ setup(
             'pot_desired_enter_float_pub=py_pkg.pot_desired_enter_float_pub:main',
             'pot_desired_android_pub=py_pkg.pot_desired_android_pub:main',
             'pot_desired_conti_android_pub=py_pkg.pot_desired_conti_android_pub:main',
+            'pot_desired_time_android_pub=py_pkg.pot_desired_time_android_pub:main',
             'pot_realized_conti_pub_test=py_pkg.pot_realized_conti_pub_test:main',
             'pot_realized_pub_test=py_pkg.pot_realized_pub_test:main',
             'write_data_csv=py_pkg.write_data_csv:main',
