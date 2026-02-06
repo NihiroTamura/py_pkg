@@ -21,6 +21,8 @@
   <exec_depend>threading</exec_depend>
   <exec_depend>queue</exec_depend>
   <exec_depend>os</exec_depend>
+  <exec_depend>tkinter</exec_depend>
+
 
 
   <test_depend>ament_copyright</test_depend>
