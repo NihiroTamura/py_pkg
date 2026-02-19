@@ -37,15 +37,26 @@ class PotGuiNode(Node):
         self.desired = [float(v) for v in INITIAL_DESIRED]
         self.real_raw = [0.0]*26
 
-        # Subscribers
-        self.create_subscription(UInt16MultiArray, '/board1_tk/pub', lambda msg: self.board_cb(msg, 0), 10)
-        self.create_subscription(UInt16MultiArray, '/board2_tk/pub', lambda msg: self.board_cb(msg, 6), 10)
-        self.create_subscription(UInt16MultiArray, '/board3_tk/pub', lambda msg: self.board_cb(msg, 12), 10)
-        self.create_subscription(UInt16MultiArray, '/board4_tk/pub', lambda msg: self.board_cb(msg, 17), 10)
-        self.create_subscription(UInt16MultiArray, '/board5_tk/pub', lambda msg: self.board_cb(msg, 22), 10)
+        # boardごとのPOT個数
+        self.POT_COUNT = {
+            'board1': 6,
+            'board2': 6,
+            'board3': 5,
+            'board4': 5,
+            'board5': 4,
+        }
 
-    def board_cb(self, msg, offset):
-        for i in range(6):
+        # Subscribers
+        self.create_subscription(UInt16MultiArray, '/board1_tk/pub', lambda msg: self.board_cb(msg, 0, 'board1'), 10)
+        self.create_subscription(UInt16MultiArray, '/board2_tk/pub', lambda msg: self.board_cb(msg, 6, 'board2'), 10)
+        self.create_subscription(UInt16MultiArray, '/board3_tk/pub', lambda msg: self.board_cb(msg, 12, 'board3'), 10)
+        self.create_subscription(UInt16MultiArray, '/board4_tk/pub', lambda msg: self.board_cb(msg, 17, 'board4'), 10)
+        self.create_subscription(UInt16MultiArray, '/board5_tk/pub', lambda msg: self.board_cb(msg, 22, 'board5'), 10)
+
+    def board_cb(self, msg, offset, board_name):
+        # このボードのPOT個数だけ書き込む
+        num_pot = self.POT_COUNT[board_name]
+        for i in range(num_pot):
             idx = offset + i
             if idx < 26 and i < len(msg.data):
                 self.real_raw[idx] = float(msg.data[i])
