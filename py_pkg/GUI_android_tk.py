@@ -60,7 +60,8 @@ class PotGuiNode(Node):
 
     def publish(self):
         msg = Float32MultiArray()
-        msg.data = self.desired
+        # ROS2 は各要素が Python の float 型であることを要求する（int は不可）
+        msg.data = [float(v) for v in self.desired]
         self.publisher.publish(msg)
 
     def publish_initial(self):
@@ -160,7 +161,7 @@ class PotGuiTk:
     # -------------------------
     def on_slider(self, value):
         val = float(value)
-        self.node.desired[self.current_dof] = val
+        self.node.desired[self.current_dof] = float(val)
 
         # Entryも同期
         self.step_entries[self.current_dof].delete(0, tk.END)
@@ -181,11 +182,11 @@ class PotGuiTk:
     def send_step(self):
         for i in range(26):
             try:
-                val = float(self.step_entries[i].get())
+                val = float(self.step_entries[i].get().strip())
                 mn, mx = POT_RANGE[i]
-                val = max(mn, min(mx, val))  # 範囲制限
+                val = float(max(mn, min(mx, val)))  # 範囲制限（float で保持）
                 self.node.desired[i] = val
-            except:
+            except (ValueError, IndexError):
                 pass
 
         self.node.publish()
