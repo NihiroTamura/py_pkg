@@ -1,0 +1,4 @@
+{"sessionId": "9b5f18", "runId": "pre-fix", "hypothesisId": "H1", "location": "write_limitdata_ADRC_android_csv.py:33", "message": "__init__ start", "data": {"class": "DataRecorderNode"}, "timestamp": 1780387331841}
+{"sessionId": "9b5f18", "runId": "pre-fix", "hypothesisId": "H1", "location": "write_limitdata_ADRC_android_csv.py:58", "message": "before assigning subscriptions", "data": {"has_attr_subscriptions": true}, "timestamp": 1780387331848}
+{"sessionId": "9b5f18", "runId": "pre-fix", "hypothesisId": "H1", "location": "write_limitdata_ADRC_android_csv.py:62", "message": "after assigning runtime containers", "data": {"queues_type": "<class 'dict'>", "writer_threads_type": "<class 'list'>"}, "timestamp": 1780387331848}
+{"sessionId": "9b5f18", "runId": "pre-fix", "hypothesisId": "H4", "location": "write_limitdata_ADRC_android_csv.py:121", "message": "trigger received", "data": {"recording_active": false}, "timestamp": 1780387418641}
