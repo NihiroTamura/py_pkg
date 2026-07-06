@@ -8,6 +8,8 @@ import tkinter as tk
 from tkinter import ttk
 import time
 
+import random
+
 # POT ranges
 POT_RANGE = [
     (185, 700), (135, 550), (130, 680), (10, 734), (66, 259), (192, 389),
@@ -25,6 +27,17 @@ INITIAL_DESIRED = [
     325, 370, 280, 420,
     360, 390, 420, 390
 ]
+
+# Random target ranges
+RANDOM_RANGE = POT_RANGE = [
+    (450, 700), (135, 550), (500, 680), (250, 700), (66, 259), (192, 389),
+    (70, 200), (60, 465), (115, 200), (100, 550), (239, 430), (205, 395),
+    (30, 660), (30, 690), (110, 830), (3, 630), (3, 700), (9, 660),
+    (275, 360), (115, 785), (192, 440), (284, 557),
+    (323, 580), (188, 630), (375, 500), (300, 490),
+]
+
+RANDOM_ENABLE = [True]*26
 
 # ------------------------------
 # ROS2 Node
@@ -127,6 +140,16 @@ class PotGuiTk:
         self.step_button = tk.Button(self.root, text="Send Step Input", command=self.send_step)
         self.step_button.pack(pady=5)
 
+        rand_frame=tk.LabelFrame(self.root,text="Random DOF")
+        rand_frame.pack(pady=5)
+        self.random_enable_vars=[]
+        for i in range(26):
+            v=tk.BooleanVar(value=RANDOM_ENABLE[i])
+            tk.Checkbutton(rand_frame,text=str(i),variable=v).grid(row=i//13,column=i%13,sticky="w")
+            self.random_enable_vars.append(v)
+        self.random_button=tk.Button(self.root,text="Send Random Target",command=self.send_random)
+        self.random_button.pack(pady=5)
+
         # --------------------------
         # Plot buffer
         # --------------------------
@@ -189,6 +212,19 @@ class PotGuiTk:
             except (ValueError, IndexError):
                 pass
 
+        self.node.publish()
+        self.update_ui()
+
+
+    def send_random(self):
+        for i in range(26):
+            if not self.random_enable_vars[i].get():
+                continue
+            mn,mx=RANDOM_RANGE[i]
+            val=random.randint(int(mn),int(mx))
+            self.node.desired[i]=float(val)
+            self.step_entries[i].delete(0,tk.END)
+            self.step_entries[i].insert(0,str(val))
         self.node.publish()
         self.update_ui()
 
