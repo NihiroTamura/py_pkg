@@ -201,12 +201,9 @@ class MathematicalSolver:
         a2_tgt, a1_tgt, a0_tgt = self._target_coeffs(T1, wn)                                            # 目標モデルの3次遅れ系の係数を計算
         a2_sys, a1_sys, a0_sys, b0_sys = sys_params                                                     # システムモデルのパラメータ取得
 
-        # 目標軌道・システム軌道
+        # 目標軌道
         y_tgt, dy_tgt, ddy_tgt, _ = self.simulate_unforced(                                             # 目標モデルの応答を計算
             self.t_eval, a2_tgt, a1_tgt, a0_tgt, y0
-        )
-        y_sys, dy_sys, ddy_sys = self.simulate_forced(                                                  # システムモデルの応答を計算
-            self.t_eval, a2_sys, a1_sys, a0_sys, b0_sys, u_ff, y0
         )
 
         # 状態空間（可制御正準形）
@@ -225,15 +222,37 @@ class MathematicalSolver:
         except Exception:                                                                               # 解けなかったときの処理
             K = np.array([1.0, 10.0, 100.0])
 
-        # 目標軌道とシステム軌道の差分を正確な物理量から計算
-        err = y_tgt - y_sys                                                                             # 位置誤差を計算
-        d_err = dy_tgt - dy_sys                                                                         # 速度誤差を計算
-        dd_err = ddy_tgt - ddy_sys                                                                      # 加速度誤差を計算
-
+        # 逐次計算 (オイラー積分) による最適入力の算出
+        dt = self.dt                                                                                    # シミュレーションのサンプル刻み幅
+        x_sys = np.array([y0, a2_sys * y0, a1_sys * y0], dtype=float)                                   # システムモデルの初期状態 (可観測正準形)
         u_opt = np.zeros(len(self.t_eval))                                                              # 最適入力を保存する配列
-        for i in range(len(self.t_eval)):                                                               # シミュレーション時間で最適入力を計算
-            x_err = np.array([err[i], d_err[i], dd_err[i]])                             # 誤差状態ベクトルを作成
-            u_opt[i] = u_ff[i] + float(K @ x_err)                                       # 前回のFF入力 + 修正量(フィードバック制御 u = K(x_tgt - x_sys))
+
+        for i in range(len(self.t_eval)):
+            if self.t_eval[i] <= self.T:                                                                # FF入力時間内のみ実行
+                # 可観測正準系の状態空間表現から、現在の物理量(位置, 速度, 加速度)を計算
+                dx0 = x_sys[1] - a2_sys * x_sys[0]
+                dx1 = x_sys[2] - a1_sys * x_sys[0]
+                
+                y_val = x_sys[0]
+                dy_val = dx0
+                ddy_val = dx1 - a2_sys * dx0
+
+                # システム軌道と目標軌道の誤差を計算 (物理量ベース)
+                x_tgt = np.array([y_tgt[i], dy_tgt[i], ddy_tgt[i]])
+                x_err = np.array([y_val, dy_val, ddy_val]) - x_tgt                                      # 誤差 = システム軌道 - 目標軌道
+                
+                # LQRゲインを用いて最適入力を計算
+                u_opt_val = -float(K @ x_err)
+                u_opt[i] = u_opt_val
+                
+                # 状態変数の更新 (オイラー積分)
+                dx2 = b0_sys * u_opt_val - a0_sys * x_sys[0]
+                x_sys[0] += dx0 * dt
+                x_sys[1] += dx1 * dt
+                x_sys[2] += dx2 * dt
+            else:
+                u_opt[i] = 0.0                                                                          # FF入力時間以降は0で埋める
+
         u_opt = np.clip(u_opt, -255.0, 255.0)                                                           # 最適入力をクリッピング
 
         # 5次多項式フィット（0≤t≤T, 端点0, 極値2個）
@@ -336,11 +355,11 @@ class OptimalControlSequencer(Node):
 
         # 初期姿勢
         self.initial_pot = [
-            644.0, 357.0, 577.0, 560.0, 171.0, 322.0,
-            109.0, 343.0, 179.0, 494.0, 329.0, 347.0,
-            559.0, 333.0, 425.0, 5.0, 28.0, 382.0,
-            296.0, 298.0, 282.0, 420.0,
-            386.0, 539.0, 480.0, 390.0,
+            500.0, 200.0, 500.0, 300.0, 170.0, 300.0,
+            160.0, 410.0, 200.0, 500.0, 350.0, 220.0,
+            300.0, 250.0, 400.0, 350.0, 420.0, 400.0,
+            325.0, 370.0, 280.0, 420.0,
+            360.0, 390.0, 420.0, 390.0,
         ]
 
         # ホームポジション
@@ -355,8 +374,8 @@ class OptimalControlSequencer(Node):
 
         # プリセットした目標値
         self.preset_targets = [
-            [671, 283, 624, 349, 226, 371, 170, 411, 151, 153, 395, 327, 208, 251, 421, 316, 367, 573, 279, 535, 401, 420, 446, 497, 440, 390],
             [501, 201, 501, 700, 171, 301, 161, 411, 201, 501, 351, 221, 301, 251, 401, 351, 421, 401, 326, 371, 281, 300, 361, 391, 421, 300],
+            [671, 283, 624, 349, 226, 371, 170, 411, 151, 153, 395, 327, 208, 251, 421, 316, 367, 573, 279, 535, 401, 420, 446, 497, 440, 390],
         ]
 
         self.current_ff_matrix = [[0.0, 0.0, 0.0, 0.0, 0.0] for _ in range(24)]                                                                 # 24自由度分のFF係数
