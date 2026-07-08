@@ -28,6 +28,7 @@ setup(
             'pid_test=py_pkg.pid_test:main',
             'pid_stop_lpf_pub_optimize=py_pkg.pid_stop_lpf_pub_optimize:main',
             'pot_desired_pub=py_pkg.pot_desired_pub:main',
+            'pot_desired_test_pub=py_pkg.pot_desired_test_pub:main',
             'pot_desired_float_pub=py_pkg.pot_desired_float_pub:main',
             'pot_desired_conti_pub=py_pkg.pot_desired_conti_pub:main',
             'pot_desired_conti_float_pub=py_pkg.pot_desired_conti_float_pub:main',
@@ -54,6 +55,10 @@ setup(
             'optimize_ROS2_float=py_pkg.optimize_ROS2_float:main',
             'optimize_ADRC_ROS2_float=py_pkg.optimize_ADRC_ROS2_float:main',
             'optimize_Ballistic_ROS2=py_pkg.optimize_Ballistic_ROS2:main',
+            'optimize_ff_ROS2=py_pkg.optimize_ff_ROS2:main',
+            'optimize_ADRC_ff_ROS2=py_pkg.optimize_ADRC_ff_ROS2:main',
+            'optimize_LQR_ff_ROS2=py_pkg.optimize_LQR_ff_ROS2:main',
+            'test_code=py_pkg.test_code:main',
             'GUI_android_tk=py_pkg.GUI_android_tk:main'
         ],
     },

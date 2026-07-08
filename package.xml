@@ -22,7 +22,12 @@
   <exec_depend>queue</exec_depend>
   <exec_depend>os</exec_depend>
   <exec_depend>tkinter</exec_depend>
-
+  <exec_depend>scipy</exec_depend>
+  <exec_depend>concurrent.futures</exec_depend>
+  <exec_depend>sys</exec_depend>
+  <exec_depend>traceback</exec_depend>
+  <exec_depend>openpyxl</exec_depend>
+  <exec_depend>pandas</exec_depend>
 
 
   <test_depend>ament_copyright</test_depend>

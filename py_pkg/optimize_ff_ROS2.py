@@ -15,7 +15,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy # ROS 2のQoS
 from std_msgs.msg import UInt16MultiArray, Float32MultiArray # ROS 2のメッセージの作成(ROS 2のメッセージの作成)
 
 import numpy as np # 数値計算のライブラリ(数値計算のライブラリ)
-from scipy.optimize import curve_fit, minimize, NonlinearConstraint # curve_fit：モデル同定、minimize：最適化、NonlinearConstraint：制約条件
+from scipy.optimize import curve_fit, minimize, NonlinearConstraint, differential_evolution # curve_fit：モデル同定、minimize：最適化、NonlinearConstraint：制約条件、differential_evolution：大域最適化
 
 # Excelデバッグ出力用のインポート
 import openpyxl
@@ -141,8 +141,12 @@ class MathematicalSolver:
                 else: 
                     u = 0.0
             
-            dxdt = np.dot(A, x) + B * u # 状態方程式
-            x = x + dxdt * self.dt # オイラー法で積分 
+            # 4次ルンゲ・クッタ法 (RK4) による高精度数値積分
+            k1 = np.dot(A, x) + B * u
+            k2 = np.dot(A, x + 0.5 * self.dt * k1) + B * u
+            k3 = np.dot(A, x + 0.5 * self.dt * k2) + B * u
+            k4 = np.dot(A, x + self.dt * k3) + B * u
+            x = x + (self.dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
 
             # if not np.all(np.isfinite(x)):
             #     raise RuntimeError("simulation diverged")
@@ -247,39 +251,72 @@ class MathematicalSolver:
             def simulate_system(t_array, K, T1, wn, zeta_val):  # 引数（時間配列、３次遅れ系パラメータ）
                 return self._simulate_core(t_array, [K, T1, wn, zeta_val], False, init_pot, target_pot, ff_params=ff_params) # 実際のデータからシミュレーションを実行（返り値は誤差軌道）
             
-            # パラメータ[K, T1, wn, zeta_val]の探索範囲
-            bounds_low = [0.1, 0.01, 1.0, 0.3] # 下限
-            bounds_high = [3.0, 1.0, 30.0, 3.0] # 上限
-            
-            # 物理パラメータベースのマルチスタートシード [K, T1, wn, zeta_val]
-            seeds = [
+            # パラメータ[K, T1, wn, zeta_val]の探索範囲（広めに設定）
+            bounds_low = [0.01, 0.001, 0.5, 0.1]  # 下限
+            bounds_high = [5.0, 2.0, 80.0, 5.0]   # 上限
+
+            # ========================================================
+            # Stage 1: Differential Evolution（大域探索）
+            # ========================================================
+            # 集団ベースの大域最適化で、局所解を回避して良好な初期値を発見する
+            def residual_func(params):
+                """大域探索用の残差平方和を計算する目的関数"""
+                try:
+                    with np.errstate(over='ignore', invalid='ignore'):  # DE探索中の発散警告を抑制
+                        y_sim = self._simulate_core(t, list(params), False, init_pot, target_pot, ff_params=ff_params)
+                        if not np.all(np.isfinite(y_sim)):
+                            return 1e15  # 発散した場合は巨大ペナルティ
+                        rss = float(np.sum((adjusted_e_data - y_sim) ** 2))
+
+                    # 安定性チェック（不安定モデルや高速すぎる極を持つモデルにペナルティ）
+                    K_est, T1_est, wn_est, zeta_est = params
+                    a0_chk = (wn_est ** 2) / T1_est
+                    a1_chk = (wn_est ** 2) + (2.0 * zeta_est * wn_est) / T1_est
+                    a2_chk = (2.0 * zeta_est * wn_est) + 1.0 / T1_est
+                    poles = np.roots([1, a2_chk, a1_chk, a0_chk])
+
+                    if np.any(np.real(poles) >= 0):
+                        return 1e15  # 不安定モデルにペナルティ
+                    if np.max(np.abs(np.real(poles))) > 100:
+                        return 1e15  # 高速すぎる極にペナルティ
+
+                    return rss
+                except Exception:
+                    return 1e15  # 例外発生時は巨大ペナルティ
+
+            de_bounds = list(zip(bounds_low, bounds_high))
+            de_result = differential_evolution(
+                residual_func,
+                bounds=de_bounds,
+                seed=42,         # 再現性のための乱数シード
+                maxiter=300,     # 最大反復回数
+                tol=1e-8,        # 収束判定閾値
+                polish=False,    # polishing は Stage 2 の curve_fit で行う
+                popsize=20       # 集団サイズ（探索の多様性を確保）
+            )
+
+            # ========================================================
+            # Stage 2: curve_fit（局所リファイン）
+            # ========================================================
+            # DE結果を起点として、勾配ベースの局所最適化で精密フィッティングを行う
+            best_popt = None
+            min_res = float('inf')
+
+            # DE結果を最優先シードとし、従来のマルチスタートシードも追加（多様性確保）
+            refine_seeds = [de_result.x.tolist()]
+            refine_seeds.extend([
                 [1.0, 0.1, 15.0, 1.0],   # 標準（目標モデルに近い臨界制動系）
                 [0.5, 0.5, 5.0,  0.5],   # 緩慢・低減衰系
                 [2.0, 0.02, 40.0, 1.5],  # 高速・過制動系
                 [1.0, 0.2, 10.0, 0.2],   # 強く振動する系
-                [1.0,0.2,10.0,1.0],
-                [1.0,0.5,5.0,1.0],
-                [0.8,0.3,8.0,0.8],
-                [1.2,0.15,12.0,1.2],
-                [1.0,1.0,3.0,1.0]
-            ]
-            
-            # これまでで一番良かったパラメータを保存
-            best_popt = None
+            ])
 
-            # RESで用いる初期の最小値である正の無限
-            min_res = float('inf')
-
-            # print(f"\n========== DOF {dof_idx+1} : System Model Fitting ==========")
-            
-            # seedsパラメータからcurve_fitを実行
-            for seed in seeds:
+            for seed in refine_seeds:
                 try:
-                    # seedsパラメータからcurve_fitを実行
                     p0 = np.clip(seed, bounds_low, bounds_high).tolist()
 
                     # シミュレーション結果と測定データとの差が最小になるパラメータを探す
-                    popt, _ = curve_fit(simulate_system, t, adjusted_e_data, p0=p0, bounds=(bounds_low, bounds_high), maxfev=5000) # 引数（誤差軌道、時間、実際に測定した誤差、探索開始位置、探索範囲、最大評価回数）
+                    popt, _ = curve_fit(simulate_system, t, adjusted_e_data, p0=p0, bounds=(bounds_low, bounds_high), maxfev=5000)
 
                     # ------------------------
                     # 安定性および高速極チェック
@@ -292,49 +329,36 @@ class MathematicalSolver:
                     poles = np.roots([1, a2, a1, a0])
 
                     if np.any(np.real(poles) >= 0):
-                        print(f"[DOF {dof_idx+1}] unstable model rejected")
-                        raise RuntimeError("unstable model")
+                        print(f"[DOF {dof_idx+1}][System Model] unstable model rejected")
+                        continue
 
-                    # ==================================================
-                    # 高速極チェック
-                    # ==================================================
                     if np.max(np.abs(np.real(poles))) > 100:
                         print(f"[DOF {dof_idx+1}][System Model] too fast pole rejected")
-                        raise RuntimeError("too fast pole")
+                        continue
 
-                    # ------------------------
                     # シミュレーション実行
-                    # ------------------------
-
-                    # 最最適化で求めたパラメータを使って、もう一度シミュレーションを実行
-                    y_sim = simulate_system(t, *popt) # poptは202行目で得られた最適パラメータ
+                    y_sim = simulate_system(t, *popt)
 
                     # シミュレーションと実測データのズレRSSを計算（残差平方和）
                     res = np.sum((adjusted_e_data - y_sim) ** 2)
 
-                    # ログを表示
-                    # print(f"[DOF {dof_idx+1}]" f"[System Model] Seed={seed}")
-                    # print(f"[DOF {dof_idx+1}]" f"[System Model] Parameters={popt}")
-                    # print(f"[DOF {dof_idx+1}]" f"[System Model] RSS={res:.6f}")
-                    
                     # 収束判定を評価（各seedで評価）
                     if res < min_res:
-                        min_res = res # 現在の最小残差
-                        best_popt = popt # 現在の一番良かったパラメータ
+                        min_res = res
+                        best_popt = popt
                 except Exception as e:
-                    #print(f"[DOF {dof_idx+1}]" f"[System Model][ERROR] Seed {seed} failed: {e}")
                     continue
-            
-            # どの seed でもフィッティングに成功しなかった場合の処理
-            if best_popt is None:
-                print(f"[DOF {dof_idx+1}]" "[System Model][WARNING] System model fitting failed for all seeds.")
-                print(f"[DOF {dof_idx+1}]" "[System Model][WARNING] Using default parameters: [1.0, 0.1, 15.0, 1.0]")
-                best_popt = np.array([1.0, 0.1, 15.0, 1.0]) # すべて失敗したら適当な初期値を返す
-            #else:
-                #print(f"[DOF {dof_idx+1}]" f"[System Model] Best parameters = {best_popt}")
-                # print(f"[DOF {dof_idx+1}]" f"[System Model] Minimum RSS = {min_res:.6f}")
 
-            # パラメータ[a0, a1, a2, b0, b1, b2]を返す
+            # フォールバック: curve_fit が全失敗した場合、DE結果を直接採用
+            if best_popt is None:
+                if de_result.fun < 1e14:
+                    best_popt = np.array(de_result.x)
+                    print(f"[DOF {dof_idx+1}][System Model] curve_fit refinement failed. Using DE result directly (RSS={de_result.fun:.6f})")
+                else:
+                    print(f"[DOF {dof_idx+1}][System Model][WARNING] All fitting methods failed. Using default parameters: [1.0, 0.1, 15.0, 1.0]")
+                    best_popt = np.array([1.0, 0.1, 15.0, 1.0])
+
+            # パラメータ[K, T1, wn, zeta_val]を返す
             return best_popt
     
     # 最適なFF入力を計算する関数
@@ -1306,5 +1330,3 @@ def main(args=None):
 
 if __name__ == '__main__':
     main()
-
-    #2026/06/25 20:50で一番（システムモデルは3次遅れ系）
