@@ -1,1310 +1,826 @@
 #!/usr/bin/env python3
-import os # ファイルパスの操作(OSとのやり取り)
-import sys # システム関連の操作(システムの設定や環境変数の操作)
-import csv # CSVファイルの読み書き
-import time # 時間関連の操作(時間の取得や待機)
-import traceback # エラー情報の取得(エラー内容を文字列として取得)
-import threading # スレッド関連の操作(スレッドの作成や管理)
-import tkinter as tk # GUIライブラリ(ウィンドウの作成や管理)
-from tkinter import filedialog # GUIの操作(ファイルの選択や保存)
-from concurrent.futures import ProcessPoolExecutor # 並行処理の実行(並行処理の実行)
+"""
+LQR + 5次関数FF制御入力 最適化プログラム (ROS2) 最適入力にbestJが得られた時の入力を入れている
+FF = a*t^5 + b*t^4 + c*t^3 + d*t^2 + e*t
+"""
+import os                                                       # OSライブラリ
+import sys                                                      # Pythonを扱うライブラリ
+import time                                                     # 時間
+import threading                                                # スレッド処理
+import traceback                                                # エラー内容表示
+import warnings                                                 # 警告表示を制御
 
-import rclpy # ROS2の初期化(ROS2の初期化)
-from rclpy.node import Node # ROS 2のノードの作成(ROS 2のノードの作成)
-from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy # ROS 2のQoSの設定
-from std_msgs.msg import UInt16MultiArray, Float32MultiArray # ROS 2のメッセージの作成(ROS 2のメッセージの作成)
+import matplotlib                                               # グラフライブラリ
+matplotlib.use('Agg')                                           # 画像保存専用モードに変更
+import matplotlib.pyplot as plt                                 # プロット
+import numpy as np                                              # 数学計算
+import openpyxl                                                 # Excel書き込み
+from openpyxl.drawing.image import Image as OpenpyxlImage       # Excelへ画像保存
+import pandas as pd                                             # csv保存
 
-import numpy as np # 数値計算のライブラリ(数値計算のライブラリ)
-from scipy.optimize import curve_fit, minimize, NonlinearConstraint # curve_fit：モデル同定、minimize：最適化、NonlinearConstraint：制約条件
+import rclpy                                                    # ROS2ライブラリ
+from rclpy.node import Node                                     # Nodeクラスの読み込み
+from std_msgs.msg import Float32MultiArray, UInt16MultiArray    # ROS2メッセージ型
 
-# Excelデバッグ出力用のインポート
-import openpyxl
-from openpyxl.chart import LineChart, Reference
+import scipy.optimize                                           # 最適化ライブラリ
+from scipy.linalg import solve_continuous_are                   # リッカチ代数方程式を解くライブラリ
+
+import tkinter as tk                                            # GUIライブラリ
+from tkinter import filedialog                                  # GUIでフォルダ選択
+
+warnings.simplefilter('ignore', RuntimeWarning)                 # RuntimeWarningを非表示
+np.seterr(all='ignore')                                         # Numpyのエラーを無地
 
 # ==============================================================================
-# 1. 数値計算・最適化エンジン (マルチプロセス用独立クラス)
+# LQR重み行列（チューニング要素）
 # ==============================================================================
-# モデル同定、シミュレーション、最適制御、FF生成を行う
+LQR_Q = np.diag([50.0, 10.0, 0.1])      # 状態誤差の重み（大きいほど誤差を抑える）
+LQR_R = np.array([[110]])              # 制御入力の重み（大きいほど入力を抑える）
+
+# 履歴
+# 2026/07/01 20:00
+# LQR_Q = np.diag([50.0, 1.0, 0.1]), LQR_R = np.array([[100]])
+
+# ==============================================================================
+# シミュレーションおよび最適化のパラメータ（チューニング要素）
+# ==============================================================================
+SIM_TIME = 5.0              # シミュレーション時間および実測データ収集時間（秒）
+SIM_DT = 0.01               # シミュレーションのサンプル刻み幅（秒）
+INIT_WAIT_TIME = 10.0       # 初期姿勢への移動後の待機時間（秒）
+MAX_INNER_ITER = 60         # 内側ループの最大反復回数
+THRESHOLD_J = 1000000.0     # 内側ループの収束判定閾値（評価関数Jがこの値以下になれば収束）
+
+
+# ==============================================================================
+# 数学ソルバー (System ID & LQR Optimal Control)
+# ==============================================================================
 class MathematicalSolver:
-    def __init__(self, T):
-        self.T = T # 入力したFF制御入力時間
-        self.dt = 0.01  # 100Hz想定のサンプリングステップ
-        self.t_eval = np.arange(0, 5.0, self.dt) # 0から5.0までの時間を0.01秒ごとに分割した配列を作成
+    # コンストラクタ
+    def __init__(self, T, dt=SIM_DT, Q=None, R=None):       # 引数(FF制御入力時間, シミュレーションステップ時間, LQR状態重み行列, LQR入力重み行列)
+        self.T = T                                          # FF制御入力時間を保存
+        self.dt = dt                                        # シミュレーションステップ時間を保存
+        self.t_eval = np.arange(0, SIM_TIME, self.dt)       # シミュレーション時間配列を作成
+        self.Q = Q if Q is not None else LQR_Q.copy()       # 状態重み行列の保存（引数 Q が与えられていればそれを使用し、与えられていなければ LQR_Q をコピー）
+        self.R = R if R is not None else LQR_R.copy()       # 入力重み行列の保存（引数 R が与えられていればそれを使用し、与えられていなければ LQR_R をコピー）
 
-    # def check_system_stability(self, sys_params, dof_idx):
-    #     """
-    #     推定伝達関数の極を解析して
-    #     爆発の原因候補を表示する
-    #     """
+    # ------------------------------------------------------------------
+    # シミュレーション
+    # ------------------------------------------------------------------
 
-    #     a0, a1, a2, _, _, _ = sys_params
+    # 目標モデルの自由応答を計算する関数
+    def simulate_unforced(self, t_array, a2, a1, a0, y0):           # 引数(シミュレーション時間, 3次遅れ系の係数 a2・a1・a0, 初期偏差)
+        """目標モデル（入力なし）のシミュレーション"""
+        N = len(t_array)                                            # シミュレーション時間サンプル数を取得
+        x = np.array([y0, a2 * y0, a1 * y0], dtype=float)           # 状態変数の初期化 x0 = y ( y(0) = y0 ), x1 = dy + a2*y ( dy(0) = 0 ), x2 = ddy + a2*dy + a1*y ( ddy(0) = 0 ),
+        y_traj = np.zeros(N)                                        # 出力を保存する配列
+        dy_traj = np.zeros(N)                                       # 出力の1階微分を保存する配列
+        ddy_traj = np.zeros(N)                                      # 出力の2階微分を保存する配列
+        dddy_traj = np.zeros(N)                                     # 出力の3階微分を保存する配列
+        for i in range(N):                                          # シミュレーション時間ごとにオイラー積分
+            # 可観測正準系の状態空間表現          
+            dx0 = x[1] - a2 * x[0]
+            dx1 = x[2] - a1 * x[0]
+            dx2 = -a0 * x[0]
+            
+            y_traj[i] = x[0]                                    # 出力の保存
+            dy_traj[i] = dx0                                    # 速度の保存
+            ddy_traj[i] = dx1 - a2 * dx0                        # 加速度の保存
+            dddy_traj[i] = dx2 - a1 * dx0 - a2 * ddy_traj[i]    # 加加速度の保存
+            
+            # 状態変数の更新
+            x[0] += dx0 * self.dt
+            x[1] += dx1 * self.dt
+            x[2] += dx2 * self.dt
+        return y_traj, dy_traj, ddy_traj, dddy_traj
 
-    #     # 分母多項式
-    #     den = [1.0, a2, a1, a0]
+    # システムモデルの応答(FF入力)を計算する関数
+    def simulate_forced(self, t_array, a2, a1, a0, b0, u_array, y0):    # 引数(シミュレーション時間, 3次遅れ系の係数 a2・a1・a0・b0, FF入力, 初期偏差)
+        """システムモデル（FF入力あり）のシミュレーション"""
+        N = len(t_array)                                                # シミュレーション時間サンプル数を取得
+        x = np.array([y0, a2 * y0, a1 * y0], dtype=float)               # 状態変数の初期化 x0 = y ( y(0) = y0 ), x1 = dy + a2*y ( dy(0) = 0 ), x2 = ddy + a2*dy + a1*y ( ddy(0) = 0 ),
+        y_traj = np.zeros(N)                                            # 出力を保存する配列
+        dy_traj = np.zeros(N)                                           # 出力の1階微分を保存する配列
+        ddy_traj = np.zeros(N)                                          # 出力の2階微分を保存する配列
+        for i in range(N):                                              # シミュレーション時間ごとにオイラー積分
+            # 可観測正準系の状態空間表現
+            dx0 = x[1] - a2 * x[0]
+            dx1 = x[2] - a1 * x[0]
+            dx2 = b0 * u_array[i] - a0 * x[0]
+            
+            y_traj[i] = x[0]                        # 出力の保存
+            dy_traj[i] = dx0                        # 速度の保存
+            ddy_traj[i] = dx1 - a2 * dx0            # 加速度の保存
+            
+            # 状態変数の更新
+            x[0] += dx0 * self.dt
+            x[1] += dx1 * self.dt
+            x[2] += dx2 * self.dt
+        return y_traj, dy_traj, ddy_traj
 
-    #     # 極
-    #     poles = np.roots(den)
+    # 目標モデルの3次遅れ系係数を計算する関数（ "_"が付いているので外から直接呼べない内部専用関数）
+    def _target_coeffs(self, T1, wn):           # 引数(1次遅れ系の時定数, 固有振動数)
+        """減衰係数1固定の目標モデル係数"""
+        a2 = (2 * wn * T1 + 1) / T1
+        a1 = (wn ** 2 * T1 + 2 * wn) / T1
+        a0 = (wn ** 2) / T1
+        return a2, a1, a0
 
-    #     print("\n================================================")
-    #     print(f"DOF {dof_idx+1} : Pole Analysis")
-    #     print("poles =", poles)
+    # 目標モデル同定関数
+    def fit_target_model(self, y_data, y0):                                                 # 引数(実測データ, 初期偏差)
+        """目標モデル同定: 1 / ((T1*s + 1)(s^2 + 2*wn*s + wn^2))"""
+        # 同定に使用する評価関数
+        def loss(p):
+            T1, wn = p                                                              # 最適化変数の取り出し
+            if T1 <= 0 or wn <= 0:                                                  # 制約条件（負の極を排除）
+                return float('inf')
 
-    #     real_parts = np.real(poles)
+            # 3次遅れ系の係数を計算
+            a2 = (2 * wn * T1 + 1) / T1
+            a1 = (wn ** 2 * T1 + 2 * wn) / T1
+            a0 = (wn ** 2) / T1
 
-    #     # ------------------------------------------------
-    #     # 1. 不安定判定
-    #     # ------------------------------------------------
-    #     if np.any(real_parts > 0):
-    #         print("[WARNING]")
-    #         print("推定された伝達関数が不安定です")
-    #         print("→ 最有力原因")
-    #         print("→ 正の実部を持つ極があります")
-    #         print("→ オイラー積分で必ず発散します")
+            y_sim, _, _, _ = self.simulate_unforced(self.t_eval, a2, a1, a0, y0)    # シミュレーション開始（"_"はその変数を使わないという意味）
+            return np.sum((y_sim - y_data) ** 2)                                    # 評価関数値（二乗和誤差）を返す
 
-    #     # ------------------------------------------------
-    #     # 2. 極が速すぎる
-    #     # ------------------------------------------------
-    #     max_speed = np.max(np.abs(real_parts))
+        res = scipy.optimize.minimize(loss, [0.1, 10.0], method='Nelder-Mead')              # lossが最小になる変数[T1, wn]を最適化する
+        T1, wn = res.x                                                                      # 最適変数を取り出す
+        return T1, wn
 
-    #     if max_speed > 100:
-    #         tau = 1.0 / max_speed
+    # システムモデル同定関数
+    def fit_system_model(self, y_data, u_ff, y0):                                                   # 引数(実測データ, FF制御入力, 初期偏差)
+        """システムモデル同定: b0 / (s^3 + a2*s^2 + a1*s + a0)"""
+        # 同定に使用する評価関数
+        def loss(p):
+            a2, a1, a0, b0 = p                                                          # 最適化変数の取り出し
+            if a0 <= 0 or a1 <= 0 or a2 <= 0:                                           # 制約条件（負の極を排除）
+                return float('inf')
+            
+            y_sim, _, _ = self.simulate_forced(self.t_eval, a2, a1, a0, b0, u_ff, y0)   # シミュレーション開始（"_"はその変数を使わないという意味）
+            return np.sum((y_sim - y_data) ** 2)                                        # 評価関数値（二乗和誤差）を返す
 
-    #         print("[WARNING]")
-    #         print("極が非常に速いです")
-    #         print(f"最大極速度 = {max_speed:.2f}")
-    #         print(f"時定数 τ ≈ {tau:.6f} s")
+        res = scipy.optimize.minimize(loss, [10.0, 100.0, 1000.0, 1000.0], method='Nelder-Mead')    # lossが最小になる変数[T1, wn]を最適化する
+        return res.x                                                                                # 最適変数を返す
 
-    #         if tau < self.dt:
-    #             print("→ 時定数がdtより小さい")
-    #             print("→ 離散化誤差で爆発する可能性があります")
+    # 極値計算関数
+    def calc_extrema_from_ff(self, ff_params):                                                                  # 引数(FFパラメータ)
+        a, b, c, d, e = ff_params
 
-    #     # ------------------------------------------------
-    #     # 3. Euler安定条件
-    #     # ------------------------------------------------
-    #     for p in poles:
+        roots = np.roots([5*a, 4*b, 3*c, 2*d, e])                                                               # 極値を計算
 
-    #         if np.real(p) < 0:
+        real_roots = sorted(
+            r.real for r in roots if abs(r.imag) < 1e-6 and 0 < r.real < self.T                                 # FF入力時間における実部の極を取り出し、小さい順に並べる
+        )
 
-    #             dt_limit = 2.0 / abs(np.real(p))
-
-    #             if self.dt > dt_limit:
-    #                 print("[WARNING]")
-    #                 print("dt が大きすぎる可能性があります")
-    #                 print(f"極 = {p}")
-    #                 print(f"Euler安定限界 ≈ {dt_limit:.6f}")
-    #                 print(f"現在 dt = {self.dt}")
-
-    #     print("================================================\n")
-
-    # ある3次遅れ系を時間方向へシミュレーションするための関数（目標モデルとシステムモデル）
-    def _simulate_core(self, t_array, params, is_target_model, init_pot, target_pot, ff_params=None): # 引数（シミュレーション時間、モデルのパラメータ[目標モデル[K, T1, wn]、システムモデル[a0,a1,a2,b0,b1,b2]]、Trueなら目標モデル・Falseならシステムモデル、初期位置、目標位置、FF入力係数）
-        """
-        誤差空間（偏差系）での3次遅れシミュレーション
-        """
-        # 初期誤差
-        e0 = float(init_pot - target_pot)
-
-        # シミュレーション結果を保存するリスト
-        y_sim = []
-
-        # 目標モデルおよびシステムモデル共通の3次遅れ系物理パラメータ展開
-        if is_target_model:
-            K, T1, wn = params 
-            zeta_val = 1.0 # 目標モデルは減衰係数を 1.0 に固定
-        else:
-            K, T1, wn, zeta_val = params # システムモデルは zeta_val もパラメータから受け取る
-
-        # 3次遅れ系の分母・分子係数を物理パラメータから計算
-        a0 = (wn ** 2) / T1 # 定数項
-        a1 = (wn ** 2) + (2.0 * zeta_val * wn) / T1 # sの係数
-        a2 = (2.0 * zeta_val * wn) + 1.0 / T1 # s^2の係数
-
-        # 3次遅れ系の分子係数
-        b0 = (K * (wn ** 2)) / T1
-
-        # 状態空間表現（可制御正準系）
-        A = np.array([[0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [-a0, -a1, -a2]]) # A行列
-        B = np.array([[0.0], [0.0], [1.0]]) # B行列
-        C = np.array([[b0, 0.0, 0.0]]) # 出力行列
+        if len(real_roots) >= 2:                                                                                # 極値が2つ以上なら、一番早い極値と二番目の極値を使う
+            t1, t2 = real_roots[:2]
+        elif len(real_roots) == 1:                                                                              # 極値が1つなら、その極値とFF入力時間の半分の値を使う
+            t1 = real_roots[0]
+            t2 = self.T / 2
+        else:                                                                                                   # 極値が0なら、FF入力時間から算出する
+            t1 = self.T * 0.33
+            t2 = self.T * 0.66
         
-        # 出力方程式 Cx0 = e0 を満たす最小ノルム解による厳密な初期化
-        x = np.linalg.pinv(C) @ np.array([[e0]])  # ムーア・ペンローズ擬似逆行列(「初期誤差 e0 を正しく再現しながら、一番無理のない初期状態を計算する」)
+        # 5次関数計算
+        def poly(t):
+            return a*t**5 + b*t**4 + c*t**3 + d*t**2 + e*t
 
-        # シミュレーション開始
-        for ts in t_array:
-            if is_target_model:
-                u = 0.0 # 自由応答
+        y1 = poly(t1)                                                                                           # t1における5次関数値y1を計算
+        y2 = poly(t2)                                                                                           # t2における5次関数値y2を計算
+
+        return (t1, y1, t2, y2)
+
+    # ------------------------------------------------------------------
+    # LQR最適制御 + 5次多項式フィット
+    # ------------------------------------------------------------------
+    def calculate_lqr_ff(self, target_params, sys_params, u_best_ff, y0):                                          # 引数(目標モデルのパラメータ[T1, wn], 目標モデルのパラメータ[a2, a1, a0, b0], ベストFF制御入力, 初期偏差)
+        """
+        LQR（リッカチ代数方程式）で最適制御入力を計算し、
+        5次多項式 FF = a*t^5 + ... + e*t にフィットする。
+        """
+        T1, wn = target_params                                                                          # 目標モデルのパラメータ取得
+        a2_tgt, a1_tgt, a0_tgt = self._target_coeffs(T1, wn)                                            # 目標モデルの3次遅れ系の係数を計算
+        a2_sys, a1_sys, a0_sys, b0_sys = sys_params                                                     # システムモデルのパラメータ取得
+
+        # 目標軌道
+        y_tgt, dy_tgt, ddy_tgt, _ = self.simulate_unforced(                                             # 目標モデルの応答を計算
+            self.t_eval, a2_tgt, a1_tgt, a0_tgt, y0
+        )
+
+        # 状態空間（可制御正準形）
+        A = np.array([
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [-a0_sys, -a1_sys, -a2_sys],
+        ])
+        B = np.array([[0.0], [0.0], [b0_sys]])
+
+        # リッカチ方程式 → LQRゲイン
+        try:
+            P = solve_continuous_are(A, B, self.Q, self.R)                                  # リッカチ代数方程式を解く
+            K = np.linalg.inv(self.R) @ B.T @ P                                             # LQRのゲインKを計算
+            K = K.flatten()                                                                 # Kを1次元配列に変換
+        except Exception:                                                                               # 解けなかったときの処理
+            K = np.array([1.0, 10.0, 100.0])
+
+        # 逐次計算 (オイラー積分) による最適入力の算出
+        dt = self.dt                                                                                    # シミュレーションのサンプル刻み幅
+        x_sys = np.array([y0, a2_sys * y0, a1_sys * y0], dtype=float)                                   # システムモデルの初期状態 (可観測正準形)
+        u_opt = np.zeros(len(self.t_eval))                                                              # 最適入力を保存する配列
+
+        for i in range(len(self.t_eval)):
+            if self.t_eval[i] <= self.T:                                                                # FF入力時間内のみ実行
+                # 可観測正準系の状態空間表現から、現在の物理量(位置, 速度, 加速度)を計算
+                dx0 = x_sys[1] - a2_sys * x_sys[0]
+                dx1 = x_sys[2] - a1_sys * x_sys[0]
+                
+                y_val = x_sys[0]
+                dy_val = dx0
+                ddy_val = dx1 - a2_sys * dx0
+
+                # システム軌道と目標軌道の誤差を計算 (物理量ベース)
+                x_tgt = np.array([y_tgt[i], dy_tgt[i], ddy_tgt[i]])
+                x_err = np.array([y_val, dy_val, ddy_val]) - x_tgt                                      # 誤差 = システム軌道 - 目標軌道
+                
+                # LQRゲインを用いて最適入力を計算
+                u_opt_val = -float(K @ x_err)
+                u_total = u_opt_val + u_best_ff[i]
+                u_opt[i] = u_total                                                                      # FFの計算には現時点でのベストなFFと最適入力の合計値を用いる
+                
+                # 状態変数の更新 (オイラー積分)
+                dx2 = b0_sys * u_total - a0_sys * x_sys[0]
+                x_sys[0] += dx0 * dt
+                x_sys[1] += dx1 * dt
+                x_sys[2] += dx2 * dt
             else:
-                if ff_params is not None: # FF入力が用意されているなら以下を実行
-                    a, b, c, d, e = ff_params 
-                    u = a*(ts**5) + b*(ts**4) + c*(ts**3) + d*(ts**2) + e*ts if ts <= self.T else 0.0  # FF入力を計算（FF制御入力時間以内のみ）
-                else: 
-                    u = 0.0
-            
-            dxdt = np.dot(A, x) + B * u # 状態方程式
-            x = x + dxdt * self.dt # オイラー法で積分 
+                u_opt[i] = 0.0                                                                          # FF入力時間以降は0で埋める
 
-            # if not np.all(np.isfinite(x)):
-            #     raise RuntimeError("simulation diverged")
+        u_opt = np.clip(u_opt, -255.0, 255.0)                                                           # 最適入力をクリッピング
 
-            # if np.max(np.abs(x)) > 1e6:
-            #     raise RuntimeError("simulation exploded")
+        # 5次多項式フィット（0≤t≤T, 端点0, 極値2個）
+        t_ff = self.t_eval[self.t_eval <= self.T]                                                       # FF入力を与える時間だけ取り出す
+        u_opt_ff = u_opt[: len(t_ff)]                                                                   # FF入力を与える区間だけの最適入力を取り出す
 
-            e_val = np.dot(C, x)[0, 0]  # 状態ベクトルから出力（誤差）を計算
-            y_sim.append(e_val)  # シミュレーションした誤差を保存
+        # 5次関数を定義する関数
+        def poly(t, a, b, c, d):                                                                        # 引数(時間, 5次関数パラメータa・b・c・d)
+            e = -(a * self.T ** 4 + b * self.T ** 3 + c * self.T ** 2 + d * self.T)     # 5次関数パラメータeを計算
+            return a * t ** 5 + b * t ** 4 + c * t ** 3 + d * t ** 2 + e * t            # 5次関数FF入力値を返す
 
-        return np.array(y_sim) # PythonのリストをNumpy配列へ変換
+        # LQR入力を5次関数で近似するための評価関数
+        def fit_loss(p):
+            a, b, c, d = p                                                                          # 最適化5次関数パラメータ変数を取り出す                                                                              
+            u_pred = poly(t_ff, a, b, c, d)                                                         # 5次関数で計算したFF入力
+            mse = np.sum((u_pred - u_opt_ff) ** 2)                                                  # 最適入力と近似したFF入力との二乗和誤差
+            penalty_pwm = (                                                                         # -255～255の間に収めるためのペナルティ
+                np.sum(np.maximum(0, u_pred - 255) ** 2)
+                + np.sum(np.maximum(0, -255 - u_pred) ** 2)
+            )
+            e_val = -(a * self.T ** 4 + b * self.T ** 3 + c * self.T ** 2 + d * self.T)             # 5次関数パラメータeを計算
+            dp = 5 * a * t_ff ** 4 + 4 * b * t_ff ** 3 + 3 * c * t_ff ** 2 + 2 * d * t_ff + e_val   # 微分値を計算
+            sign_changes = np.count_nonzero(np.diff(dp > 0))                                        # 傾き（微分値）の符号が変わった回数を取得
+            penalty_extrema = abs(sign_changes - 2) * 1e7                                           # 極値が2つになるためのペナルティ
+            return mse + 1e6 * penalty_pwm + penalty_extrema
 
-    # 測定データから3次遅れ系のパラメータを同定する関数
-    def fit_3rd_order_system(self, t, y_data, is_step_input, init_pot, target_pot, ff_params=None, dof_idx=None): # 引数（時間データ、測定データ、Trueなら目標モデル・Falseならシステムモデル、初期位置、目標位置、FF入力係数、自由度番号）
-        """
-        Multi-start（複数初期値探索）による完全一般化システム同定（複数の初期値から最適化を開始し、一番良かったものを採用する）
-        """
-        # 目標位置を原点(0)に平行移動
-        adjusted_e_data = y_data - target_pot
+        initial_guess = [0.0, 0.0, 0.01, -0.015 * self.T]                                               # 最適化5次関数パラメータの初期値
+        res = scipy.optimize.minimize(fit_loss, initial_guess, method='Nelder-Mead')                    # fit_lossが最小になる5次関数パラメータを取得
+        a, b, c, d = res.x                                                                              # 最適化した5次関数パラメータを取得
+        e = -(a * self.T ** 4 + b * self.T ** 3 + c * self.T ** 2 + d * self.T)                         # 5次関数パラメータeを計算
 
-        # 目標モデルの場合
-        if is_step_input:
-            # curve_fitに渡すための関数を作成（curve_fitはf(x,param1,param2,...)という形式の関数しか受け付けない）
-            def simulate_target(t_array, K, T1, wn): # 引数（時間配列、ゲインK、一次遅れ系時定数、二次遅れ系固有角振動数）
-                return self._simulate_core(t_array, [K, T1, wn], True, init_pot, target_pot) # 実際のデータからシミュレーションを実行（返り値は誤差軌道）
-            
-            # パラメータ[K, T1, ωn]の探索範囲
-            bounds_low = [0.01, 0.001, 0.1] # 下限
-            bounds_high = [10.0, 2.0, 100.0] # 上限
-            
-            # 3種類の異なるパラメータ[K, T1, ωn]初期値からマルチスタート
-            seeds = [
-                [1.0, 0.1, 15.0],
-                [0.5, 0.5, 5.0],
-                [2.0, 0.02, 40.0]
-            ]
-            
-            # これまでで一番良かったパラメータを保存
-            best_popt = None
+        # 極値 (t1,y1), (t2,y2) を抽出
+        roots = np.roots([5 * a, 4 * b, 3 * c, 2 * d, e])                                               # 極値を計算
+        real_roots = sorted(
+            r.real for r in roots if abs(r.imag) < 1e-6 and 0 < r.real < self.T                         # FF入力時間における実部の極を取り出し、小さい順に並べる
+        )
+        if len(real_roots) >= 2:                                                                        # 極値が2つ以上なら、一番早い極値と二番目の極値を使う
+            t1, t2 = real_roots[0], real_roots[1]
+        elif len(real_roots) == 1:                                                                      # 極値が1つなら、その極値とFF入力時間の半分の値を使う
+            t1 = real_roots[0]
+            t2 = self.T / 2.0
+        else:                                                                                           # 極値が0なら、FF入力時間から算出する
+            t1 = self.T * 0.33
+            t2 = self.T * 0.66
 
-            # RESで用いる初期の最小値である正の無限
-            min_res = float('inf')
+        y1 = poly(t1, a, b, c, d)                                                                       # t1における5次関数値y1を計算
+        y2 = poly(t2, a, b, c, d)                                                                       # t2における5次関数値y2を計算
 
-            # print(f"\n========== DOF {dof_idx+1} : Target Model Fitting ==========")
-            
-            # seedsパラメータからcurve_fitを実行
-            for seed in seeds:
-                try:
-                    # seedsパラメータからcurve_fitを実行
-                    p0 = np.clip(seed, bounds_low, bounds_high).tolist()
+        u_pred_full = np.zeros_like(self.t_eval)                                                        # シミュレーション時間全体におけるFF入力全体を保存する配列
+        u_pred_full[: len(t_ff)] = poly(t_ff, a, b, c, d)                                               # FF制御入力を格納
 
-                    # シミュレーション結果と測定データとの差が最小になるパラメータを探す
-                    popt, _ = curve_fit(simulate_target, t, adjusted_e_data, p0=p0, bounds=(bounds_low, bounds_high), maxfev=5000) # 引数（誤差軌道、時間、実際に測定した誤差、探索開始位置、探索範囲、最大評価回数）
-
-                    # 最最適化で求めたパラメータを使って、もう一度シミュレーションを実行
-                    y_sim = simulate_target(t, *popt) # poptは133行目で得られた最適パラメータ
-
-                    # シミュレーションと実測データのズレRSSを計算（残差平方和）
-                    res = np.sum((adjusted_e_data - y_sim) ** 2)
-                    
-                    # ログを表示
-                    # print(f"[DOF {dof_idx+1}]" f"[Target Model] Seed={seed}")
-                    # print(f"[DOF {dof_idx+1}]" f"[Target Model] Parameters={popt}")
-                    # print(f"[DOF {dof_idx+1}]" f"[Target Model] RSS={res:.6f}")
-
-                    K, T1, wn = popt
-                    zeta = 1.0
-
-                    a0 = (wn**2) / T1
-                    a1 = (wn**2) + (2.0 * zeta * wn) / T1
-                    a2 = (2.0 * zeta * wn) + (1.0 / T1)
-
-                    poles = np.roots([1, a2, a1, a0])
-
-                    if np.any(np.real(poles) >= 0):
-                        print(f"[DOF {dof_idx+1}][Target Model] unstable model rejected")
-                        continue
-
-                    # 収束判定を評価（各seedで評価）
-                    if res < min_res:
-                        min_res = res # 現在の最小残差
-                        best_popt = popt # 現在の一番良かったパラメータ
-                except Exception as e:
-                    #print(f"[DOF {dof_idx+1}]" f"[Target Model][ERROR] Seed {seed} failed: {e}")
-                    continue
-            
-            # どの seed でもフィッティングに成功しなかった場合の処理
-            if best_popt is None:
-                print(f"[DOF {dof_idx+1}]" "[Target Model][WARNING] Target model fitting failed for all seeds.")
-                print(f"[DOF {dof_idx+1}]" "[Target Model][WARNING] Using default parameters: [1.0, 0.1, 15.0]")
-                best_popt = np.array([1.0, 0.1, 15.0]) # すべて失敗したら適当な初期値を返す
-            #else:
-                #print(f"[DOF {dof_idx+1}]" f"[Target Model] Best parameters = {best_popt}")
-                # print(f"[DOF {dof_idx+1}]" f"[Target Model] Minimum RSS = {min_res:.6f}")
-            
-            # パラメータ[K,T1,ωn]を返す
-            return best_popt
-
-        # システムモデルの場合   
-        else:
-            # curve_fitに渡すための関数を作成（curve_fitはf(x,param1,param2,...)という形式の関数しか受け付けない）
-            def simulate_system(t_array, K, T1, wn, zeta_val):  # 引数（時間配列、３次遅れ系パラメータ）
-                return self._simulate_core(t_array, [K, T1, wn, zeta_val], False, init_pot, target_pot, ff_params=ff_params) # 実際のデータからシミュレーションを実行（返り値は誤差軌道）
-            
-            # パラメータ[K, T1, wn, zeta_val]の探索範囲
-            bounds_low = [0.1, 0.01, 1.0, 0.3] # 下限
-            bounds_high = [3.0, 1.0, 30.0, 3.0] # 上限
-            
-            # 物理パラメータベースのマルチスタートシード [K, T1, wn, zeta_val]
-            seeds = [
-                [1.0, 0.1, 15.0, 1.0],   # 標準（目標モデルに近い臨界制動系）
-                [0.5, 0.5, 5.0,  0.5],   # 緩慢・低減衰系
-                [2.0, 0.02, 40.0, 1.5],  # 高速・過制動系
-                [1.0, 0.2, 10.0, 0.2],   # 強く振動する系
-                [1.0,0.2,10.0,1.0],
-                [1.0,0.5,5.0,1.0],
-                [0.8,0.3,8.0,0.8],
-                [1.2,0.15,12.0,1.2],
-                [1.0,1.0,3.0,1.0]
-            ]
-            
-            # これまでで一番良かったパラメータを保存
-            best_popt = None
-
-            # RESで用いる初期の最小値である正の無限
-            min_res = float('inf')
-
-            # print(f"\n========== DOF {dof_idx+1} : System Model Fitting ==========")
-            
-            # seedsパラメータからcurve_fitを実行
-            for seed in seeds:
-                try:
-                    # seedsパラメータからcurve_fitを実行
-                    p0 = np.clip(seed, bounds_low, bounds_high).tolist()
-
-                    # シミュレーション結果と測定データとの差が最小になるパラメータを探す
-                    popt, _ = curve_fit(simulate_system, t, adjusted_e_data, p0=p0, bounds=(bounds_low, bounds_high), maxfev=5000) # 引数（誤差軌道、時間、実際に測定した誤差、探索開始位置、探索範囲、最大評価回数）
-
-                    # ------------------------
-                    # 安定性および高速極チェック
-                    # ------------------------
-                    K_est, T1_est, wn_est, zeta_est = popt
-                    a0 = (wn_est ** 2) / T1_est
-                    a1 = (wn_est ** 2) + (2.0 * zeta_est * wn_est) / T1_est
-                    a2 = (2.0 * zeta_est * wn_est) + 1.0 / T1_est
-
-                    poles = np.roots([1, a2, a1, a0])
-
-                    if np.any(np.real(poles) >= 0):
-                        print(f"[DOF {dof_idx+1}] unstable model rejected")
-                        raise RuntimeError("unstable model")
-
-                    # ==================================================
-                    # 高速極チェック
-                    # ==================================================
-                    if np.max(np.abs(np.real(poles))) > 100:
-                        print(f"[DOF {dof_idx+1}][System Model] too fast pole rejected")
-                        raise RuntimeError("too fast pole")
-
-                    # ------------------------
-                    # シミュレーション実行
-                    # ------------------------
-
-                    # 最最適化で求めたパラメータを使って、もう一度シミュレーションを実行
-                    y_sim = simulate_system(t, *popt) # poptは202行目で得られた最適パラメータ
-
-                    # シミュレーションと実測データのズレRSSを計算（残差平方和）
-                    res = np.sum((adjusted_e_data - y_sim) ** 2)
-
-                    # ログを表示
-                    # print(f"[DOF {dof_idx+1}]" f"[System Model] Seed={seed}")
-                    # print(f"[DOF {dof_idx+1}]" f"[System Model] Parameters={popt}")
-                    # print(f"[DOF {dof_idx+1}]" f"[System Model] RSS={res:.6f}")
-                    
-                    # 収束判定を評価（各seedで評価）
-                    if res < min_res:
-                        min_res = res # 現在の最小残差
-                        best_popt = popt # 現在の一番良かったパラメータ
-                except Exception as e:
-                    #print(f"[DOF {dof_idx+1}]" f"[System Model][ERROR] Seed {seed} failed: {e}")
-                    continue
-            
-            # どの seed でもフィッティングに成功しなかった場合の処理
-            if best_popt is None:
-                print(f"[DOF {dof_idx+1}]" "[System Model][WARNING] System model fitting failed for all seeds.")
-                print(f"[DOF {dof_idx+1}]" "[System Model][WARNING] Using default parameters: [1.0, 0.1, 15.0, 1.0]")
-                best_popt = np.array([1.0, 0.1, 15.0, 1.0]) # すべて失敗したら適当な初期値を返す
-            #else:
-                #print(f"[DOF {dof_idx+1}]" f"[System Model] Best parameters = {best_popt}")
-                # print(f"[DOF {dof_idx+1}]" f"[System Model] Minimum RSS = {min_res:.6f}")
-
-            # パラメータ[a0, a1, a2, b0, b1, b2]を返す
-            return best_popt
+        return [a, b, c, d, e], (t1, y1, t2, y2), u_pred_full, y_tgt                                    # 5次関数のパラメータ、極値、完成したFF制御入力、目標モデル、を返す
     
-    # 最適なFF入力を計算する関数
-    def solve_optimal_control(self, tgt_params, sys_params, init_pot, target_pot): # 引数（目標モデル、システムモデル、初期位置、目標位置）
-        """
-        随伴変数法を用いた最適制御入力の反復導出（オイラー・ラグランジュ方程式（Pontryaginの最小原理）を数値的に解く方法）
-        """
-        # 1. 目標モデルから理想誤差軌道を生成
-        y_target = self._simulate_core(self.t_eval, tgt_params, True, init_pot, target_pot) # 引数(時間、目標モデルのパラメータ、True、初期位置、目標位置)
-        
-        # 2. システムモデルの状態空間行列を再構築
-        K, T1, wn, zeta = sys_params
-        a0 = (wn **2) / T1 # 定数項
-        a1 = (wn **2) + (2.0 * zeta * wn) /T1 # sの係数
-        a2 = (2.0 * zeta * wn) + 1.0 / T1 # s^2の係数
-
-        # 3次遅れ系の分子係数
-        b0 = (K*(wn**2))/T1
-        b1 = 0.0
-        b2 = 0.0
-
-        A = np.array([[0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [-a0, -a1, -a2]]) # A行列
-        B = np.array([[0.0], [0.0], [1.0]]) # B行列
-        C = np.array([[b0, b1, b2]]) # C行列
-        
-        # 初期誤差
-        e0 = float(init_pot - target_pot)
-
-        # 初期状態
-        x0 = np.linalg.pinv(C) @ np.array([[e0]])
-        
-        # サンプル数
-        N = len(self.t_eval)
-
-        # FF入力の初期値
-        u_iter = np.zeros(N)
-
-        # 入力ペナルティ（正規化定数）
-        rho = 0.1
-        
-        # 3. 反復最適化ループ (収束判定を入れて条件を満たすまで実行)
-        max_adj_iter = 200 # 最大反復回数
-        adj_iter_cnt = 0 # 現在の反復回数
-        error_criterion = float('inf') # 収束基準の初期値
-        
-        # 収束条件を満たさない、かつ、200回未満なら繰り返す
-        while error_criterion > 1e-6 and adj_iter_cnt < max_adj_iter:
-            # 前回の入力を保存
-            u_old = u_iter.copy()
-            
-            # A. 順方向シミュレーション
-            x_traj = np.zeros((3, N)) # 状態軌道 x(t) を保存する配列
-            x_curr = x0.copy() # 現在の状態を初期状態にする
-            for k in range(N): # 0秒から最後まで1サンプルずつ計算
-                x_traj[:, k] = x_curr.ravel() # 現在の状態
-                dxdt = np.dot(A, x_curr) + B * u_iter[k] # 状態方程式
-                x_curr += dxdt * self.dt # オイラー法で積分
-            
-            # B. 随伴方程式の逆方向積分: lambda(T)=0 から開始（「現在のFF入力で動いた結果に対して、どのように入力を修正すれば評価関数が小さくなるか」を計算）
-            lam_traj = np.zeros((3, N)) # λ(t) = [λ1, λ2, λ3]を保存する配列
-            lam_curr = np.zeros((3, 1)) # 終端条件
-            for k in reversed(range(N)): # 随伴方程式であるため、逆向きに積分
-                # 誤差の勾配を計算
-                err = np.dot(C, x_traj[:, k].reshape(3, 1))[0, 0] - y_target[k]
-                # x_traj[:, k].reshape(-1,1)：順方向シミュレーションで保存していたx_trajから時刻kの状態を取り出し、(3,1)の列ベクトルにする
-                # y = float(C @ x)：出力方程式を計算
-                # err = y - y_target[k]：目標軌道との差を計算
-
-                # 随伴方程式: dλ/dt = -A^T * λ - 2 * C^T * (y - y_ref)
-                dl_dt = -np.dot(A.T, lam_curr) - 2.0 * C.T * err
-                lam_curr -= dl_dt * self.dt # 逆時間積分（オイラー法）
-                lam_traj[:, k] = lam_curr.ravel() # その状態軌道に対する随伴変数の時間変化（逆方向積分）を保存
-            
-            # C. 入力更新: u = -0.5/rho * B^T * λ
-            u_iter = -0.5 / rho * (B.T @ lam_traj).flatten()
-            u_iter = np.clip(u_iter, -255, 255) # 入力制限 ※改善の余地あり
-            
-            # 収束判定の計算 (入力ベクトルの差分のL2ノルム) 
-            # 「今回更新した入力」が「前回の入力」とほとんど同じになったかを調べる
-            error_criterion = float(np.linalg.norm(u_iter - u_old) / (np.linalg.norm(u_old) + 1e-10))
-            adj_iter_cnt += 1 # 1回反復したのでカウントを1増やす
-        
-        # 4. 5次多項式フィッティング (非線形制約条件および極値条件の統合)
-        t_ff = self.t_eval[self.t_eval <= self.T] # FF入力が有効な時間だけ取り出す
-        u_target_ff = u_iter[:len(t_ff)] # FF入力が有効な時間の波形を取り出す
-        
-        # 数値計算上の極値点情報（目標軌道から初期探索用として抽出）
-        # 元のシーケンサが期待する出力形式に合わせるため、極値の位置をここで仮計測
-        u_grad = np.gradient(u_target_ff, self.dt) # 勾配を計算
-        zero_crossings = np.where(np.diff(np.sign(u_grad)))[0] # 勾配の符号が変化したところを探す
-        valid_idx = [idx for idx in zero_crossings if 0 < t_ff[idx] < self.T] # 開始点や終了点は除外し、内部だけの極値を採用
-
-        # 1つ目の極値（山または谷）が現れる時刻の初期値を決める
-        t1_init = t_ff[valid_idx[0]] if len(valid_idx) > 0 else self.T * 0.33 # 極値が見つかればその時間を使い、見つからなければ全体時間の約1/3を仮の極値時刻とする
-
-        # 2つ目の極値（山または谷）が現れる時刻の初期値を決める
-        t2_init = t_ff[valid_idx[1]] if len(valid_idx) > 1 else self.T * 0.66 # 極値が見つかればその時間を使い、見つからなければ全体時間の約2/3を仮の極値時刻とする
-
-        # 山と谷の順序を判定
-        idx_max = np.argmax(u_target_ff) # 山部分
-        idx_min = np.argmin(u_target_ff) # 谷部分
-
-        if idx_max < idx_min: # 山が先，谷が後
-            y1_default = np.max(u_target_ff)
-            y2_default = np.min(u_target_ff)
-        else: # 谷が先，山が後
-            y1_default = np.min(u_target_ff)
-            y2_default = np.max(u_target_ff)
-
-        # 1つ目の極値の高さを決める
-        y1_init = (u_target_ff[valid_idx[0]] if len(valid_idx) > 0 else y1_default * 0.5) # 極値が見つかればその高さを使い、見つからなければ最大or最小値の1/2を極値とする
-
-        # 2つ目の極値の高さを決める
-        y2_init = (u_target_ff[valid_idx[1]] if len(valid_idx) > 1 else y2_default * 0.5) # 極値が見つかればその高さを使い、見つからなければ最大or最小値の1/2を極値とする
-        
-        # SLSQPが最小化する評価関数
-        def polynomial_fit_obj(p):
-            a, b, c, d = p # パラメータを取得
-            # 条件2. 点(0,0), (T,0)を通る拘束を満たすための末端係数eの決定
-            e = -(a * (self.T ** 4) + b * (self.T ** 3) + c * (self.T ** 2) + d * self.T)
-
-            # 多項式を計算
-            u_poly = a*(t_ff**5) + b*(t_ff**4) + c*(t_ff**3) + d*(t_ff**2) + e*t_ff
-            
-            # 最小二乗誤差の計算（この値を最小化）
-            loss = np.sum((u_target_ff - u_poly) ** 2)
-            
-            # 条件1. 0 <= t <= T で極値が2つしか持たない（導関数の零点が2つのみ）
-            # 導関数 5at^4 + 4bt^3 + 3ct^2 + 2dt + e = 0 の0からTの範囲の根を評価
-            poly_deriv_coeffs = [5*a, 4*b, 3*c, 2*d, e] # 導関数係数
-            roots = np.roots(poly_deriv_coeffs) # u'(t)=0を解く
-            real_roots_in_range = [r.real for r in roots if np.isreal(r) and 0 < r < self.T] # 実数解だけ抽出
-            # 極値が2個か確認（極値が2個以外ならペナルティを与える）
-            if len(real_roots_in_range) != 2:
-                loss += 1e7 * (abs(len(real_roots_in_range) - 2) + 1)
-
-            # 評価値を返す
-            return loss
-
-        # NonlinearConstraint 用の関数定義 (時間軸 t_ff 上の全点の多項式出力を返す)
-        # 「この係数で作られる5次多項式は、全時間で入力制限を守っているか？」を判定
-        def input_constraint_func(p):
-            a, b, c, d = p # SLSQPが現在試している係数を取得
-            e = -(a * (self.T ** 4) + b * (self.T ** 3) + c * (self.T ** 2) + d * self.T) # eを計算
-            return a*(t_ff**5) + b*(t_ff**4) + c*(t_ff**3) + d*(t_ff**2) + e*t_ff # 5次多項式を計算
-
-        # すべての時間点で -255.0 <= u_poly <= 255.0 となる非線形制約を定義
-        const_nonlinear = NonlinearConstraint(input_constraint_func, -255.0, 255.0) # 引数（制約値を返す関数、下限、上限）
-            
-        # 制約付き最適化をサポートする SLSQP メソッドを使用
-        res = minimize(polynomial_fit_obj, x0=[0.0, 0.0, 0.0, 0.0], method='SLSQP', constraints=[const_nonlinear]) # 引数（目的関数、係数の初期値、使用するアルゴリズム、制約条件）
-
-        # 最適パラメータ
-        a, b, c, d = res.x # 最適パラメータを取得
-        e = -(a * (self.T ** 4) + b * (self.T ** 3) + c * (self.T ** 2) + d * self.T) # eを計算
-        
-        # FF入力の5次関数のパラメータを返す
-        return [a, b, c, d, e]
-
-# 1自由度(DOF)分の最適化処理をまとめたメイン関数
-def execute_dof_pipeline(args): # 引数（外から値を受け取るための変数：コマンドラインから入力した情報）
-    """単一の自由度（DOF）に対する計算サンドボックス（他のDOFとは独立して計算する）関数"""
-    # アンパック（args[タプル]を分解して格納）
-    dof_idx, time_series_y, current_ff, T, init_pot, target_pot = args # 自由度番号、5秒間取得した角度データ、現在使っているFFパラメータ、FF入力時間、初期値謂、目標位置
-    try:
-        # MathematicalSolverクラスのインスタンスを作成
-        solver = MathematicalSolver(T)
-
-        # シミュレーション用の時間軸を作成
-        t = np.linspace(0, 5.0, len(time_series_y))
-
-        # 目標モデル（減衰係数=1）のパラメータを推定する
-        tgt_params_init = solver.fit_3rd_order_system(t, time_series_y, is_step_input=True, init_pot=init_pot, target_pot=target_pot, dof_idx=dof_idx) # 引数（時間軸、実際のデータ、目標モデルを指定、初期位置、目標位置、自由度番号）
-
-        # システムモデルの推定
-        sys_params_init = solver.fit_3rd_order_system(t, time_series_y, is_step_input=False, init_pot=init_pot, target_pot=target_pot, ff_params=current_ff, dof_idx=dof_idx) # 引数（時間軸、実際のデータ、システムモデルを指定、初期位置、目標位置、FF制御パラメータ、自由度番号）
-
-        # 目標モデルとシステムモデルの差が最小になる5次多項式の係数を探索
-        opt_ff = solver.solve_optimal_control(tgt_params_init, sys_params_init, init_pot=init_pot, target_pot=target_pot) # 引数（目標モデル、システムモデル、初期位置、目標位置）
-        
-        # 最適5次多項式のパラメータを取得
-        a, b, c, d, e = opt_ff
-
-        # 極値（山・谷）の時刻を求める
-        roots = np.roots([5*a, 4*b, 3*c, 2*d, e]) # 極値を計算
-        valid_roots = sorted([r.real for r in roots if np.isreal(r) and 0 < r < T]) # 実数かつ時間範囲内だけ残す
-        
-        # 極値時刻を取り出す
-        t1, t2 = (valid_roots[0], valid_roots[1]) if len(valid_roots) == 2 else (0.0, 0.0) # 何もなければ0にする
-
-        # 1つ目の極値の高さを計算
-        y1 = a*(t1**5) + b*(t1**4) + c*(t1**3) + d*(t1**2) + e*t1
-
-        # 2つ目の極値の高さを計算
-        y2 = a*(t2**5) + b*(t2**4) + c*(t2**3) + d*(t2**2) + e*t2
-
-        # ① 目標モデルfinalの同定（実測データ2に対して、減衰係数1固定で同定）
-        tgt_params_final = solver.fit_3rd_order_system(t, time_series_y, is_step_input=True, init_pot=init_pot, target_pot=target_pot, dof_idx=dof_idx)
-        
-        # ② システムモデルfinalの同定（実測データ2に対して、5次関数FF入力を考慮して同定）
-        sys_params_final = solver.fit_3rd_order_system(t, time_series_y, is_step_input=False, init_pot=init_pot, target_pot=target_pot, ff_params=opt_ff, dof_idx=dof_idx)
-        
-        # ターゲットモデルをもう一度シミュレーション
-        y_target_final = solver._simulate_core(solver.t_eval, tgt_params_final, True, init_pot, target_pot)
-
-        # 実システムもシミュレーション
-        y_sys_final = solver._simulate_core(solver.t_eval, sys_params_final, False, init_pot, target_pot, opt_ff)
-
-        # 評価関数を計算
-        J = float(np.sum((y_target_final - y_sys_final) ** 2))
-
-        # デバッグ用として、実測データ・モデルデータをExcel出力のためにリサンプリングして保持
-        # データの長さミスマッチを防ぐため、t_evalと同じ長さ(500点)にリサンプリング、またはt_eval上で評価
-        t_eval_len = len(solver.t_eval)
-        measured_resampled = np.interp(solver.t_eval, t, time_series_y)
-        
-        # 結果を返す
-        return {
-            "status": "SUCCESS", 
-            "idx": dof_idx, 
-            "params": opt_ff, 
-            "extr": [t1, t2, y1, y2], 
-            "J": J,
-            "debug_data": {
-                "t_eval": solver.t_eval.tolist(),
-                "measured": measured_resampled.tolist(),                # 実測データ2
-                "target_model": (y_target_final + target_pot).tolist(), # 目標モデルfinal ★修正完了
-                "system_model": (y_sys_final + target_pot).tolist()     # システムモデルfinal
-            }
-        }
-    except Exception:
-        return {"status": "ERROR", "idx": dof_idx, "error": traceback.format_exc()}
+    # 最終的な制御性能を評価する関数
+    def compute_J(self, y_tgt, y_sys):                                                                  # 引数(目標モデルの応答, システムモデルの応答)
+        """評価関数 J（目標軌道とシステムモデル出力の二乗誤差）"""
+        return float(np.sum((y_tgt - y_sys) ** 2))                                                      # 評価値（二乗和誤差）を返す
 
 
 # ==============================================================================
-# 2. ROS 2 メイン制御シーケンサノード
+# ROS2 ノード
 # ==============================================================================
-# ROS2のNodeを継承した、最適制御実験を管理するクラス
 class OptimalControlSequencer(Node):
-    # ★★★ 簡単な切り替え用フラグ (True: Excel保存有効, False: 無効) ★★★
+    # ★ デバッグExcel出力の切り替え (True: 有効, False: 無効)
     DEBUG_EXCEL = True
 
-    # ROS2ノードが起動した瞬間に一度だけ実行される初期化処理
-    def __init__(self, csv_path, T, max_iter, target_mode): # 引数（csv_path、FF入力時間T、実験回数、モード選択）
-        # 親クラス(Node)の初期化
-        super().__init__('optimal_control_sequencer')
+    # コンストラクタ
+    def __init__(self, csv_path, T, max_iter, target_mode):                                                                                     # 引数(保存csv情報, FF制御入力時間, 外側ループ最大回数, 目標値の与え方がランダムorプリセット)
+        super().__init__('optimal_control_sequencer_lqr')                                                                                       # ROS2ノードとして登録
+        self.csv_path = csv_path                                                                                                                # csv情報を格納
+        self.T = T                                                                                                                              # FF制御入力時間を格納
+        self.max_outer_iter = max_iter                                                                                                          # 外側ループ最大回数を格納
+        self.target_mode = target_mode                                                                                                          # 目標値の与え方のモードを格納
 
-        # CSV保存先を保存
-        self.csv_path = csv_path
+        self.current_outer = 0                                                                                                                  # 外側ループ回数
+        self.current_inner = 0                                                                                                                  # 内側ループ回数
+        self.max_inner_iter = MAX_INNER_ITER                                                                                                    # 内側ループ回数
+        self.threshold_J = THRESHOLD_J                                                                                                          # 内側ループの収束判定の閾値
 
-        # FF入力時間を保存
-        self.T = T
+        self.initial_stabilize_time = INIT_WAIT_TIME                                                                                            # 初期姿勢への移動後の待機時間
+        self.data_collection_time = SIM_TIME                                                                                                    # データ取得時間
+        self.dt = SIM_DT                                                                                                                        # シミュレーションステップ時間
 
-        # 実験回数を保存
-        self.max_iter = max_iter
-        
-        # "1": プリセット優先, "2": 完全ランダム
-        self.target_mode = target_mode 
-        
-        # 現在の試行回数
-        self.current_iteration = 0
-        
-        # 定常化待機時間
-        self.initial_stabilize_time = 10.0
+        self.state = "INIT_ROBOT"                                                                                                               # ロボット状態（初期位置へ送る状態）
 
-        # データ収集時間
-        self.data_collection_time = 5.0
-
-        # シーケンサ状態
-        self.state = "INIT_ROBOT"
-
-        # 最小評価関数の初期値
-        self.min_J_global = float('inf')
-
-        # 最良結果
-        self.best_results_to_save = None
-
-        # デバッグ用 Excel ブックの初期化
+        # デバックExcelを行うときの処理
         if self.DEBUG_EXCEL:
-            self.debug_wb = openpyxl.Workbook()
-            # 初期作成されるシートを削除するための参照保持
-            self.default_sheet = self.debug_wb.active
-            self.excel_path = os.path.splitext(self.csv_path)[0] + "_debug_models.xlsx"
+            self.debug_wb = openpyxl.Workbook()                                                 # 新しいExcelファイルをメモリ上に作成
+            self.default_sheet = self.debug_wb.active                                           # ExcelのSheet情報を取得
+            self.excel_path = os.path.splitext(self.csv_path)[0] + "_debug_models.xlsx"         # csvの拡張子を除き、Excelのファイル名を作成
 
-        # ポテンショメータ値の範囲
+        # ポテンショメータ値の範囲 (26 elements)
         self.pot_bounds = [
             (450, 700), (135, 550), (500, 680), (250, 700), (66, 259), (192, 389),
-            (70, 200),  (60, 465),  (115, 200), (100, 550), (239, 430), (205, 395),
-            (30, 660),  (30, 690),  (110, 830), (3, 630),   (3, 700),   (9, 660),
-            (275, 360), (115, 785), (192, 440), (284, 557), (323, 580), (188, 630),
-            (375, 500), (300, 490)
-        ]
-        
-        # ロボットが起動した直後の初期姿勢（ホームポジション）
-        self.initial_desired_raw = [
-            500, 200, 500, 300, 170, 300,
-            160, 410, 200, 500, 350, 220,
-            300, 250, 400, 350, 420, 400,
-            325, 370, 280, 420,
-            360, 390, 420, 390
+            (70, 200), (60, 465), (115, 200), (100, 550), (239, 430), (205, 395),
+            (30, 660), (30, 690), (110, 830), (3, 630), (3, 700), (9, 660),
+            (275, 360), (115, 785), (192, 440), (284, 557),
+            (323, 580), (188, 630), (375, 500), (300, 490),
         ]
 
-        # ユーザー定義のプリセット目標姿勢のリスト(例として2つプリセット、24自由度分を定義)
+        # 初期姿勢
+        self.initial_pot = [
+            500.0, 200.0, 500.0, 300.0, 170.0, 300.0,
+            160.0, 410.0, 200.0, 500.0, 350.0, 220.0,
+            300.0, 250.0, 400.0, 350.0, 420.0, 400.0,
+            325.0, 370.0, 280.0, 420.0,
+            360.0, 390.0, 420.0, 390.0,
+        ]
+
+        # ホームポジション
+        self.initial_pot_fin = [
+            500.0, 200.0, 500.0, 300.0, 170.0, 300.0,
+            160.0, 410.0, 200.0, 500.0, 350.0, 220.0,
+            300.0, 250.0, 400.0, 350.0, 420.0, 400.0,
+            325.0, 370.0, 280.0, 420.0,
+            360.0, 390.0, 420.0, 390.0,
+        ]
+        self.home_pot = list(self.initial_pot_fin)                                                                  # オリジナルの初期姿勢（非常停止・終了用安定位置）を保存
+
+        # プリセットした目標値
         self.preset_targets = [
-            [
-                501, 201, 501, 700, 171, 301,
-                161, 411, 201, 501, 351, 221,
-                301, 251, 401, 351, 421, 401,
-                326, 371, 281,
-                361, 391, 421
-            ]
+            [501, 201, 501, 700, 171, 301, 161, 411, 201, 501, 351, 221, 301, 251, 401, 351, 421, 401, 326, 371, 281, 300, 361, 391, 421, 300],
+            [671, 283, 624, 349, 226, 371, 170, 411, 151, 153, 395, 327, 208, 251, 421, 316, 367, 573, 279, 535, 401, 420, 446, 497, 440, 390],
         ]
 
-        # 最適化対象24自由度のみの最小値
-        self.pot_min = (
-            [b[0] for b in self.pot_bounds[0:18]] +
-            [b[0] for b in self.pot_bounds[18:21]] +
-            [b[0] for b in self.pot_bounds[22:25]]
-        )
+        self.current_ff_matrix = [[0.0, 0.0, 0.0, 0.0, 0.0] for _ in range(24)]                                                                 # 24自由度分のFF係数
+        self.best_ff_matrix = None                                                                                                              # 今までの最良FF係数
+        self.best_extrema = None                                                                                                                # 今までの最良FFの極値
+        self.min_J_sum = float('inf')                                                                                                           # 評価関数Jの初期化
+        self.best_debug_data = None                                                                                                             # デバック情報
 
-        # 最適化対象24自由度のみの最大値
-        self.pot_max = (
-            [b[1] for b in self.pot_bounds[0:18]] +
-            [b[1] for b in self.pot_bounds[18:21]] +
-            [b[1] for b in self.pot_bounds[22:25]]
-        )
-        
-        # 最適化対象24自由度のみの初期姿勢
-        self.initial_pot = [float(int(x)) for x in (
-            self.initial_desired_raw[0:18] +   
-            self.initial_desired_raw[18:21] +  
-            self.initial_desired_raw[22:25]    
-        )]
-        
-        # 初回の目標値選択
-        self.target_pot = self.get_next_target_positions()
+        self.buffer_time_series = {f'board{i}': [] for i in range(1, 6)}                                                                        # 5board分のデータバッファ
+        self.target_pot = self.get_next_target_positions()                                                                                      # 最初にロボットへ送る目標値を決定
 
-        # 24自由度分のFFパラメータを初期化
-        self.current_ff_matrix = [[0.1, 0.0, 0.0, 0.0, 0.0] for _ in range(24)]
+        # Publisher作成
+        self.pub_target = self.create_publisher(Float32MultiArray, '/board_android_float/sub', 10)                                              # 目標値パブリッシャーを作成
+        self.pub_ff = {}                                                                                                                        # FFパラメータ係数を送信するための辞書を初期化
+        for i in range(1, 6):                                                                                                                   # boardごとにFFパラメータ係数パブリッシャーを作成
+            self.pub_ff[i] = self.create_publisher(Float32MultiArray, f'/board{i}_FFparam_float/sub', 10)
 
-        # 受信した時系列データを保存するバッファを生成
-        self.buffer_time_series = {f'board{i}': [] for i in range(1, 6)}
+        # Subscriber作成
+        self.create_subscription(UInt16MultiArray, '/board1_tk/pub', lambda m: self.cb_board(m, 1), 10)
+        self.create_subscription(UInt16MultiArray, '/board2_tk/pub', lambda m: self.cb_board(m, 2), 10)
+        self.create_subscription(UInt16MultiArray, '/board3_tk/pub', lambda m: self.cb_board(m, 3), 10)
+        self.create_subscription(UInt16MultiArray, '/board4_tk/pub', lambda m: self.cb_board(m, 4), 10)
+        self.create_subscription(UInt16MultiArray, '/board5_tk/pub', lambda m: self.cb_board(m, 5), 10)
 
-        # ROS2通信の品質設定を作成開始
-        qos_profile = QoSProfile(
-            reliability=ReliabilityPolicy.RELIABLE,
-            history=HistoryPolicy.KEEP_LAST,
-            depth=100
-        )
-
-        # Subscriber生成
-        self.sub_b1 = self.create_subscription(UInt16MultiArray, '/board1_tk/pub', lambda msg: self.cb_board(msg, 1), qos_profile)
-        self.sub_b2 = self.create_subscription(UInt16MultiArray, '/board2_tk/pub', lambda msg: self.cb_board(msg, 2), qos_profile)
-        self.sub_b3 = self.create_subscription(UInt16MultiArray, '/board3_tk/pub', lambda msg: self.cb_board(msg, 3), qos_profile)
-        self.sub_b4 = self.create_subscription(UInt16MultiArray, '/board4_tk/pub', lambda msg: self.cb_board(msg, 4), qos_profile)
-        self.sub_b5 = self.create_subscription(UInt16MultiArray, '/board5_tk/pub', lambda msg: self.cb_board(msg, 5), qos_profile)
-
-        # Publisher生成
-        self.pub_android = self.create_publisher(Float32MultiArray, '/board_android_float/sub', qos_profile) # アンドロイドへ目標位置を送るPublisher
-        self.pubs_ff = {i: self.create_publisher(Float32MultiArray, f'/board{i}_FFparam_float/sub', qos_profile) for i in range(1, 6)} # boardごとのFFパラメータ送信用Publisher
-
-        # Timer生成
+        # タイマー作成
         self.control_timer = self.create_timer(0.1, self.sequencer_loop)
 
-        # 現在状態に入った時刻を保存
-        self.state_start_time = self.get_clock().now()
-    
-    def get_next_target_positions(self):
-        """
-        現在の試行回数(current_iteration)と選択されたモードに応じて、次の目標姿勢を取得する
-        """
-        # モード1 (プリセット優先) かつ プリセットリスト内にまだインデックスがある場合
-        if self.target_mode == '1' and self.current_iteration < len(self.preset_targets):
-            self.get_logger().info(f"【目標値選択】プリセットパターン {self.current_iteration + 1} を適用します。")
-            return [float(int(x)) for x in self.preset_targets[self.current_iteration]]
-        else:
-            # モード2（完全ランダム）、またはモード1でプリセットをすべて消化し終えた場合
-            if self.target_mode == '1':
-                self.get_logger().info("【目標値選択】プリセットをすべて消化したため、ここからはランダム目標値を適用します。")
-            else:
-                self.get_logger().info("【目標値選択】完全ランダム目標値を生成・適用します。")
-            return [float(int(x)) for x in np.floor(np.random.uniform(self.pot_min, self.pot_max))]
-    
-    # 各boardのデータ受信時に呼ばれる関数
-    def cb_board(self, msg, board_id):
-        if self.state == "COLLECTING": # データ収集中だけ保存する
-            if board_id in [4, 5]: # board4,5は6自由度分送られるが、実際に最適化するのは3自由度
-                # 不要自由度を除外
-                selected = [msg.data[idx] for idx in [0, 1, 2, 6, 7, 8]]
+        self.state_start_time = self.get_clock().now()                                                                                          # 状態開始時刻の保存
 
-                # 時系列データとして保存
+    @staticmethod                                                                                                                               # Pythonデコレータ（静的メソッド：selfを使わない）
+    def build_dof_map():
+        """24自由度 → 26要素配列インデックス"""
+        dof_map = []                                                                                                                            # 空リスト作成
+        for i in range(1, 4):                                                                                                                   # board1, board2, board3用
+            for j in range(6):
+                dof_map.append((i - 1) * 6 + j)
+        for i in [4, 5]:                                                                                                                        # board4, board5用
+            for j in range(3):
+                dof_map.append(18 + (i - 4) * 4 + j)
+        return dof_map
+
+    # 送信する目標値を決める関数
+    def get_next_target_positions(self):
+        if self.target_mode == "1" and self.current_outer < len(self.preset_targets):                                                           # 目標値送信モードが1で、外側ループ回数がプリセットの数より小さければ、プリセットした目標値を送る
+            return self.preset_targets[self.current_outer]
+        return [float(np.random.randint(b[0], b[1] + 1)) for b in self.pot_bounds]                                                              # それ以外はランダムにPOT範囲から送る
+
+    # ROS2 Subscriberのコールバック関数
+    def cb_board(self, msg, board_id):                                                                                                          # 引数(受信メッセージ, board番号)
+        if self.state == "COLLECTING":                                                                                                          # 目標値受信状態のみ実行
+            if board_id in [4, 5]:                                                                                                              # baord4と5は、3要素のみ受信してバッファに格納
+                selected = [msg.data[idx] for idx in [0, 1, 2, 6, 7, 8]]
                 self.buffer_time_series[f'board{board_id}'].append(selected)
             else:
-                # 時系列データとして保存
-                self.buffer_time_series[f'board{board_id}'].append(msg.data)
-
-    def sequencer_loop(self):
-        # 現在時刻取得
-        now = self.get_clock().now()
-
-        # 状態遷移後の経過時間[s]
-        elapsed = (now - self.state_start_time).nanoseconds / 1e9
-
-        # 新しい試行開始状態
-        if self.state == "INIT_ROBOT":
-            self.get_logger().info(f"=== 最最適制御サイクル {self.current_iteration + 1} / {self.max_iter} ===") # 現在試行回数表示
-            self.get_logger().info("初期位置データをロボットに送信して安定化待機中...")
-            self.publish_target_positions(self.initial_pot) # ホーム姿勢へ移動指令
-            self.state = "WAIT_INITIAL_STABILIZE" # 安定化待機へ移行
-            self.state_start_time = now # 開始時刻更新
-
-        # ロボットが落ち着くのを待つ状態
-        elif self.state == "WAIT_INITIAL_STABILIZE":
-            if elapsed >= self.initial_stabilize_time: # 指定時間待機したら次へ
-                self.get_logger().info("定常状態を確認。ランダム目標値と現在のFFパラメータを適用します。")
-                self.publish_all_ff_parameters() # 現在のFFパラメータを送信
-                time.sleep(0.1)
-                self.publish_target_positions(self.target_pot) # ランダム目標姿勢を送信
-                
-                # 全バッファ走査
-                for k in self.buffer_time_series: 
-                    # 前回データ削除
-                    self.buffer_time_series[k].clear()
-
-                # データ収集開始
-                self.state = "COLLECTING"
-
-                # 収集開始時刻記録
-                self.state_start_time = now
-
-        # 動作データ収集中の状態
-        elif self.state == "COLLECTING":
-            if elapsed >= self.data_collection_time: # 指定時間取得したら終了
-                # ===== デバッグ追加 =====
-                for i in range(1, 6):
-                    count = len(self.buffer_time_series[f'board{i}'])
-                    self.get_logger().info(
-                        f"board{i} received data count = {count}"
-                    )
-                # =======================
-
-                self.state = "PROCESSING" # 解析状態へ
-                self.get_logger().info("5秒間の動作データを取得完了。最適化パイプラインを展開します。")
-                threading.Thread(target=self.dispatch_optimization_pipeline).start() # 最適化処理を別スレッドで開始
-
-        # 最適化終了待ち状態
-        elif self.state == "PROCESSING":
-            pass
-
-        # 全試行終了
-        elif self.state == "FINISHED":
-            # ★ 1. 強制終了する前に、まず確実にエクセルファイルを保存する
-            if self.DEBUG_EXCEL:
-                try:
-                    self.get_logger().info("【デバッグ】エクセルファイルを最終保存中...")
-                    if self.default_sheet in self.debug_wb.worksheets and len(self.debug_wb.worksheets) > 1:
-                        self.debug_wb.remove(self.default_sheet)
-                    self.debug_wb.save(self.excel_path)
-                    self.get_logger().info(f"デバッグ用エクセルファイルを保存しました: {self.excel_path}")
-                except Exception as e:
-                    self.get_logger().error(f"デバッグ用エクセル保存に失敗しました: {e}")
-
-            self.get_logger().info("すべての実験試行が正常終了しました。ノードを落とします。")
-
-            self.control_timer.cancel() # タイマーを破棄
-            #sys.exit(0) # プログラム終了
-            # 安全かつ確実に spin を強制離脱させてコマンドラインに戻す
-            raise SystemExit(0)
-
-    # 目標値をロボットへ送信する関数
-    def publish_target_positions(self, pot_list): # 引数（24自由度分の目標値）
-        # ROS2送信用メッセージを生成
-        msg = Float32MultiArray()
-
-        # 長さ26の配列を生成
-        data = [0.0] * 26
-        
-        # 1番目から21番目：そのまま格納 (インデックス 0〜20)
-        data[0:21] = pot_list[0:21]     
-        
-        # 22番目 (インデックス 21)：除外しているので適当な値を入れる
-        if self.current_iteration == 0 and self.state == "INIT_ROBOT": # 最初の試行かつ初期化状態か確認
-            data[21] = 0.0
-        else:
-            data[21] = 0.0
-        
-        # 22自由度目を23番目に、23自由度目を24番目に、24自由度目を25番目に格納 (インデックス 22〜24)
-        data[22:25] = pot_list[21:24]  
-        
-        # 26番目 (インデックス 25)：除外しているので適当な値を入れる
-        if self.current_iteration == 0 and self.state == "INIT_ROBOT": # 最初の試行かつ初期化状態か確認
-            data[25] = 0.0
-        else:
-            data[25] = 0.0
-        
-        # 全要素をfloat型へ変換
-        msg.data = [float(int(x)) for x in data]
-
-        # アンドロイドへ送信
-        self.pub_android.publish(msg)
-
-        self.get_logger().info(
-            f"[TARGET] Sent target positions = {msg.data}"
-        )
+                self.buffer_time_series[f'board{board_id}'].append(list(msg.data))                                                              # board1と2と3は、そのままバッファに格納
     
-    # 24自由度のFFパラメータを送信する関数
+    # 目標値のPublish関数
+    def publish_target_positions(self, pot_list):                                                                                               # 引数(送信する目標値)
+        msg = Float32MultiArray()                                                                                                               # メッセージの型
+        msg.data = [float(x) for x in pot_list]                                                                                                 # 目標値をメッセージに格納
+        self.pub_target.publish(msg)                                                                                                            # メッセージ送信
+        self.get_logger().info("=== 送信した目標値 (Target POT) ===")                                                                            # ログを出力
+        for i in range(0, len(pot_list), 6):
+            chunk = [f"{x:.1f}" for x in pot_list[i:i + 6]]
+            self.get_logger().info(
+                f"  [{i + 1:02d}-{min(i + 6, len(pot_list)):02d}]: " + " | ".join(chunk)
+            )
+        self.get_logger().info("===================================")
+
+    # FFパラメータのPublish関数
     def publish_all_ff_parameters(self):
-        # board1 (DOF1〜6)
-        b1_data = [] # 送信用配列
-        for i in range(6):
-            b1_data.extend(self.current_ff_matrix[0 + i]) # 各自由度のパラメータa,b,c,d,e
-            b1_data.append(self.T) # 制御入力時間
-        msg1 = Float32MultiArray(data=[float(x) for x in b1_data]) # ROSメッセージ化
-        self.pubs_ff[1].publish(msg1) # board1へ送信
+        dof_idx = 0                                                                                                                             # DOF番号（最初は0）
+        self.get_logger().info("=== 送信したFFパラメータ ===")
+        for b_id in range(1, 6):                                                                                                                # board1からboard5の順に実行
+            msg = Float32MultiArray()                                                                                            # メッセージの型
+            data = []                                                                                                            # 空のリスト
+            for _ in range(6):                                                                                                   # DOFループ
+                if b_id in [4, 5] and _ >= 3:                                                                           # board4とboard5、かつ、DOF4以降       
+                    data.extend([0.0, 0.0, 0.0, 0.0, 0.0, self.T])                                              # すべてのFFパラメータを0にする。
+                else:                                                                                                   # board1とboard2とboard3とboar4・5の3DOFまで
+                    a, b, c, d, e = self.current_ff_matrix[dof_idx]                                             # FFパラメータを取り出す
+                    data.extend([float(a), float(b), float(c), float(d), float(e), float(self.T)])              # データに格納
+                    self.get_logger().info(                                                                     # ログ出力
+                        f"  B{b_id}-D{_ + 1} (DOF {dof_idx + 1:02d}): "
+                        f"a={a:.1e}, b={b:.1e}, c={c:.1e}, d={d:.1e}, e={e:.1e}"
+                    )
+                    dof_idx += 1                                                                                # DOF番号更新
+            msg.data = data                                                                                     # ROS2メッセージに格納
+            self.pub_ff[b_id].publish(msg)                                                                      # メッセージ送信
+        self.get_logger().info("============================")
 
-        self.get_logger().info(
-            f"[FF][board1] {msg1.data}"
-        )
+    # ROS2のタイマーのコールバック関数
+    def sequencer_loop(self):
+        now = self.get_clock().now()                                                                                                            # 現在の時刻を取得
+        elapsed = (now - self.state_start_time).nanoseconds / 1e9                                                                               # 経過時間を計算
 
-        # board2 (DOF7〜12)
-        b2_data = [] # 送信用配列
-        for i in range(6):
-            b2_data.extend(self.current_ff_matrix[6 + i]) # 各自由度のパラメータa,b,c,d,e
-            b2_data.append(self.T) # 制御入力時間
-        msg2 = Float32MultiArray(data=[float(x) for x in b2_data]) # ROSメッセージ化
-        self.pubs_ff[2].publish(msg2) # board2へ送信
+        # 初期姿勢へ戻す状態
+        if self.state == "INIT_ROBOT":
+            self.get_logger().info(                                                                                     # ログ出力
+                f"=== 最適制御 外側ループ {self.current_outer + 1} / {self.max_outer_iter} "
+                f"(内側ループ {self.current_inner + 1}/{self.max_inner_iter}) ==="
+            )
+            self.publish_target_positions(self.initial_pot)                                                             # 初期姿勢を送信
+            self.state = "WAIT_INITIAL_STABILIZE"                                                                       # 状態変更
+            self.state_start_time = now                                                                                 # 現在時刻を取得
 
-        self.get_logger().info(
-            f"[FF][board2] {msg2.data}"
-        )
+        # 初期姿勢への収束を待っている状態
+        elif self.state == "WAIT_INITIAL_STABILIZE":
+            if elapsed >= self.initial_stabilize_time:                                                                  # 待ち時間が終了したか判定
+                self.publish_all_ff_parameters()                                                                # FFパラメータを送信
+                time.sleep(0.1)                                                                                 # 0.1秒待機
+                self.publish_target_positions(self.target_pot)                                                  # 目標値送信
+                for k in self.buffer_time_series:                                                               # 各boardが持つデータバッファを初期化
+                    self.buffer_time_series[k].clear()
+                self.state = "COLLECTING"                                                                       # 状態変更
+                self.state_start_time = now                                                                     # 現在時刻を取得
 
-        # board3 (DOF13〜18)
-        b3_data = [] # 送信用配列
-        for i in range(6):
-            b3_data.extend(self.current_ff_matrix[12 + i]) # 各自由度のパラメータa,b,c,d,e
-            b3_data.append(self.T) # 制御入力時間
-        msg3 = Float32MultiArray(data=[float(x) for x in b3_data]) # ROSメッセージ化
-        self.pubs_ff[3].publish(msg3) # board3へ送信
+        # ロボットの実測データを収集している状態
+        elif self.state == "COLLECTING":
+            if elapsed >= self.data_collection_time:                                                                    # データ収集時間が終了したか判定
+                self.state = "PROCESSING"                                                                       # 状態変更
+                threading.Thread(target=self.dispatch_optimization_pipeline, daemon=True).start()               # dispatch_optimization_pipeline関数を新しいスレッドに追加し実行する
 
-        self.get_logger().info(
-            f"[FF][board3] {msg3.data}"
-        )
-
-        # board4 (DOF19〜21 + 最適化対象外×3)
-        b4_data = [] # 送信用配列
-        # 1〜18番目: DOF19, 20, 21 (パラメータと時間)
-        for i in range(3):
-            b4_data.extend(self.current_ff_matrix[18 + i]) # 各自由度のパラメータa,b,c,d,e
-            b4_data.append(self.T) # 制御入力時間
-        # 19〜23番目: 最適化対象外 (すべて0) -> 24番目: 制御入力時間
-        b4_data.extend([0.0] * 5)
-        b4_data.append(self.T)
-        # 25〜29番目: 最適化対象外 (すべて0) -> 30番目: 制御入力時間
-        b4_data.extend([0.0] * 5)
-        b4_data.append(self.T)
-        # 31〜35番目: 最最適化対象外 (すべて0) -> 36番目: 制御入力時間
-        b4_data.extend([0.0] * 5)
-        b4_data.append(self.T)
-        msg4 = Float32MultiArray(data=[float(x) for x in b4_data]) # ROSメッセージ化
-        self.pubs_ff[4].publish(msg4) # board4へ送信
-
-        self.get_logger().info(
-            f"[FF][board4] {msg4.data}"
-        )
-
-        # board5 (DOF22〜24 + 最適化対象外×3)
-        b5_data = [] # 送信用配列
-        # 1〜18番目: DOF22, 23, 24 (パラメータと時間)
-        for i in range(3):
-            b5_data.extend(self.current_ff_matrix[21 + i]) # 各自由度のパラメータa,b,c,d,e
-            b5_data.append(self.T) # 制御入力時間
-        # 19〜23番目: 最適化対象外 (すべて0) -> 24番目: 制御入力時間
-        b5_data.extend([0.0] * 5)
-        b5_data.append(self.T)
-        # 25〜29番目: 最適化対象外 (すべて0) -> 30番目: 制御入力時間
-        b5_data.extend([0.0] * 5)
-        b5_data.append(self.T)
-        # 31〜35番目: 最適化対象外 (すべて0) -> 36番目: 制御入力時間
-        b5_data.extend([0.0] * 5)
-        b5_data.append(self.T)
-        msg5 = Float32MultiArray(data=[float(x) for x in b5_data]) # ROSメッセージ化
-        self.pubs_ff[5].publish(msg5) # board5へ送信
-
-        self.get_logger().info(
-            f"[FF][board5] {msg5.data}"
-        )
+        # プログラムの最終状態
+        elif self.state == "FINISHED":
+            # ロボットを安定化させるために初期位置をPublish
+            self.get_logger().info("=== 最終安定化: home_pot を送信します ===")
+            self.publish_target_positions(self.home_pot)                                                                # オリジナルの初期姿勢を送信
+            if self.DEBUG_EXCEL:                                                                                        # Excel出力判定
+                try:
+                    if self.default_sheet in self.debug_wb.worksheets and len(self.debug_wb.worksheets) > 1:    # デフォルトシート(Sheet)がある、かつ、他にもシートがある 
+                        self.debug_wb.remove(self.default_sheet)                                            # デフォルトシート削除                                         
+                    self.debug_wb.save(self.excel_path)                                                         # Excel保存
+                    self.get_logger().info(f"デバッグExcel保存: {self.excel_path}")                              # ログ出力
+                except Exception as exc:
+                    self.get_logger().error(f"Excel保存失敗: {exc}")                                             # エラーログ
+            self.get_logger().info("すべての実験試行が正常終了しました。")
+            self.control_timer.cancel()                                                                                 # タイマー停止
+            raise SystemExit(0)                                                                                         # プログラム終了
     
-    # 最適化パイプライン全体を実行する関数
+    # 実測データから次回のFF入力を計算する関数（スレッド関数）
     def dispatch_optimization_pipeline(self):
         try:
-            # 24自由度分の時系列データ格納用
-            dof_time_series = [[] for _ in range(24)]
+            # 26要素と最適化する24自由度の対応表を作成
+            data_24_dof = []                                                                                            # 24自由度分の空リスト
+            dof_map = []                                                                                                # 26要素→24自由度への対応表
+            for i in range(1, 4):                                                                                       # board1、board2、board3
+                for j in range(6):
+                    dof_map.append((i - 1) * 6 + j)                                                         # 0~17 DOF               
+            for i in [4, 5]:                                                                                            # board4、board5
+                for j in range(3):
+                    dof_map.append(18 + (i - 4) * 4 + j)                                                    # 18, 19, 20, 22, 23, 24 DOF
 
-            # 各boardの受信データ数を調べ、最小数を取得（全boardで共通に使える長さに揃える）
-            min_length = min(len(self.buffer_time_series[f'board{i}']) for i in range(1, 6))
-            
-            # データが少なすぎるか判定
-            if min_length < 10:
-                raise RuntimeError("受信データ点数が極端に不足しています。") # 正常な最適化ができないので中断
+            # Boardごとに保存されている実測データを24自由度の時系列データへ変換する
+            for i in range(1, 4):                                                                                       # board1、board2、board3
+                arr = np.array(self.buffer_time_series[f'board{i}'])                                        # 各boardに対応する実測データを取りだす
+                for j in range(6):                                                                          # DOF1～6の順に処理
+                    data_24_dof.append(arr[:, j] if arr.size > 0 else [])                               # データがあることを確認して、そのDOFのデータを格納
+            for i in [4, 5]:                                                                                            # board4、board5
+                arr = np.array(self.buffer_time_series[f'board{i}'])                                        # 各boardに対応する実測データを取りだす
+                for j in range(3):                                                                          # DOF1～3の順に処理
+                    data_24_dof.append(arr[:, j] if arr.size > 0 else [])                           # データがあることを確認して、そのDOFのデータを格納
 
-            # boardデータを24自由度へ再構成
-            for t_idx in range(min_length): # 時刻サンプルを順番に処理
-                # board1〜3用
-                for b in range(1, 4):
-                    # 各boardの6自由度
-                    for d in range(6):
-                        # 対応自由度へ格納(そのまま格納)
-                        dof_time_series[(b-1)*6 + d].append(self.buffer_time_series[f'board{b}'][t_idx][d]) # self.buffer_time_series[f'board{b}'][t_idx][d])：その時刻のポテンショメータ値を追加
-                for d in range(3):
-                    # board4用
-                    dof_time_series[18 + d].append(self.buffer_time_series['board4'][t_idx][d]) # 最適化対象3自由度のみ
-                    # board5用
-                    dof_time_series[21 + d].append(self.buffer_time_series['board5'][t_idx][d]) # 最適化対象3自由度のみ
+            # 24自由度それぞれに対して、目標モデル同定・システムモデル同定・LQR最適制御を実行する
+            solver = MathematicalSolver(self.T, self.dt)                                                                # MathematicalSolverクラスの生成
+            N_samples = int(SIM_TIME / self.dt)                                                                         # サンプル数の計算
 
-            # 並列計算用入力リスト
-            tasks = []
-            # 24自由度全て処理
-            for idx in range(24):
-                # 1自由度分の入力をまとめる
-                tasks.append((
-                    idx, # 自由度番号
-                    np.array(dof_time_series[idx], dtype=np.float64), # その自由度の時系列データ
-                    self.current_ff_matrix[idx], # 現在のFFパラメータ
-                    self.T, # FF制御入力時間
-                    self.initial_pot[idx], # 初期位置
-                    self.target_pot[idx] # 目標位置
-                ))
+            J_array = []                                                                                                # 24自由度それぞれの評価関数Jの空リスト
+            debug_info = []                                                                                             # デバッグExcelへ保存する情報の空リスト
+            extrema_list = []                                                                                           # 保存する極大値と極小値の空リスト
+            used_extrema_list = []                                                                                      # 極値のリスト
 
-            # 並列演算開始
-            self.get_logger().info("ProcessPoolExecutorを展開。演算中...")
-            with ProcessPoolExecutor() as executor: # CPU並列処理開始
-                results = list(executor.map(execute_dof_pipeline, tasks)) # 各自由度ごとにexecute_dof_pipeline()を実行
+            # 今回ロボットへ送信したFF（更新前）を保存
+            ff_used_this_iteration = [row[:] for row in self.current_ff_matrix]                                         # パラメータの保存
+            used_extrema_list =  [solver.calc_extrema_from_ff(ff) for ff in ff_used_this_iteration]                     # 極値の保存
 
-            # 評価関数集計
-            errors_detected = False # エラー検知フラグ
-            round_J = 0.0 # 今回の24自由度全体の評価関数
-            round_results = [] # 正常結果保存用
+            for dof_idx in range(24):                                                                                   # 24自由度分のループ
+                raw_y = np.array(data_24_dof[dof_idx])[:N_samples]                                                      # 5秒間分の実測データを取りだす
+                if len(raw_y) < N_samples:                                                                              # データ数が不足している場合
+                    raw_y = np.pad(raw_y, (0, max(0, N_samples - len(raw_y))), mode='edge')                 # 測定できたデータの最後の値をコピーして、不足分だけ後ろに追加する
 
-            # 24自由度結果を順番に確認
-            for r in results:
-                if r["status"] == "ERROR": # 計算失敗判定
-                    self.get_logger().error(f"【自由度 {r['idx']} 演算エラー】\n{r['error']}")
-                    errors_detected = True # 異常フラグON
-                else: # 正常時
-                    round_J += r["J"] # 評価関数加算
-                    round_results.append(r) # 正常結果保存
+                # Initial and Target values
+                Pi = self.initial_pot[dof_map[dof_idx]]                                                     # 現在のDOFの初期位置を取得
+                Pf = self.target_pot[dof_map[dof_idx]]                                                      # 現在のDOFの目標位置を取得
+                y0 = Pi - Pf                                                                                # 初期偏差を計算
 
-            # エラー確認
-            if errors_detected:
-                raise ArithmeticError("計算パイプライン中に致命的エラーを検知しました。") # 最適化中断
+                # Shift data so it converges to 0
+                y_shifted = raw_y - Pf                                                                      # 目標位置を原点（0）に移動するための処理
 
-            # 結果出力
-            self.get_logger().info("=" * 60)
-            self.get_logger().info(f"Iteration {self.current_iteration + 1}")
-            self.get_logger().info(f"Current J = {round_J:.6f}")
+                # 1. Target Model ID
+                tgt_params = solver.fit_target_model(y_shifted, y0)                                         # 目標モデルの同定をして、パラメータを取得
 
-            if self.min_J_global != float('inf'):
-                ratio = 100.0 * (round_J - self.min_J_global) / self.min_J_global
+                # 2. System Model ID
+                a, b, c, d, e = self.current_ff_matrix[dof_idx]                                             # 現在のDOFのFFパラメータを取り出す
+                t_ff = solver.t_eval[solver.t_eval <= self.T]                                               # 0秒～FF入力時間までの時間配列を取り出す
+                u_ff = np.zeros(N_samples)                                                                  # 入力ベクトルの生成
+                u_ff[:len(t_ff)] = a * t_ff ** 5 + b * t_ff ** 4 + c * t_ff ** 3 + d * t_ff ** 2 + e * t_ff # FF入力時間だけ、そのときのFF入力を格納する
 
-                if round_J < self.min_J_global:
-                    self.get_logger().info(f"BEST J = {self.min_J_global:.6f}")
-                    self.get_logger().info(f"Improved by {-ratio:.2f}%")
+                # ベストFF入力の生成 (これまでの最小JのときのFF入力)
+                u_best_ff = np.zeros(N_samples)
+                if self.min_J_sum != float('inf') and self.best_ff_matrix is not None:
+                    ab, bb, cb, db, eb = self.best_ff_matrix[dof_idx]
+                    u_best_ff[:len(t_ff)] = ab * t_ff ** 5 + bb * t_ff ** 4 + cb * t_ff ** 3 + db * t_ff ** 2 + eb * t_ff
                 else:
-                    self.get_logger().info(f"BEST J = {self.min_J_global:.6f}")
-                    self.get_logger().info(f"Worse by {ratio:.2f}%")
-            else:
-                self.get_logger().info("First trial")
+                    u_best_ff[:] = u_ff[:]
 
-            self.get_logger().info("=" * 60)
+                sys_params = solver.fit_system_model(y_shifted, u_ff, y0)                                   # システムモデルの同定をして、パラメータを取得
 
-            # グローバル最良結果更新
-            if round_J < self.min_J_global: # 今回の評価関数が過去最小か判定
-                self.min_J_global = round_J # 最小値更新
-                self.best_results_to_save = round_results # 最良パラメータ保存
-                self.get_logger().info(f"==> グローバル最小評価関数 J 更新: {self.min_J_global}") # 更新通知
+                # 3. Calculate squared error J
+                a2_sys, a1_sys, a0_sys, b0_sys = sys_params                                                 # システムモデル係数を取り出す
+                y_sys_sim, _, _ = solver.simulate_forced(solver.t_eval, a2_sys, a1_sys, a0_sys, b0_sys, u_ff, y0)   # 同定したシステムモデルの応答を取り出す
 
-            # FFパラメータ更新（Jの成否に関わらず、次回の実験のために最新の最適化パラメータを反映）
-            for r in round_results: # 24自由度分の計算結果を順番に取り出す
-                self.current_ff_matrix[r["idx"]] = r["params"] # 最適化後のFFパラメータで更新する
+                # 4. LQR最適制御入力計算 + 5次多項式フィット
+                new_ff, extrema, u_opt_full, y_tgt = solver.calculate_lqr_ff(tgt_params, sys_params, u_best_ff, y0)    # 最適入力を計算して、その結果の、FFパラメータ、極値、5次関数のFF制御入力、目標モデルの応答、を格納
+                self.current_ff_matrix[dof_idx] = new_ff                                                    # FFパラメータの更新
+                extrema_list.append(extrema)                                                                # 極値を保存
 
-            # --- 収束判定としきい値・ループ制限の設定 ---
-            j_threshold = 100000.0 # 収束とみなす評価関数のしきい値
-            max_loops_per_target = 10   # 同一目標姿勢での最大ループ回数（安全弁）
-            
-            # 同一目標でのカウンタ変数がまだ存在しない場合は初期化
-            if not hasattr(self, 'same_target_loop_count'):
-                self.same_target_loop_count = 0
-            
-            # 今回の試行をカウント
-            self.same_target_loop_count += 1
+                # 内側ループの判定用評価関数J（実測データと目標モデルとの差）
+                J = np.sum((y_tgt - y_shifted) ** 2)                                                        # 二乗和誤差を計算
+                J_array.append(J)                                                                           # 24自由度それぞれの評価関数Jの空リストに追加
 
-            # 条件A: しきい値以下に収束したか
-            is_converged = round_J <= j_threshold
-            # 条件B: 同一目標での最大ループ回数に達したか
-            is_loop_limit = self.same_target_loop_count >= max_loops_per_target
+                # デバック用データを保存
+                debug_info.append({
+                    't': solver.t_eval,         # 実測時間
+                    'y_data': raw_y,            # 実測POT値
+                    'y_sys': y_sys_sim + Pf,    # システムモデル応答
+                    'y_tgt': y_tgt + Pf,        # 目標モデル応答
+                    'J': J,
+                })
 
-            if is_converged or is_loop_limit:
-                if is_converged:
-                    self.get_logger().info(f"【収束達成】round_J ({round_J:.4f}) <= しきい値 ({j_threshold})。次のランダム目標へ移行します。")
+            total_J = sum(J_array)                                                                                      # 各自由度の評価関数値Jを足す
+
+            # 評価関数値の値の変化確認
+            if self.min_J_sum == float('inf'):                                                                          # 初回の場合
+                diff_msg = "(初回)"
+            else:                                                                                                       # 2回目以降
+                diff = total_J - self.min_J_sum                                                             # これまでのbestJと比較
+                if diff < 0:
+                    diff_msg = f"(これまでのベストより {-diff:.2f} 改善！)"
                 else:
-                    self.get_logger().warn(f"【ループ上限到達】同一目標での試行が {max_loops_per_target} 回に達したため、収束を諦めて次のランダム目標へ強制移行します。")
-                
-                # 同一目標カウンターをリセット
-                self.same_target_loop_count = 0
+                    diff_msg = f"(これまでのベストより {diff:.2f} 悪化)"
 
-                # csv用に保存
-                self.csv_initial_pot = self.initial_pot.copy()
-                self.csv_target_pot  = self.target_pot.copy()
+            self.get_logger().info(                                                                                     # ログ出力
+                f"内側ループ {self.current_inner + 1} 完了: 今回のJ = {total_J:.2f}, "
+                f"これまでのベストJ = {self.min_J_sum if self.min_J_sum != float('inf') else total_J:.2f} {diff_msg}"
+            )
 
-                # ★ 最もJが小さかったベスト結果をExcelの各シート(Trial)へ記録
-                if self.DEBUG_EXCEL and self.best_results_to_save is not None:
+            # ベストかどうか判定
+            if total_J < self.min_J_sum:
+                self.min_J_sum = total_J                                                                    # ベストJ更新
+                self.best_ff_matrix = [row[:] for row in ff_used_this_iteration]                            # ベストFFパラメータを格納
+                self.best_extrema = used_extrema_list[:]                                                    # ベストJのときの極値を保存
+                self.best_debug_data = debug_info                                                           # ベストJのときのデバック情報を保存
+
+            self.current_inner += 1                                                                                     # 内側ループ回数更新
+
+            # 内側ループ終了判定
+            if total_J < self.threshold_J or self.current_inner >= self.max_inner_iter:                                             # 評価関数Jが閾値より小さくなったか、or、内側ループの最大回数を超えたか
+                self.get_logger().info(                                                                                 # ログ出力
+                    f"外側ループ {self.current_outer + 1} 完了！最高結果をCSV/Excelに保存します。"
+                )
+                self.save_optimal_results_to_csv()                                                                      # ベストFF入力の情報をCSVへ保存
+                if self.DEBUG_EXCEL:                                                                                    # Excelにも保存する場合は保存
                     self.save_debug_to_excel()
 
-                # csvに保存
-                self.save_optimal_results_to_csv()
+                # 最良パラメータ表示
+                self._print_best_params(dof_map)                                                                        # 最良パラメータを表示
 
-                # 初期位置更新
-                self.initial_pot = list(self.target_pot) # 今回の目標位置を、次回の開始位置にする
+                self.current_outer += 1                                                                                 # 外側ループ回数を更新
+                self.current_inner = 0                                                                                  # 内側ループ回数を0に戻す
+                self.min_J_sum = float('inf')                                                                           # 内側ループの評価関数値の初期値を無限に変える
 
-                # 次の目標値（次の試行）に進むため、Best J 管理用の変数をリセット
-                self.min_J_global = float('inf')
-                self.best_results_to_save = None
-                
-                # 試行回数更新（目標をクリア、またはスキップした時のみ全体の進捗を進める）
-                self.current_iteration += 1 # 実験回数を1増やす
+                # 外側ループを終えた後の判定
+                if self.current_outer >= self.max_outer_iter:
+                    self.state = "FINISHED"                                                                             # 終了状態に変更
+                    self.state_start_time = self.get_clock().now()                                                      # 現在時刻を取得
+                    return                                                                                              # dispatch_optimization_pipeline()を終了
 
-                # 次の目標値を取得 (進捗current_iterationに応じた値を割り当てる)
-                if self.current_iteration < self.max_iter:
-                    # 次の目標位置生成
-                    self.target_pot = self.get_next_target_positions()
+                # Next outer loop target
+                self.initial_pot = list(self.target_pot)                                                                # 1つ前の目標値を次の初期姿勢にする
+                self.target_pot = self.get_next_target_positions()                                                      # 次の目標値を決める
+                # reset ff for new target
+                self.current_ff_matrix = [[0.0] * 5 for _ in range(24)]                                                 # FFパラメータをリセット
 
-            else:
-                self.get_logger().info(f"【未収束】round_J ({round_J:.4f}) > しきい値 ({j_threshold}) [同一目標内での試行: {self.same_target_loop_count}/{max_loops_per_target} 回]。同じ目標位置でFFを再適用します。")
-                # initial_pot, target_pot, current_iteration は更新せずそのまま維持
+            self.state = "INIT_ROBOT"                                                                                   # 初期状態に戻す
+            self.state_start_time = self.get_clock().now()                                                              # 現在時刻を取得
 
-            # 終了判定
-            if self.current_iteration >= self.max_iter: # 設定回数に達したか確認
-                self.state = "FINISHED" # 終了状態へ
-            else: # まだ試行回数に達していない場合
-                self.state = "INIT_ROBOT" # 最初の状態へ戻る
-
-        # 途中で何らかのエラーが発生した場合    
-        except Exception as e:
-            self.get_logger().error(f"シーケンサープロセスが異常停止しました: {e}") # エラー内容出力
-            self.state = "FINISHED" # 安全のため終了状態へ
-
-        # エラーの有無に関係なく必ず実行
-        finally:
-            # 状態開始時刻を更新
+        except Exception as exc:                                                                                                                    # 何かエラーが出たときの処理
+            self.get_logger().error(f"最適化パイプライン異常: {exc}\n{traceback.format_exc()}")
+            self.state = "FINISHED"
             self.state_start_time = self.get_clock().now()
 
-    # 最適化結果をCSVへ保存する関数
-    def save_optimal_results_to_csv(self):
-        self.get_logger().info(f"最小J結果をCSVに永続化保存中: {self.csv_path}") # ROSログ出力
+    # 外側ループが終了した時点で得られた最良のFFパラメータを一覧表示する関数
+    def _print_best_params(self, dof_map):
+        """外側ループ完了時に最良パラメータa,b,c,d,eとt1,t2,y1,y2を表示する"""
+        self.get_logger().info("")
+        self.get_logger().info("=" * 90)
+        self.get_logger().info(
+            f"  外側ループ {self.current_outer + 1} 最良結果 (ベストJ = {self.min_J_sum:.2f})"
+        )
+        self.get_logger().info("=" * 90)
 
-        # CSV保存中のエラー対策
-        try:
-            row_data = [] # CSVへ書き込む前の一時保存領域
+        board_names = ["Board1", "Board2", "Board3", "Board4", "Board5"]
+        dof_idx = 0                                                                                                                                     # 24自由度全体を数える番号
+        for b_id in range(1, 6):                                                                                                                        # board1～board5の順に処理
+            # 表の見出しを作成
+            n_dof = 6 if b_id <= 3 else 3
+            self.get_logger().info(f"")
+            self.get_logger().info(f"--- {board_names[b_id - 1]} ({n_dof}DOF) ---")
+            self.get_logger().info(
+                f"  {'DOF':>4s} | {'a':>12s}  {'b':>12s}  {'c':>12s}  {'d':>12s}  {'e':>12s}"
+                f"  | {'t1':>6s}  {'y1':>8s}  {'t2':>6s}  {'y2':>8s}"
+            )
+            self.get_logger().info("  " + "-" * 106)
 
-            # 24自由度を順番に処理
-            for idx in range(24):
-                r = next(item for item in self.best_results_to_save if item["idx"] == idx) # self.best_results_to_saveの中からidxと一致する自由度の結果を取り出す
-
-                # 特徴量取得
-                t1, t2, y1, y2 = r["extr"] # 最適化関数内で抽出した特徴量
-
-                # csvファイルに書き込む初期値・目標値も確実に小数点以下0のfloat型にする
-                init_val_fixed = float(int(self.csv_initial_pot[idx]))
-                tgt_val_fixed = float(int(self.csv_target_pot[idx]))
-
-                # 保存データ作成
-                # 1自由度分の保存データを作る
-                dof_tuple = ( 
-                    init_val_fixed, # 初期値
-                    tgt_val_fixed, # 目標値
-                    self.T, # FF制御入力時間
-                    t1, t2, y1, y2 # 各特徴量
+            # 表に値をいれて表示
+            for local_d in range(n_dof):
+                a, b, c, d, e = self.best_ff_matrix[dof_idx]                                                            # パラメータを取得
+                t1, y1, t2, y2 = self.best_extrema[dof_idx]                                                             # 極値取得
+                self.get_logger().info(
+                    f"  {dof_idx + 1:4d} | {a:>12.4e}  {b:>12.4e}  {c:>12.4e}  {d:>12.4e}  {e:>12.4e}"
+                    f"  | {t1:6.3f}  {y1:8.2f}  {t2:6.3f}  {y2:8.2f}"
                 )
+                dof_idx += 1                                                                                            # 自由度番号の更新
 
-                # 保存リストへ追加
-                row_data.append(dof_tuple)
-
-            # CSVファイルを開く
-            # CSVファイルを追記モードで開く
-            with open(self.csv_path, 'a', newline='') as f:
-                # CSV書き込みオブジェクト作成
-                writer = csv.writer(f)
-
-                # CSV1行分を格納
-                flat_row = []
-
-                # 24自由度を順番に処理
-                for t in row_data:
-                    # 要素を横方向へ展開
-                    flat_row.extend(t)
-                
-                # CSVへ1行追加
-                writer.writerow(flat_row)
-
-            # 保存完了メッセージ
-            self.get_logger().info("CSVファイルの保存に成功しました。")
-        except Exception as e: # 保存失敗時
-            self.get_logger().error(f"CSV保存中にI/Oエラーが発生しました: {e}")
-
-    def save_debug_to_excel(self):
-        """
-        [超高速・一括書き込み版] 自由度ごとに完全独立した時間軸を持つマトリクス
-        """
-        self.get_logger().info(f"【デバッグ】波形データをExcelシートに高速一括展開中... (試行 {self.current_iteration + 1})")
-        try:
-            sheet_name = f"Trial_{self.current_iteration + 1}"
-            ws = self.debug_wb.create_sheet(title=sheet_name)
-
-            # 1. J値サマリー表の作成
-            ws.append(["自由度 (DOF)", "評価関数値 J"])
-            sorted_results = sorted(self.best_results_to_save, key=lambda x: x["idx"])
-            for r in sorted_results:
-                ws.append([f"DOF {r['idx'] + 1}", r["J"]])
+        self.get_logger().info("=" * 90)
+        self.get_logger().info("")
+    
+    # 外側ループで最終的に得られた最良結果をCSVへ保存する関数
+    def save_optimal_results_to_csv(self):
+        dof_map = self.build_dof_map()                                                                                                                  # 26要素→24自由度対応表の作成
+        row_data = {}                                                                                                                              # 空の辞書作成
+        for dof_idx in range(24):                                                                                                                  # 24自由度ループ
+            Pi = self.initial_pot[dof_map[dof_idx]]                                                                                                # 初期位置取得
+            Pf = self.target_pot[dof_map[dof_idx]]                                                                                                 # 目標位置取得
+            t1, y1, t2, y2 = self.best_extrema[dof_idx]                                                                                            # 極値取得
             
-            total_row = len(sorted_results) + 2
-            ws.cell(row=total_row, column=1, value="Total J")
-            ws.cell(row=total_row, column=2, value=f"=SUM(B2:B{total_row-1})")
+            # csvへ保存するデータを追加
+            row_data[f'Init_{dof_idx + 1}'] = Pi
+            row_data[f'Target_{dof_idx + 1}'] = Pf
+            row_data[f'T_{dof_idx + 1}'] = self.T
+            row_data[f't1_{dof_idx + 1}'] = t1
+            row_data[f'y1_{dof_idx + 1}'] = y1
+            row_data[f't2_{dof_idx + 1}'] = t2
+            row_data[f'y2_{dof_idx + 1}'] = y2
 
-            # 2. ヘッダー行の一括構築 (自由度ごとに独立した 4列[Time, Measured, Target, System] を並べる)
-            headers = ["", ""]  # A, B列(サマリー用) のスペースをスキップ
-            for r in sorted_results:
-                dof_num = r['idx'] + 1
-                headers.extend([f"Time_DOF{dof_num}", f"Measured_DOF{dof_num}", f"TargetModel_DOF{dof_num}", f"SystemModel_DOF{dof_num}"])
-            ws.append(headers)
+        df = pd.DataFrame([row_data])                                                                                                                   # データを横並びにする
+        header = not os.path.exists(self.csv_path)                                                                                                      # 既存ファイルがあるか判定
+        df.to_csv(self.csv_path, mode='a', header=header, index=False)                                                                                  # csvへ保存
+        self.get_logger().info(f"CSV保存完了: {self.csv_path}")
 
-            # 3. 時系列データの一括パッキングと ws.append による超高速流し込み
-            data_len = len(sorted_results[0]["debug_data"]["t_eval"])
-            for t_step in range(data_len):
-                row_cells = [None, None]  # A, B列用
-                for r in sorted_results:
-                    debug_data = r["debug_data"]
-                    row_cells.append(debug_data["t_eval"][t_step])
-                    row_cells.append(debug_data["measured"][t_step])
-                    row_cells.append(debug_data["target_model"][t_step])
-                    row_cells.append(debug_data["system_model"][t_step])
-                ws.append(row_cells)
+    # デバック用Excelを作成する関数
+    def save_debug_to_excel(self):
+        sheet_name = f"Iter_{self.current_outer + 1}"                                                                                                   # シート名作成
+        ws = self.debug_wb.create_sheet(title=sheet_name)                                                                                               # シート作成
 
-            # 4. 各自由度の独立グラフを生成してレイアウト
-            # データ行はヘッダー（1行目サマリー、total_row行目合計、さらにヘッダー行）を挟むため、実データは total_row + 2 行目からスタート
-            start_data_row = total_row + 2
-            end_data_row = start_data_row + data_len - 1
-
-            for d_idx, r in enumerate(sorted_results):
-                # 自由度ごとに4列ずつずれる (C列が3番目なので index=3 からスタート)
-                start_col = 3 + (d_idx * 4)
-
-                # 時間軸 (Time_DOF X) への個別参照
-                cats_ref = Reference(ws, min_col=start_col, min_row=start_data_row, max_row=end_data_row)
-                
-                # データ範囲 (Measured, TargetModel, SystemModel) の個別参照
-                data_ref = Reference(ws, min_col=start_col+1, min_row=total_row+1, max_col=start_col+3, max_row=end_data_row)
-
-                chart = LineChart()
-                chart.title = f"Model Identification - DOF {r['idx'] + 1}"
-                chart.style = 13
-                chart.y_axis.title = "POT Value"
-                chart.x_axis.title = "Time (s)"
-                chart.width = 15
-                chart.height = 9
-                
-                chart.add_data(data_ref, titles_from_data=True)
-                chart.set_categories(cats_ref)
-
-                # A列のJ値サマリーの下方に縦並びでグラフを並べる
-                insert_cell = f"A{total_row + 3 + (d_idx * 18)}"
-                ws.add_chart(chart, insert_cell)
-
-            # 各試行が終了するごとに自動中間保存 (安全確保)
-            self.debug_wb.save(self.excel_path)
-            self.get_logger().info(f"【デバッグ】独立軸Excelシートの中間保存に成功しました: {self.excel_path}")
-        except Exception as e:
-            self.get_logger().error(f"【デバッグ】Excel処理中にエラーが発生しました: {e}")
+        ws.cell(row=1, column=1, value="DOF")                                                                                                           # 1列目のタイトル作成
+        ws.cell(row=1, column=2, value="Best J")                                                                                                        # 2列目のタイトル作成
+        for dof_idx in range(24):                                                                                                                       # 24自由度ループ
+            ws.cell(row=dof_idx + 2, column=1, value=dof_idx + 1)                                                                           # A列へDOF番号を格納
+            ws.cell(row=dof_idx + 2, column=2, value=self.best_debug_data[dof_idx]['J'])                                                    # B列へ評価関数Jを格納
+        
+        # 各DOFのグラフを作成し、それをExcelへ貼り付ける処理
+        for dof_idx in range(24):                                                                                                                       # 24自由度ループ
+            data = self.best_debug_data[dof_idx]                                                                                            # デバック用データを取りだす
+            plt.figure(figsize=(6, 4))                                                                                                      # 新しいグラフを作成
+            plt.plot(data['t'], data['y_data'], label='Actual Data')                                                                        # 実測データを描画
+            plt.plot(data['t'], data['y_tgt'], '--', label='Target Model (zeta=1)')                                                         # 目標モデルを描画
+            plt.plot(data['t'], data['y_sys'], ':', label='System Model')                                                                   # システムモデルを描画
+            plt.title(f"DOF {dof_idx + 1} (J = {data['J']:.2f})")                                                                           # グラフのタイトルを設定
+            plt.legend()                                                                                                                    # 凡例を表示
+            img_path = f"/tmp/lqr_plot_iter{self.current_outer + 1}_dof{dof_idx + 1}.png"                                                   # 画像ファイル名を作成
+            plt.savefig(img_path)                                                                                                           # PNG画像として保存
+            plt.close()                                                                                                                     # グラフを閉じる
+            img = OpenpyxlImage(img_path)                                                                                                   # PNG画像をOpenPyXLが扱える画像オブジェクトへ変換
+            col = "D" if dof_idx % 2 == 0 else "M"                                                                                          # 偶数自由度は左に、奇数自由度は右に配置
+            row_idx = 2 + (dof_idx // 2) * 22                                                                                               # 張り付ける高さを指定
+            ws.add_image(img, f"{col}{row_idx}")                                                                                            # 画像を張り付ける
 
 
 # ==============================================================================
-# 3. GUIファイルシステムダイアログ & エントリーポイント
+# エントリーポイント
 # ==============================================================================
-# CSVファイルの保存先を決める関数
+
+# CSVファイル選択関数
 def resolve_csv_file():
-    root = tk.Tk() # TkinterのGUIウィンドウ生成
-    root.withdraw() # メインウィンドウを非表示にする
-    root.attributes("-topmost", True) # ファイル選択ダイアログを最前面表示にする
+    root = tk.Tk()                                                                                                                          # Tkinterを起動
+    root.withdraw()                                                                                                                         # 親ウィンドウは表示しない
+    root.attributes("-topmost", True)                                                                                                       # ダイアログを最前面に表示
 
-    # 説明表示
     print("====================================================")
     print("【最適制御実施前手順 1】結果記録用CSVの選択および生成")
     print("1: 既存の結果CSVファイルを選択して追記する")
     print("2: 新規保存先フォルダを選択してCSVファイルを生成する")
     print("====================================================")
-    choice = input("モードを選択してください (1 または 2): ").strip()
+    choice = input("モードを選択してください (1 または 2): ").strip()                                                                           # モードの入力
 
-    # モード1：既存CSVへ追記
+    # 追記の場合
     if choice == '1':
-        file_path = filedialog.askopenfilename( # ファイル選択ダイアログを開く。
+        file_path = filedialog.askopenfilename(                                                                             # ファイル選択ダイアログを表示
             title="既存の結果CSVファイルを選択してください",
-            filetypes=[("CSV Files", "*.csv")] # CSVだけ表示
+            filetypes=[("CSV Files", "*.csv")],
         )
-        # キャンセルされたか確認
         if not file_path:
-            print("ファイル未選択のため終了します。") # 終了メッセージ
-            sys.exit(1) # 異常終了
-        return file_path # 選択したCSVパスを返す
-    # モード2：新規作成モード
-    else:
-        folder_path = filedialog.askdirectory(title="結果のCSVファイルを保存するフォルダを選択してください") # フォルダ選択ダイアログ
-        if not folder_path: # キャンセル確認
-            print("フォルダ未選択のため終了します。")
+            print("ファイル未選択のため終了します。")
             sys.exit(1)
-        
-        # ファイル名生成
-        file_path = os.path.join(folder_path, "optimal_control_results.csv")
-        
-        # ファイル存在確認
-        if not os.path.exists(file_path): # まだ存在しない場合のみ作成
-            with open(file_path, 'w', newline='') as f: # 新規CSV作成
-                writer = csv.writer(f) # CSVライター作成
-                headers = [] # ヘッダ格納用
+        return file_path
 
-                # 24自由度分ヘッダ作成
-                for i in range(1, 25):
-                    headers.extend([
-                        f'Init_POT_dof{i}', f'Target_POT_dof{i}', f'T_dof{i}', 
-                        f't1_dof{i}', f't2_dof{i}', f'y1_dof{i}', f'y2_dof{i}'
-                    ])
+    # 新規作成の場合
+    folder_path = filedialog.askdirectory(title="結果のCSVファイルを保存するフォルダを選択してください")                                            # フォルダ選択ダイアログを表示
+    if not folder_path:
+        print("フォルダ未選択のため終了します。")
+        sys.exit(1)
+    file_name = input("新規作成するCSVファイル名を入力してください (例: result.csv): ").strip()                                                     # ファイル名の入力
+    if not file_name.endswith(".csv"):
+        file_name += ".csv"
+    return os.path.join(folder_path, file_name)
 
-                writer.writerow(headers) # ヘッダ行を書き込む
-        return file_path # 作成したCSVパスを返す
 
-# プログラムのエントリーポイント
 def main(args=None):
-    # 保存先決定
-    csv_file_path = resolve_csv_file()
-    
-    print("\n【最適制御実施前手順 2】")
-    T = float(input("FF制御入力時間 T (秒) を入力してください: ")) # FF入力時間取得
-    
-    print("\n【最適制御実施前手順 3】")
-    max_iterations = int(input("最適制御の総実行回数を入力してください: ")) # 総試行回数取得
+    csv_path = resolve_csv_file()
+    print(f"【保存先CSVパス】 {csv_path}")
 
-    # 目標値指定モードの選択 ---
-    print("\n【最適制御実施前手順 4】目標値指定モードの選択")
-    print("1: プリセット目標値を優先して与え、足りない分をランダム補填する")
-    print("2: 最初からすべてランダムに目標値を与える")
-    target_mode = input("モードを選択してください (1 または 2): ").strip()
-    while target_mode not in ['1', '2']:
-        target_mode = input("無効な入力です。1 または 2 を選択してください: ").strip()
+    print("【FF制御時間 T を入力してください】")
+    T = float(input("> "))
+    print("【最適制御実行回数を入力してください】")
+    max_iter = int(input("> "))
+    print("【モードを選択してください (1: プリセット後ランダム, 2: 最初からランダム)】")
+    mode = input("> ").strip()
+    while mode not in ['1', '2']:
+        mode = input("無効な入力です。1 または 2 を入力してください: ").strip()
 
-    print("\n【最適制御実施前手順 5】ROS 2 最適制御プログラムをスピンアップします...")
-
-    # ROS2初期化
     rclpy.init(args=args)
-    
-    # コンストラクタを実行
-    node = OptimalControlSequencer(csv_file_path, T, max_iterations, target_mode)
-    
+    node = OptimalControlSequencer(csv_path, T, max_iter, mode)
     try:
-        # ROS2イベントループ開始
         rclpy.spin(node)
-    except (KeyboardInterrupt, SystemExit): # Ctrl+C対応
-        print("\nユーザーによるシグナル遮断を検知しました。")
-    finally: # 必ず実行
-        node.destroy_node() # ROS2ノード破棄
-        rclpy.shutdown() # ROS2終了
+    except SystemExit:
+        pass
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
 
 if __name__ == '__main__':
     main()
-
-    #2026/06/25 20:50で一番（システムモデルは3次遅れ系）
