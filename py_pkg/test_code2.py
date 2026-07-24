@@ -34,8 +34,8 @@ np.seterr(all='ignore')                                         # Numpyのエラ
 # ==============================================================================
 # LQR重み行列（チューニング要素）
 # ==============================================================================
-LQR_Q = np.diag([50.0, 10.0, 0.1])      # 状態誤差の重み（大きいほど誤差を抑える）
-LQR_R = np.array([[110]])              # 制御入力の重み（大きいほど入力を抑える）
+LQR_Q = np.diag([80.0, 10.0, 0.1])      # 状態誤差の重み（大きいほど誤差を抑える）
+LQR_R = np.array([[60]])              # 制御入力の重み（大きいほど入力を抑える）
 
 # 履歴
 # 2026/07/01 20:00
@@ -224,19 +224,16 @@ class MathematicalSolver:
 
         # 逐次計算 (オイラー積分) による最適入力の算出
         dt = self.dt                                                                                    # シミュレーションのサンプル刻み幅
-        x_sys = np.array([y0, a2_sys * y0, a1_sys * y0], dtype=float)                                   # システムモデルの初期状態 (可観測正準形)
+        x_sys = np.array([y0, 0.0, 0.0], dtype=float)                                                   # システムモデルの初期状態 (可制御正準形)
         u_opt = np.zeros(len(self.t_eval))                                                              # 最適入力を保存する配列
 
         for i in range(len(self.t_eval)):
             if self.t_eval[i] <= self.T:                                                                # FF入力時間内のみ実行
-                # 可観測正準系の状態空間表現から、現在の物理量(位置, 速度, 加速度)を計算
-                dx0 = x_sys[1] - a2_sys * x_sys[0]
-                dx1 = x_sys[2] - a1_sys * x_sys[0]
-                
+                # 可制御正準系の状態空間表現から、現在の物理量(位置, 速度, 加速度)を計算
                 y_val = x_sys[0]
-                dy_val = dx0
-                ddy_val = dx1 - a2_sys * dx0
-
+                dy_val = x_sys[1]
+                ddy_val = x_sys[2]
+                
                 # システム軌道と目標軌道の誤差を計算 (物理量ベース)
                 x_tgt = np.array([y_tgt[i], dy_tgt[i], ddy_tgt[i]])
                 x_err = np.array([y_val, dy_val, ddy_val]) - x_tgt                                      # 誤差 = システム軌道 - 目標軌道
@@ -246,7 +243,9 @@ class MathematicalSolver:
                 u_opt[i] = u_opt_val
                 
                 # 状態変数の更新 (オイラー積分)
-                dx2 = b0_sys * u_opt_val - a0_sys * x_sys[0]
+                dx0 = x_sys[1]
+                dx1 = x_sys[2]
+                dx2 = b0_sys * u_opt_val - a0_sys * x_sys[0] - a1_sys * x_sys[1] -a2_sys * x_sys[2]
                 x_sys[0] += dx0 * dt
                 x_sys[1] += dx1 * dt
                 x_sys[2] += dx2 * dt

@@ -58,7 +58,12 @@ setup(
             'optimize_ff_ROS2=py_pkg.optimize_ff_ROS2:main',
             'optimize_ADRC_ff_ROS2=py_pkg.optimize_ADRC_ff_ROS2:main',
             'optimize_LQR_ff_ROS2=py_pkg.optimize_LQR_ff_ROS2:main',
+            'optimize_EL_ff_ROS2=py_pkg.optimize_EL_ff_ROS2:main',
+            'optimize_TuningEL_ff_ROS2=py_pkg.optimize_TuningEL_ff_ROS2:main',
             'test_code=py_pkg.test_code:main',
+            'test_code2=py_pkg.test_code2:main',
+            'test_code3=py_pkg.test_code3:main',
+            'test_code4=py_pkg.test_code4:main',
             'GUI_android_tk=py_pkg.GUI_android_tk:main'
         ],
     },
