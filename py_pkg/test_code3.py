@@ -490,6 +490,8 @@ class OptimalControlSequencer(Node):
         self.best_extrema = None                                                                                                                # 今までの最良FFの極値
         self.min_J_sum = float('inf')                                                                                                           # 評価関数Jの初期化
         self.best_debug_data = None                                                                                                             # デバック情報
+        self.prev_u_pred_full = [None] * 24                                                                                                      # 前回ループで計算した5次関数FF入力（今回の実測データを生成した入力）
+        self.prev_u_opt = [None] * 24                                                                                                            # 前回ループで計算した最適制御入力（今回の実測データを生成した入力）
 
         self.buffer_time_series = {f'board{i}': [] for i in range(1, 6)}                                                                        # 5board分のデータバッファ
         self.target_pot = self.get_next_target_positions()                                                                                      # 最初にロボットへ送る目標値を決定
@@ -569,7 +571,7 @@ class OptimalControlSequencer(Node):
                     data.extend([float(a), float(b), float(c), float(d), float(e), float(self.T)])              # データに格納
                     self.get_logger().info(                                                                     # ログ出力
                         f"  B{b_id}-D{_ + 1} (DOF {dof_idx + 1:02d}): "
-                        f"a={a:.1e}, b={b:.1e}, c={c:.1e}, d={d:.1e}, e={e:.1e} | "
+                        f"a={a:.6e}, b={b:.6e}, c={c:.6e}, d={d:.6e}, e={e:.6e} | "
                         f"t1={t1:.3f}, y1={y1:.2f}, t2={t2:.3f}, y2={y2:.2f}"
                     )
                     dof_idx += 1                                                                                # DOF番号更新
@@ -700,16 +702,25 @@ class OptimalControlSequencer(Node):
                 J = np.sum((y_tgt - y_shifted) ** 2)                                                        # 二乗和誤差を計算
                 J_array.append(J)                                                                           # 24自由度それぞれの評価関数Jの空リストに追加
 
+                # 今回の実測データ（＝今回のJ）を生成した入力は、前回ループで計算した u_pred_full / u_opt
+                # 初回ループは前回値が無いため、実際に印加したFF入力(u_ff)で代用する
+                u_pred_full_for_J = self.prev_u_pred_full[dof_idx] if self.prev_u_pred_full[dof_idx] is not None else u_ff.copy()   # 今回のJを生成した5次関数FF入力
+                u_opt_for_J = self.prev_u_opt[dof_idx] if self.prev_u_opt[dof_idx] is not None else u_ff.copy()                     # 今回のJを生成した最適制御入力
+
                 # デバック用データを保存
                 debug_info.append({
-                    't': solver.t_eval,         # 実測時間
-                    'y_data': raw_y,            # 実測POT値
-                    'y_sys': y_sys_sim + Pf,    # システムモデル応答
-                    'y_tgt': y_tgt + Pf,        # 目標モデル応答
+                    't': solver.t_eval,             # 実測時間
+                    'y_data': raw_y,                # 実測POT値
+                    'y_sys': y_sys_sim + Pf,        # システムモデル応答
+                    'y_tgt': y_tgt + Pf,            # 目標モデル応答
                     'J': J,
-                    'u_pred_full': u_pred_full, # 近似した5次関数FF入力
-                    'u_opt': u_opt,             # 最適制御入力
+                    'u_pred_full': u_pred_full_for_J,   # 今回のJを生成した5次関数FF入力（最小J時の値）
+                    'u_opt': u_opt_for_J,               # 今回のJを生成した最適制御入力（最小J時の値）
                 })
+
+                # 次回ループで印加する（＝次回の実測データを生成する）入力を保存
+                self.prev_u_pred_full[dof_idx] = u_pred_full                                                 # 次回ループ用の5次関数FF入力を保存
+                self.prev_u_opt[dof_idx] = u_opt                                                             # 次回ループ用の最適制御入力を保存
 
             total_J = sum(J_array)                                                                                      # 各自由度の評価関数値Jを足す
 
@@ -764,6 +775,8 @@ class OptimalControlSequencer(Node):
                 self.target_pot = self.get_next_target_positions()                                                      # 次の目標値を決める
                 # reset ff for new target
                 self.current_ff_matrix = [list(MathematicalSolver.initial_ff_params(self.T)) for _ in range(24)]        # FFパラメータを初回励振用の非ゼロ初期値へリセット
+                self.prev_u_pred_full = [None] * 24                                                                     # FFリセットに伴い前回入力もリセット（初回はu_ffで代用）
+                self.prev_u_opt = [None] * 24                                                                           # FFリセットに伴い前回最適入力もリセット（初回はu_ffで代用）
 
             self.state = "INIT_ROBOT"                                                                                   # 初期状態に戻す
             self.state_start_time = self.get_clock().now()                                                              # 現在時刻を取得
