@@ -64,6 +64,12 @@ setup(
             'test_code2=py_pkg.test_code2:main',
             'test_code3=py_pkg.test_code3:main',
             'test_code4=py_pkg.test_code4:main',
+            'test_code5=py_pkg.test_code5:main',
+            'test_code6=py_pkg.test_code6:main',
+            'test_code7=py_pkg.test_code7:main',
+            'test_code8=py_pkg.test_code8:main',
+            'test_code9=py_pkg.test_code9:main',
+            'view_optimization=py_pkg.view_optimization:main',
             'GUI_android_tk=py_pkg.GUI_android_tk:main'
         ],
     },

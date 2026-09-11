@@ -23,6 +23,8 @@
   <exec_depend>os</exec_depend>
   <exec_depend>tkinter</exec_depend>
   <exec_depend>scipy</exec_depend>
+  <exec_depend>cmaes</exec_depend>
+  <exec_depend>matplotlib</exec_depend>
   <exec_depend>concurrent.futures</exec_depend>
   <exec_depend>sys</exec_depend>
   <exec_depend>traceback</exec_depend>

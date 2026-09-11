@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+#2026/08/04までのオイラーラグランジュ法プログラム
 import os                                                       # OSライブラリ
 import sys                                                      # Pythonを扱うライブラリ
 import time                                                     # 時間
@@ -20,6 +21,7 @@ from std_msgs.msg import Float32MultiArray, UInt16MultiArray    # ROS2メッセ�
 
 import scipy.optimize                                           # 最適化ライブラリ
 from scipy.signal import cont2discrete                          # 連続時間→離散時間(ZOH)厳密離散化
+from cmaes import CMA                                           # CMA-ES（進化戦略）最適化ライブラリ
 
 import tkinter as tk                                            # GUIライブラリ
 from tkinter import filedialog                                  # GUIでフォルダ選択
@@ -33,9 +35,6 @@ np.seterr(all='ignore')                                         # Numpyのエラ
 # ==============================================================================
 COST_Q = np.diag([8858.79, 0.191027, 0.0711133])     # 状態誤差の重み（大きいほど誤差を抑える）
 COST_R = np.array([[10.7164]])             # 制御入力の重み（大きいほど入力を抑える）
-
-# COST_Q = np.diag([724837, 13949.9, 0.184584])
-# COST_R = np.array([[0.0526736]])
 
 # ==============================================================================
 # シミュレーションおよび最適化のパラメータ（チューニング要素）
@@ -61,91 +60,27 @@ EL_LS_MAX = 40              # ステップ幅 α のバックトラッキング�
 INIT_FF_PEAK = 50.0         # 初期FFの極値の大きさ [PWM]（f(t1)=+50≥40, f(t2)=-50≤-40 を満たす）
 
 # ==============================================================================
-# 最適入力の5次多項式フィットのパラメータ（チューニング要素）
-#   f(t) = a t^5 + b t^4 + c t^3 + d t^2 - (a T_FF^4 + b T_FF^3 + c T_FF^2 + d T_FF) t
-#   ・1次の係数を e = -(a T_FF^4 + b T_FF^3 + c T_FF^2 + d T_FF) に固定しているため
-#     f(0) = f(T_FF) = 0 が常に厳密に成立する
-#   ・極値は「探してから数える」のではなく、f'(t) を
-#         f'(t) = (t-t1)(t-t2)·q(t),  q(t) = α(t-m)² + β （α,βは同符号 → q は符号一定）
-#     と因数分解した形で表すことで、0<t<T_FF に山1つ・谷1つだけを構造的に保証する
-#   ・α=0 のとき f は3次関数 C·t(t-tm)(t-T_FF) に退化する（理想形）
-#   ・その条件を満たす形の中で、u_opt との二乗和誤差が最小のものを採用する
+# 5次多項式FFフィット（CMA-ES）のパラメータ（チューニング要素）
+#   最適入力 u_opt を f(t) = a t^5 + b t^4 + c t^3 + d t^2 - (aT^4+bT^3+cT^2+dT) t で近似する。
+#   極値条件（区間(0,T)の内部に f'(t)=0 の実単純根がちょうど2つ）はペナルティで妥協せず、
+#   条件を満たした個体だけを採用し、満たす解が出なければ初期値を変えて再探索する。
 # ==============================================================================
-FIT_EXTREMA_WEIGHT = 1e12   # q(t)が符号一定にならない（極値が増える）ときのペナルティ重み（大きな重み）
-FIT_PWM_WEIGHT = 1e6        # PWM上下限(±255)を超えたときのペナルティ重み
-FIT_QUAD_MARGIN = 0.05      # |q(t)|が区間内で最大値のこの割合を下回らないようにする余裕（平坦部＝準重根を防ぐ）
-FIT_EXTREMA_MARGIN = 0.02   # 極値を端点(0, T_FF)から離しておく余裕（T_FFに対する割合。端点に張り付いた極値を防ぐ）
-FIT_EXTREMA_GAP = 0.05      # 山と谷を離しておく最小間隔（T_FFに対する割合。2つの極値が重なるのを防ぐ）
-FIT_MAX_RETRY = 100          # 極値2個の判定を満たさなかった場合のフィット再試行回数
-FIT_MIN_TRIAL = 5           # 条件を満たす解が得られても最低限試す初期値の個数（初期値依存の悪い解の採用を防ぐ）
-FIT_ROOT_TOL = 1e-6         # f'(t)=0 の実根判定の許容誤差（虚部の大きさおよび重根の同一視）
+CMA_POP_SIZE = 16           # CMA-ESの1世代あたりの個体数
+CMA_MAX_GEN = 200           # 1回の探索あたりの最大世代数
+CMA_SIGMA_RATIO = 0.3       # CMA-ESの初期ステップ幅（u_optの最大振幅に対する比）
+CMA_MAX_RESTART = 20        # 極値条件を満たす解が見つかるまでの最大再探索回数
+EXTREMA_IMAG_TOL = 1e-6     # f'(t)=0 の根を実根とみなす虚部の許容値
+EXTREMA_EPS = 1e-9          # |f''(ti)| > ε で単純根（重根でない）と判定する閾値 ε
+FIT_PWM_PENALTY = 1e6       # FF入力を -255～255 に収めるためのペナルティ係数
+INFEASIBLE_PENALTY = 1e12   # 極値条件を満たさない個体を必ず劣後させる定数オフセット（採用は条件判定のみで行う）
 
 # ==============================================================================
-# 5次多項式フィットの極値アンカー（トラストリージョン）のパラメータ（チューニング要素）
-#   u_opt はインパルス状になりやすく、f(0)=f(T_FF)=0 を課した5次多項式では表現しきれない。
-#   その結果フィットの残差曲面が平坦になり、振幅・極値位置がほぼ不定となって
-#   内側ループごとに極値が大きく飛ぶ（＝実機に入る入力が毎回別物になる）。
-#   そこで「そのDOFで最小のJを出したFFの極値」をアンカーとし、
-#     ・fit_loss に正規化した近接項 w_prox·prox を加えて最適化そのものを引き寄せる
-#     ・アンカーの極値から作った形状パラメータを初期値の1つに加える（ウォームスタート）
-#     ・フィット精度が実質同等な候補（mse ≤ (1+ε)·mse_min）の中から最も近い解を採用する
-#     ・改善したら重みを半分（半径拡大）、悪化したら倍（半径縮小）に更新する
-#   ことで、極値の連続性とフィット精度を両立させる。
+# 最適化ビューア（別プロセス）へ渡すスナップショットの設定
+#   内側ループが1回終わるごとに、24自由度分の波形とパラメータ履歴を1つの .npz へ書き出す。
+#   ビューア（view_optimization.py）はこのファイルの更新時刻を監視して自動で再描画する。
 # ==============================================================================
-FIT_PROX_W0 = 1.0           # 近接項の重みの初期値（アンカーを効かせ始めるときの探索半径）
-FIT_PROX_W_MIN = 1e-3       # 近接項の重みの下限（改善が続いたときに許す最大の探索半径）
-FIT_PROX_W_MAX = 1e3        # 近接項の重みの上限（悪化が続いたときの最小の探索半径）
-FIT_PROX_WARMUP = 3         # アンカーを効かせ始めるまでの内側ループ回数（初期FFの振幅に縛られるのを防ぐ）
-FIT_MSE_TOL = 0.10          # フィット精度の許容劣化率 ε（mse ≤ (1+ε)·mse_min の候補だけをアンカー選択の対象にする）
-FIT_PWM_SCALE = 255.0       # 極値の大きさ [PWM] の正規化スケール（時間 t は T_FF で正規化する）
-
-
-# ==============================================================================
-# 5次多項式フィットの極値アンカー（DOFごとのトラストリージョン）
-# ==============================================================================
-class ExtremaAnchor:
-    """1自由度分の「最小Jを出したFFの極値」を保持し、フィットの探索半径を適応させるクラス。
-
-    合計Jではなく**DOFごとのJ**でベストを持つ（1軸が支配的なとき、他の軸が
-    「たまたま合計が良かった回」の極値にアンカーされるのを防ぐ）。
-
-    ・pending_extrema : 今回ロボットへ印加したFFの極値。そのFFが生んだJが確定した時点で
-                        改善していれば best_extrema へ昇格する（J とFFの対応をずらさないため）
-    ・w_prox          : 近接項の重み。改善で半分（半径拡大）、悪化で倍（半径縮小）。
-                        古典的なトラストリージョンと同じ更新で「良くなっている間は自由に動き、
-                        悪化し始めたらベストへ引き戻される」挙動になる
-    ・n_update        : update() の呼び出し回数。FIT_PROX_WARMUP 未満はアンカーを無効にする
-    """
-
-    # コンストラクタ
-    def __init__(self):
-        self.best_J = float('inf')          # このDOFのこれまでの最小J
-        self.best_extrema = None            # 最小Jを出したFFの極値 (t1, y1, t2, y2)
-        self.pending_extrema = None         # 今回印加したFFの極値（Jが確定したら昇格させる候補）
-        self.w_prox = FIT_PROX_W0           # 近接項の重み（トラストリージョン半径に相当）
-        self.n_update = 0                   # update() の呼び出し回数（＝Jが確定した回数）
-
-    # 今回のJでベスト極値と探索半径を更新する関数
-    def update(self, J):                                                            # 引数(今回印加したFFが生んだ評価関数J)
-        improved = J < self.best_J                                                  # このDOFのベストを更新したか
-        if improved:                                                                # 改善していれば
-            self.best_J = J                                                         # ベストJを更新
-            if self.pending_extrema is not None:                                    # 今回印加したFFの極値を
-                self.best_extrema = tuple(self.pending_extrema)                     # ベスト極値へ昇格
-        if self.n_update >= FIT_PROX_WARMUP:                                        # アンカーが有効な区間だけ半径を更新する
-            self.w_prox = (max(self.w_prox * 0.5, FIT_PROX_W_MIN) if improved       # 改善 → 重みを半分にして探索半径を広げる
-                           else min(self.w_prox * 2.0, FIT_PROX_W_MAX))             # 悪化 → 重みを倍にしてベスト極値へ引き戻す
-        self.n_update += 1                                                          # 呼び出し回数を更新
-
-    # アンカーとして使う極値を返す関数（ウォームアップ中・ベスト未確定なら None）
-    def target(self):
-        if self.n_update < FIT_PROX_WARMUP:                                         # 初回数ループはアンカーを効かせない
-            return None
-        return self.best_extrema                                                    # ベスト極値（未確定なら None）
-
-    # 近接項の重みを返す関数（アンカーが無効なら0 → 従来どおりの純粋なフィットになる）
-    def weight(self):
-        return 0.0 if self.target() is None else self.w_prox
+ENABLE_SNAPSHOT = True                                      # ビューア用スナップショット出力のON/OFF
+SNAPSHOT_PATH = "/tmp/el_optimization_snapshot.npz"         # スナップショットの保存先（ビューア側と同じパスにすること）
 
 
 # ==============================================================================
@@ -159,6 +94,7 @@ class MathematicalSolver:
         self.t_eval = np.arange(0, SIM_TIME, self.dt)       # シミュレーション時間配列を作成
         self.Q = Q if Q is not None else COST_Q.copy()      # 状態重み行列の保存（引数 Q が与えられていればそれを使用し、与えられていなければ COST_Q をコピー）
         self.R = R if R is not None else COST_R.copy()      # 入力重み行列の保存（引数 R が与えられていればそれを使用し、与えられていなければ COST_R をコピー）
+        self.last_fit_restart = 0                           # 直近の fit_ff_poly が何回目の再探索で条件を満たしたか（-1は退避。ビューア表示用）
 
     # ------------------------------------------------------------------
     # 離散化・シミュレーション
@@ -220,12 +156,27 @@ class MathematicalSolver:
         a0 = (wn ** 2) / T1
         return a2, a1, a0
 
+    # 同定の初期値を決める関数（ "_"が付いているので外から直接呼べない内部専用関数）
+    @staticmethod
+    def _init_guess(prev_params, default):                                          # 引数(前回の同定結果, 前回結果が無いときの既定初期値)
+        """同定（least_squares）の初期値 x0 を決める。
+
+        前回の同定結果があればそれを初期値に使う（ウォームスタート）。内側ループごとに
+        モデルはわずかしか変化しないため、前回値から始めた方が収束が速く、同定値が
+        ループ間で飛びにくい。前回値が無い（初回）か、要素数が合わない・NaN/Infを含む
+        場合は既定の初期値へ戻す。
+        """
+        if prev_params is not None and len(prev_params) == len(default) and np.all(np.isfinite(prev_params)):
+            return [float(v) for v in prev_params]                                  # 前回の同定結果を初期値にする
+        return list(default)                                                        # 初回・異常値のときは既定の初期値にする
+
     # 目標モデル同定関数
-    def fit_target_model(self, y_data, y0):                                                 # 引数(実測データ, 初期偏差)
+    def fit_target_model(self, y_data, y0, prev_params=None):                               # 引数(実測データ, 初期偏差, 前回の同定結果[T1, wn])
         """目標モデル同定: 1 / ((T1*s + 1)(s^2 + 2*wn*s + wn^2))（減衰係数 zeta=1 固定）
 
         勾配ベースの信頼領域反射法（scipy.optimize.least_squares, method='trf'）で
         各時刻の残差 r(k)=y_sim(k)-y_data(k) の二乗和 Σr² を最小化する（Nelder-Mead は使用しない）。
+        初期値 x0 は前回の同定結果（prev_params）があればそれを使う（ウォームスタート）。
         """
         # 各時刻の残差ベクトルを返す関数（least_squares は Σr² を最小化する）
         def residuals(p):
@@ -235,7 +186,7 @@ class MathematicalSolver:
             return y_sim - y_data                                                   # 残差ベクトルを返す
 
         res = scipy.optimize.least_squares(                                                 # Σr² が最小になる変数[T1, wn]を最適化する
-            residuals, x0=[0.1, 10.0],
+            residuals, x0=self._init_guess(prev_params, [0.1, 10.0]),                       # 初期値（前回の同定結果 or 既定値）
             bounds=([1e-6, 1e-6], [np.inf, np.inf]),                                        # T1>0, wn>0（負の極を排除）
             method='trf',
         )
@@ -243,12 +194,13 @@ class MathematicalSolver:
         return T1, wn
 
     # システムモデル同定関数
-    def fit_system_model(self, y_data, u_ff, y0):                                                   # 引数(実測データ, FF制御入力, 初期偏差)
+    def fit_system_model(self, y_data, u_ff, y0, prev_params=None):                                 # 引数(実測データ, FF制御入力, 初期偏差, 前回の同定結果[a2, a1, a0, b0])
         """システムモデル同定: b0 / (s^3 + a2*s^2 + a1*s + a0)
 
         目標モデルと同じく勾配ベースの信頼領域反射法（least_squares, method='trf'）で
         残差二乗和を最小化する。b0は励振（非ゼロFF入力）があってはじめて同定できるため、
         初回同定では INIT_FF_PEAK 振幅の初期FFで励振する。
+        初期値 x0 は前回の同定結果（prev_params）があればそれを使う（ウォームスタート）。
         """
         # 各時刻の残差ベクトルを返す関数
         def residuals(p):
@@ -257,7 +209,7 @@ class MathematicalSolver:
             return y_sim - y_data                                                       # 残差ベクトルを返す
 
         res = scipy.optimize.least_squares(                                                         # Σr² が最小になる変数[a2, a1, a0, b0]を最適化する
-            residuals, x0=[10.0, 100.0, 1000.0, 1000.0],
+            residuals, x0=self._init_guess(prev_params, [10.0, 100.0, 1000.0, 1000.0]),             # 初期値（前回の同定結果 or 既定値）
             bounds=([1e-6, 1e-6, 1e-6, -np.inf], [np.inf, np.inf, np.inf, np.inf]),                 # a2,a1,a0>0（負の極を排除）, b0は符号自由
             method='trf',
         )
@@ -312,19 +264,147 @@ class MathematicalSolver:
         e = 0.5 * C * T ** 2                                                                            # t^1 の係数（f(T)=0 を満たす）
         return [a, b, c, d, e]
 
+    # 5次関数が満たすべき極値条件を判定する関数
+    def check_extrema_condition(self, a, b, c, d):                                      # 引数(5次関数パラメータ a・b・c・d)
+        """区間 (0,T) の内部に f'(t)=0 の実単純根がちょうど2つ存在するかを判定する。
+
+        判定する条件
+            ∃ t1,t2 ∈ (0,T), 0 < t1 < t2 < T,  f'(t1)=f'(t2)=0,  f''(t1)≠0, f''(t2)≠0
+            かつ ∀t∈(0,T), f'(t)=0 ⇔ (t=t1)∨(t=t2)
+        条件は区間 (0,T) の内部だけに適用する。t<0 や t>T にある実根、および複素根は
+        いっさい制約しない（区間外に極値があってもよい）。
+
+        手順
+            1. 導関数 f'(t) = 5a t^4 + 4b t^3 + 3c t^2 + 2d t + e の根を求める
+            2. |Im(root)| ≤ EXTREMA_IMAG_TOL の実根だけを抽出する
+            3. 0 < t < T の内部にある実根だけを対象にする
+            4. その個数がちょうど2個であることを判定する
+            5. 各根で |f''(ti)| > EXTREMA_EPS を確認し、単純根（重根でない）であることを保証する
+
+        条件を満たせば極値時刻 (t1, t2)（t1<t2）を返し、満たさなければ None を返す。
+        """
+        e = -(a * self.T ** 4 + b * self.T ** 3 + c * self.T ** 2 + d * self.T)         # f(T)=0 から決まる5次関数パラメータe
+        if not np.all(np.isfinite([a, b, c, d, e])):                                    # 係数が発散・NaNなら不採用
+            return None
+        roots = np.roots([5 * a, 4 * b, 3 * c, 2 * d, e])                               # 手順1: 導関数 f'(t) の根を求める
+        real_roots = sorted(                                                            # 手順2,3: 実根かつ 0<t<T の内部にあるものだけを取り出す
+            r.real for r in roots if abs(r.imag) <= EXTREMA_IMAG_TOL and 0.0 < r.real < self.T
+        )
+        if len(real_roots) != 2:                                                        # 手順4: 内部の実根がちょうど2個でなければ不採用
+            return None
+        t1, t2 = real_roots                                                             # 0 < t1 < t2 < T
+        for ti in (t1, t2):                                                             # 手順5: 各根が単純根であることを確認
+            ddf = 20 * a * ti ** 3 + 12 * b * ti ** 2 + 6 * c * ti + 2 * d              # f''(t) = 20a t^3 + 12b t^2 + 6c t + 2d
+            if abs(ddf) <= EXTREMA_EPS:                                                 # |f''(ti)| ≤ ε は重根とみなして不採用
+                return None
+        return t1, t2                                                                   # 条件を満たした極値時刻を返す
+
+    # 最適入力を5次関数で近似する関数（CMA-ES + 極値条件を満たす解のみ採用）
+    def fit_ff_poly(self, t_ff, u_opt_ff):                                              # 引数(FF入力時間の配列, その区間の最適入力)
+        """最適入力 u_opt を f(t)=a t^5+b t^4+c t^3+d t^2-(aT^4+bT^3+cT^2+dT) t で近似する。
+
+        探索アルゴリズムは CMA-ES（cmaes.CMA）。Nelder-Mead は局所解に陥りやすく、
+        極値条件を満たす解へ到達しにくいため置き換えた。
+
+        極値条件はペナルティで妥協せず、check_extrema_condition() を満たした個体だけを
+        採用候補にする（満たさない個体は INFEASIBLE_PENALTY を加えて必ず劣後させるが、
+        たとえ最良個体でも採用しない）。1回の探索で条件を満たす個体が1つも出なければ、
+        新しい初期値（平均ベクトル）と広げたステップ幅で最初から再探索し、条件を満たす
+        5次関数が見つかるまで最大 CMA_MAX_RESTART 回まで繰り返す。
+
+        探索空間は端点条件 f(0)=f(T)=0 を満たす基底 φ_j(t)=t^(j+2)-T^(j+1) t を
+        最大値1へ正規化した係数（4次元）。T や振幅が変わっても探索スケールが一定になり、
+        CMA-ES が安定して働く。
+        """
+        # 端点条件 f(0)=f(T)=0 を満たす基底 φ_j を作り、最大値が1になるよう正規化する
+        basis = np.stack([
+            t_ff ** 5 - self.T ** 4 * t_ff,                                             # φ_a(t)（係数a に対応）
+            t_ff ** 4 - self.T ** 3 * t_ff,                                             # φ_b(t)（係数b に対応）
+            t_ff ** 3 - self.T ** 2 * t_ff,                                             # φ_c(t)（係数c に対応）
+            t_ff ** 2 - self.T * t_ff,                                                  # φ_d(t)（係数d に対応）
+        ])
+        scale = np.max(np.abs(basis), axis=1)                                           # 各基底の最大値（正規化の分母）
+        scale[scale < 1e-300] = 1.0                                                     # 0除算の回避
+        basis_n = basis / scale[:, None]                                                # 正規化した基底（最大値1）
+
+        amp = float(np.max(np.abs(u_opt_ff)))                                           # 最適入力の振幅（探索スケールの基準）
+        if not np.isfinite(amp) or amp < 1e-6:                                          # 最適入力がほぼ0なら初期FFの振幅を基準にする
+            amp = INIT_FF_PEAK
+
+        # 探索の初期値: 極値条件を必ず満たす形 f(t)=C t(t-T/2)(t-T) を u_opt へ最小二乗で当てたもの
+        #   この形の極値は t=T(3±√3)/6 の2点のみで常に単純根なので、実行可能な点から探索を始められる
+        g = t_ff ** 3 - 1.5 * self.T * t_ff ** 2 + 0.5 * self.T ** 2 * t_ff             # 形状 t(t-T/2)(t-T)
+        denom = float(g @ g)                                                            # 最小二乗の分母
+        C = float(g @ u_opt_ff) / denom if denom > 1e-300 else 0.0                      # 二乗誤差が最小になる振幅C
+        if not np.isfinite(C) or abs(C) < 1e-12:                                        # u_optがほぼ0のときは初期励振FFと同じ振幅にする
+            C = 12.0 * np.sqrt(3.0) * INIT_FF_PEAK / (self.T ** 3)
+        params_init = np.array([0.0, 0.0, C, -1.5 * C * self.T])                        # f(t)=C t(t-T/2)(t-T) の係数 [a,b,c,d]
+        z_init = params_init * scale                                                    # 正規化した探索空間での初期値
+
+        # 最適入力との二乗和誤差 + PWM範囲のペナルティ（極値条件はここには入れない）
+        def fit_loss(z):                                                                # 引数(正規化した5次関数パラメータ)
+            u_pred = z @ basis_n                                                        # 5次関数で計算したFF入力
+            mse = np.sum((u_pred - u_opt_ff) ** 2)                                      # 最適入力と近似したFF入力との二乗和誤差
+            penalty_pwm = (                                                             # -255～255の間に収めるためのペナルティ
+                np.sum(np.maximum(0, u_pred - 255) ** 2)
+                + np.sum(np.maximum(0, -255 - u_pred) ** 2)
+            )
+            return mse + FIT_PWM_PENALTY * penalty_pwm
+
+        rng = np.random.default_rng(0)                                                  # 再探索の初期値生成用（再現性のため固定シード）
+
+        # 条件を満たす5次関数が見つかるまで、初期値を変えて CMA-ES による探索を繰り返す
+        for restart in range(CMA_MAX_RESTART):
+            if restart == 0:                                                            # 初回は実行可能な初期値から探索する
+                mean = z_init.copy()
+            else:                                                                       # 再探索は新しい初期値・広げたステップ幅でやり直す
+                mean = z_init + rng.normal(0.0, amp, 4)
+            optimizer = CMA(                                                            # CMA-ESの生成
+                mean=mean,
+                sigma=CMA_SIGMA_RATIO * amp * (1.0 + restart),                          # 初期ステップ幅（再探索ごとに広げる）
+                population_size=CMA_POP_SIZE,
+                seed=restart + 1,
+            )
+
+            best_params = None                                                          # 極値条件を満たした中で最良の [a,b,c,d]
+            best_extrema = None                                                         # そのときの極値時刻 (t1,t2)
+            best_loss = np.inf                                                          # そのときの評価値
+
+            for _gen in range(CMA_MAX_GEN):                                             # 世代ループ
+                solutions = []                                                          # (個体, 評価値) のリスト
+                for _ in range(optimizer.population_size):                              # 個体ループ
+                    z = optimizer.ask()                                                 # 個体を生成
+                    value = fit_loss(z)                                                 # 近似誤差を計算
+                    a, b, c, d = z / scale                                              # 元の5次関数パラメータへ戻す
+                    extrema = self.check_extrema_condition(a, b, c, d)                  # 極値条件を判定
+                    if extrema is None:                                                 # 条件を満たさない個体は採用せず、必ず劣後させる
+                        value += INFEASIBLE_PENALTY
+                    elif value < best_loss:                                             # 条件を満たした個体のみ採用候補にする
+                        best_loss = value
+                        best_params = (a, b, c, d)
+                        best_extrema = extrema
+                    solutions.append((z, value))                                        # 評価結果を格納
+                optimizer.tell(solutions)                                               # CMA-ESの分布を更新
+                if optimizer.should_stop():                                             # 収束したら世代ループを抜ける
+                    break
+
+            if best_params is not None:                                                 # 条件を満たす5次関数が見つかったので採用する
+                self.last_fit_restart = restart                                         # 何回目の再探索で見つかったか（ビューア表示用）
+                return best_params, best_extrema
+
+        # 最大再探索回数でも見つからない場合は、極値条件を必ず満たす形 f(t)=C t(t-T/2)(t-T) へ退避する
+        self.last_fit_restart = -1                                                      # 退避したことを示す値（ビューア表示用）
+        print(f"[warn] 極値条件を満たす5次関数が {CMA_MAX_RESTART} 回の再探索で見つからず、C·t(t-T/2)(t-T) で代替します")
+        params = (0.0, 0.0, C, -1.5 * C * self.T)                                       # この形の極値は t=T(3±√3)/6 の2点のみ（常に単純根）
+        return params, self.check_extrema_condition(*params)
+
     # ------------------------------------------------------------------
     # 離散時間オイラー・ラグランジュ（随伴／勾配）法による最適制御 + 5次多項式フィット
     # ------------------------------------------------------------------
-    def calculate_el_ff(self, target_params, sys_params, u_ff, y0, y_meas=None, anchor=None):                # 引数(目標モデルのパラメータ[T1, wn], システムモデルのパラメータ[a2, a1, a0, b0], FF制御入力, 初期偏差, 今回の実測データ, 極値アンカー)
+    def calculate_el_ff(self, target_params, sys_params, u_ff, y0):                                          # 引数(目標モデルのパラメータ[T1, wn], システムモデルのパラメータ[a2, a1, a0, b0], FF制御入力, 初期偏差)
         """
         離散時間オイラー・ラグランジュ（随伴／勾配）法で最適制御入力を計算し、
         5次多項式 FF = a*t^5 + ... + e*t にフィットする。
-
-        y_meas / anchor を渡すと、5次多項式フィットに極値アンカー（トラストリージョン）が働く。
-        y_meas は今回の実測データ（目標位置を原点へ移した y_shifted）で、
-        目標モデル応答 y_tgt との二乗和誤差 J をフィット前に anchor へ渡すために使う
-        （＝今回測ったJを反映したベスト極値・探索半径でフィットできる）。
-        どちらも None のときは近接項の重みが0になり、従来どおりの純粋なフィットになる。
 
         目的：システムモデルの軌道を、入力 u=0 で生成した目標軌道 x_tgt へ一致させる。
           入力ホライズン : u(k) は [0,T]（k=0..N_ff-1）のみ最適化し、それ以降は0
@@ -459,285 +539,19 @@ class MathematicalSolver:
         u_opt = np.zeros(len(self.t_eval))                                                              # 最適入力を保存する配列
         u_opt[:N_ff] = u                                                                                # FF入力区間 (0..N_ff-1) の最適入力を格納
 
-        # -----------------------------------------------------------------------------
-        # 5次多項式フィット
-        #   f(t) = a t^5 + b t^4 + c t^3 + d t^2 - (a T^4 + b T^3 + c T^2 + d T) t   (0≤t≤T)
-        #   ・1次の係数を e = -(a T^4 + b T^3 + c T^2 + d T) に固定 → f(0)=f(T)=0 を必ず満たす
-        #   ・f'(t)=(t-t1)(t-t2)·q(t)（q(t)は符号一定）の形で係数を作ることで、
-        #     0<t<T の極値が必ず2個（山1つ・谷1つ）になることを構造的に保証する
-        #   ・その条件を満たす形の中で u_opt との二乗和誤差が最小のものを選ぶ
-        #   ・さらに極値アンカー（そのDOFで最小のJを出したFFの極値）が与えられている場合は、
-        #     フィット精度が実質同等な候補の中でアンカーに最も近い解を選ぶ
-        #   極値 (t1,y1),(t2,y2)・FF入力波形・返す係数はすべて上式から計算する。
-        # -----------------------------------------------------------------------------
+        # 5次多項式フィット（0≤t≤T, 端点0, 極値2個）
         t_ff = self.t_eval[self.t_eval <= self.T]                                                       # FF入力を与える時間だけ取り出す
         u_opt_ff = u_opt[: len(t_ff)]                                                                   # FF入力を与える区間だけの最適入力を取り出す
 
-        # -----------------------------------------------------------------------------
-        # 極値アンカーの更新（フィットの前に今回のJを反映させる）
-        #   今回の実測データ y_meas を生んだのは前回ループで計算したFF（＝anchor.pending_extrema の極値）。
-        #   そのJをここで確定させることで、フィットは「今わかっている最良の極値」を基準にできる。
-        # -----------------------------------------------------------------------------
-        if anchor is not None and y_meas is not None:                                                   # アンカーと実測データが与えられている場合
-            anchor.update(float(np.sum((y_tgt - np.asarray(y_meas)) ** 2)))                             # 今回のJ（＝内側ループの判定用Jと同じ値）でベスト極値と探索半径を更新
-        anchor_extrema = anchor.target() if anchor is not None else None                                # アンカーとして使う極値（無効なら None）
-        w_prox = anchor.weight() if anchor is not None else 0.0                                         # 近接項の重み（無効なら0 → 従来どおりの純粋なフィット）
-
-        # 5次関数パラメータeを計算する関数（f(T)=0 の条件）
-        def calc_e(a, b, c, d):                                                                         # 引数(5次関数パラメータa・b・c・d)
-            return -(a * self.T ** 4 + b * self.T ** 3 + c * self.T ** 2 + d * self.T)                  # 5次関数パラメータeを返す
-
         # 5次関数を定義する関数
         def poly(t, a, b, c, d):                                                                        # 引数(時間, 5次関数パラメータa・b・c・d)
-            e = calc_e(a, b, c, d)                                                                      # 5次関数パラメータeを計算
-            return a * t ** 5 + b * t ** 4 + c * t ** 3 + d * t ** 2 + e * t                            # 5次関数FF入力値を返す
+            e = -(a * self.T ** 4 + b * self.T ** 3 + c * self.T ** 2 + d * self.T)     # 5次関数パラメータeを計算
+            return a * t ** 5 + b * t ** 4 + c * t ** 3 + d * t ** 2 + e * t            # 5次関数FF入力値を返す
 
-        # f'(t)=0 の実根のうち 0<t<T にあるものを時間[s]の昇順で返す関数（重根は1個として数える）
-        def extrema_times(a, b, c, d):                                                                  # 引数(5次関数パラメータa・b・c・d)
-            e = calc_e(a, b, c, d)                                                                      # 5次関数パラメータeを計算
-            coeffs = [5.0 * a, 4.0 * b, 3.0 * c, 2.0 * d, e]                                            # f'(t)=5a t^4+4b t^3+3c t^2+2d t+e の係数
-            if not np.all(np.isfinite(coeffs)):                                                         # 発散した係数は極値なしとして扱う
-                return []
-            roots = np.roots(coeffs)                                                                    # f'(t)=0 の根（極値）を計算
-            real_roots = sorted(
-                r.real for r in roots if abs(r.imag) < 1e-6 and 0 < r.real < self.T                     # FF入力時間における実部の極を取り出し、小さい順に並べる
-            )
-            uniq = []                                                                                   # 重根を1個にまとめた実根リスト
-            for r in real_roots:                                                                        # 実根を昇順に走査
-                if not uniq or (r - uniq[-1]) > FIT_ROOT_TOL * self.T:                                  # 直前の根と十分離れていれば別の極値として採用
-                    uniq.append(r)
-            return uniq
-
-        # -----------------------------------------------------------------------------
-        # 極値を「山1つ・谷1つ」に構造的に固定する形状パラメータ表現
-        #   f'(t) = (t-t1)(t-t2)·q(t),   q(t) = α(t-m)² + β    （α,β が同符号 → q(t) は符号一定）
-        #   ・q(t) は0にならないので、f'(t) の符号が変わるのは t1, t2 の2点だけ
-        #     → 0<t<T の極値は必ず2個（t1が山、t2が谷、またはその逆）。根を数えて判定する必要がない。
-        #   ・0<t1<t2<T はシグモイド変換で必ず満たす
-        #   ・f(T)=∫₀ᵀf'(t)dt = α·J1 + β·J2 = 0 は α=-J2·λ, β=J1·λ と置けば恒等的に成立する
-        #       J1 = ∫₀ᵀ(t-t1)(t-t2)(t-m)²dt,  J2 = ∫₀ᵀ(t-t1)(t-t2)dt,  λ は振幅
-        #   ・α=0（J2=0）のとき f は3次関数 C·t(t-tm)(t-T) に退化する（山1つ谷1つの理想形）
-        #   最適化変数は z=[λ, z1, z2, m] の4個（a,b,c,d と同じ自由度）
-        # -----------------------------------------------------------------------------
-        def integrals(t1, t2, m):                                                                       # 引数(1つ目の極値, 2つ目の極値, q(t)の中心)
-            A = t1 + t2                                                                                 # (t-t1)(t-t2)=t²-At+B の A
-            B = t1 * t2                                                                                 # 同じく B
-            J2 = self.T ** 3 / 3.0 - A * self.T ** 2 / 2.0 + B * self.T                                 # ∫₀ᵀ(t-t1)(t-t2)dt
-            J1 = (self.T ** 5 / 5.0 + (-2.0 * m - A) * self.T ** 4 / 4.0                                # ∫₀ᵀ(t-t1)(t-t2)(t-m)²dt
-                  + (m * m + 2.0 * m * A + B) * self.T ** 3 / 3.0
-                  + (-A * m * m - 2.0 * m * B) * self.T ** 2 / 2.0
-                  + B * m * m * self.T)
-            return J1, J2, A, B
-
-        # 形状パラメータ z=[λ,z1,z2,m] から5次関数の係数[a,b,c,d]と制約違反量を計算する関数
-        def shape_to_coeffs(z):                                                                         # 引数(形状パラメータ[λ, z1, z2, m])
-            if not np.all(np.isfinite(z)):                                                              # 発散した場合は無効とする
-                return None, np.inf, 0.0, 0.0
-            lam, z1, z2, m = z                                                                          # 振幅・極値位置・q(t)の中心を取り出す
-            s1 = 1.0 / (1.0 + np.exp(-np.clip(z1, -50.0, 50.0)))                                        # 0<s1<1（シグモイド）
-            s2 = 1.0 / (1.0 + np.exp(-np.clip(z2, -50.0, 50.0)))                                        # 0<s2<1（シグモイド）
-            lo = FIT_EXTREMA_MARGIN * self.T                                                            # 極値の下限（端点0から離す）
-            hi = (1.0 - FIT_EXTREMA_MARGIN) * self.T                                                    # 極値の上限（端点Tから離す）
-            gap = FIT_EXTREMA_GAP * self.T                                                              # 山と谷の最小間隔
-            t1 = lo + max(hi - gap - lo, 0.0) * s1                                                      # 1つ目の極値（lo≤t1≤hi-gap を必ず満たす）
-            t2 = t1 + gap + max(hi - t1 - gap, 0.0) * s2                                                # 2つ目の極値（t1+gap≤t2≤hi を必ず満たす）
-            J1, J2, A, B = integrals(t1, t2, m)                                                         # 端点条件に必要な積分値を計算
-            alpha = -J2 * lam                                                                           # q(t)の2次の係数（この置き方で f(T)=0 が恒等的に成立）
-            beta = J1 * lam                                                                             # q(t)の定数項
-
-            # q(t) が 0≤t≤T で符号を変えない（＝極値が2個から増えない）条件を違反量として計算する
-            q_min = abs(alpha * (min(max(m, 0.0), self.T) - m) ** 2 + beta)                             # 区間内の |q(t)| の最小値
-            q_max = max(abs(alpha * m ** 2 + beta), abs(alpha * (self.T - m) ** 2 + beta))              # 区間内の |q(t)| の最大値
-            violation = 0.0                                                                             # 制約違反量（0なら条件を満たす）
-            if alpha * beta < 0.0:                                                                      # α,βが異符号 → q(t)が実根を持ち極値が4個になる
-                violation += 1.0
-            if q_max > 0.0:                                                                             # |q(t)|が区間内でほぼ0まで落ち込まない余裕を持たせる
-                violation += max(0.0, FIT_QUAD_MARGIN - q_min / q_max)                                  # （準重根による平坦部と、float32変換での極値増加を防ぐ）
-            else:
-                violation += 1.0
-
-            Pq = -2.0 * alpha * m                                                                       # q(t)=α t²+Pq t+Qq へ展開
-            Qq = alpha * m * m + beta
-            a = alpha / 5.0                                                                             # f'(t)の係数から f(t) の係数へ変換
-            b = (Pq - alpha * A) / 4.0
-            c = (Qq - A * Pq + alpha * B) / 3.0
-            d = (-A * Qq + B * Pq) / 2.0
-            return np.array([a, b, c, d]), violation, t1, t2
-
-        # 5次関数の「フィット精度」だけを返す関数（近接項・極値制約を含まない ＝ 候補のガード判定に使う）
-        def fit_error(p):                                                                               # 引数(5次関数パラメータ[a, b, c, d])
-            u_pred = poly(t_ff, *p)                                                                     # 5次関数で計算したFF入力
-            if not np.all(np.isfinite(u_pred)):                                                         # 発散した場合は無限大を返す
-                return np.inf
-            mse = np.sum((u_pred - u_opt_ff) ** 2)                                                      # 最適入力と近似したFF入力との二乗和誤差
-            penalty_pwm = (                                                                             # -255～255の間に収めるためのペナルティ
-                np.sum(np.maximum(0, u_pred - 255) ** 2)
-                + np.sum(np.maximum(0, -255 - u_pred) ** 2)
-            )
-            return float(mse + FIT_PWM_WEIGHT * penalty_pwm)
-
-        # アンカー極値からの距離（近接項）を返す関数
-        #   時間は T、極値の大きさは FIT_PWM_SCALE[PWM] で正規化する。
-        #   t は 0〜T[s]、y は 0〜255[PWM] とスケールが2桁違うため、生の距離では y だけで
-        #   距離が決まってしまい極値時刻の連続性が全く効かない。
-        #   t1<t2 は shape_to_coeffs が構造的に保証しているので、アンカーとの対応付けは常に一意。
-        def prox_of(t1c, t2c, p):                                                                       # 引数(候補の1つ目の極値時刻, 2つ目の極値時刻, 5次関数パラメータ[a,b,c,d])
-            if anchor_extrema is None:                                                                  # アンカーが無効なら近接項なし
-                return 0.0
-            t1a, y1a, t2a, y2a = anchor_extrema                                                         # アンカー極値（最小Jを出したFFの極値）
-            y1c = poly(t1c, *p)                                                                         # 候補の1つ目の極値の大きさ
-            y2c = poly(t2c, *p)                                                                         # 候補の2つ目の極値の大きさ
-            if not (np.isfinite(y1c) and np.isfinite(y2c)):                                             # 発散した場合は非常に大きな値を返す
-                return 1e30
-            return float(((t1c - t1a) / self.T) ** 2 + ((t2c - t2a) / self.T) ** 2                      # 極値時刻の差（Tで正規化）
-                         + ((y1c - y1a) / FIT_PWM_SCALE) ** 2                                           # 極値の大きさの差（PWMスケールで正規化）
-                         + ((y2c - y2a) / FIT_PWM_SCALE) ** 2)
-
-        # 最適入力を5次関数で近似するための評価関数（近接項を含めて最適化そのものをアンカーへ引き寄せる）
-        #   候補の中から近いものを「選ぶ」だけでは、ランダム初期値から偶然出てきた解の集合が
-        #   アンカー近傍を含まない限り効かない。損失に入れて探索自体を引き寄せる。
-        def fit_loss(z):                                                                                # 引数(形状パラメータ[λ, z1, z2, m])
-            p, violation, t1c, t2c = shape_to_coeffs(z)                                                 # 形状パラメータから係数と制約違反量を計算
-            if p is None:                                                                               # 無効な形状は非常に大きな値を返す
-                return 1e30
-            err = fit_error(p)                                                                          # フィット精度（二乗和誤差＋PWMペナルティ）
-            if not np.isfinite(err):                                                                    # 発散した場合は非常に大きな値を返す
-                return 1e30
-            return err + FIT_EXTREMA_WEIGHT * violation + w_prox * prox_of(t1c, t2c, p)                 # 精度＋極値制約＋近接項（w_prox=0なら従来と同一）
-
-        peak_ref = float(np.max(np.abs(u_opt_ff))) if u_opt_ff.size else 0.0                            # 最適入力の振幅（初期値の基準）
-        if peak_ref < 1e-9:                                                                             # 最適入力がほぼ0なら初期FFの振幅で代用
-            peak_ref = INIT_FF_PEAK
-        i_peak = int(np.argmax(np.abs(u_opt_ff))) if u_opt_ff.size else 0                               # 最適入力の振幅が最大となる位置
-        sgn = 1.0 if (u_opt_ff.size == 0 or u_opt_ff[i_peak] >= 0) else -1.0                            # 最適入力の向き（第1極値の符号に合わせる）
-
-        # 3次関数 f(t)=C t(t-T/2)(t-T)（山1つ谷1つの理想形）に対応する形状パラメータを返す関数
-        def cubic_seed(peak):                                                                           # 引数(極値の大きさ)
-            t1 = self.T * (3.0 - np.sqrt(3.0)) / 6.0                                                    # 3次関数の1つ目の極値
-            t2 = self.T * (3.0 + np.sqrt(3.0)) / 6.0                                                    # 3次関数の2つ目の極値
-            m = self.T / 2.0                                                                            # q(t)の中心
-            J1, _, _, _ = integrals(t1, t2, m)                                                          # 積分値を計算（この配置では J2=0 → α=0 の3次関数）
-            C = 12.0 * np.sqrt(3.0) * peak / (self.T ** 3)                                              # |f(t1)|=(√3/36)C T³=peak となる振幅
-            lam = 3.0 * C / J1 if abs(J1) > 1e-30 else 0.0                                              # f'(t)=3C(t-t1)(t-t2) となる λ
-            lo = FIT_EXTREMA_MARGIN * self.T                                                            # shape_to_coeffs と同じ範囲でシグモイドを逆変換する
-            hi = (1.0 - FIT_EXTREMA_MARGIN) * self.T
-            gap = FIT_EXTREMA_GAP * self.T
-            s1 = np.clip((t1 - lo) / max(hi - gap - lo, 1e-30), 1e-6, 1.0 - 1e-6)                       # シグモイドの逆変換
-            s2 = np.clip((t2 - t1 - gap) / max(hi - t1 - gap, 1e-30), 1e-6, 1.0 - 1e-6)
-            return np.array([lam, np.log(s1 / (1.0 - s1)), np.log(s2 / (1.0 - s2)), m])
-
-        # アンカー極値 (t1,y1,t2,y2) に対応する形状パラメータを返す関数（ウォームスタート用のシード）
-        #   ・極値時刻 t1,t2 → シグモイドの逆変換で z1,z2 が一意に決まる
-        #   ・q(t)の中心は極値の中点 m=(t1+t2)/2 に置く（cubic_seed の対称配置と整合する）
-        #   ・f は λ について線形（α=-J2λ, β=J1λ より係数 a,b,c,d すべてがλに比例）なので、
-        #     λ=1 の波形 g(t) を作れば 2つの極値の大きさに最小二乗で合わせる振幅が閉形式で求まる
-        #       λ* = (y1·g(t1) + y2·g(t2)) / (g(t1)² + g(t2)²)
-        def seed_from_extrema(ext):                                                                     # 引数(アンカー極値(t1, y1, t2, y2))
-            t1a, y1a, t2a, y2a = ext                                                                    # アンカー極値を取り出す
-            lo = FIT_EXTREMA_MARGIN * self.T                                                            # shape_to_coeffs と同じ可動域
-            hi = (1.0 - FIT_EXTREMA_MARGIN) * self.T
-            gap = FIT_EXTREMA_GAP * self.T
-            t1c = min(max(t1a, lo), max(hi - gap, lo))                                                  # アンカーの極値時刻を可動域へ収める
-            t2c = min(max(t2a, t1c + gap), hi)
-            s1 = np.clip((t1c - lo) / max(hi - gap - lo, 1e-30), 1e-6, 1.0 - 1e-6)                      # シグモイドの逆変換
-            s2 = np.clip((t2c - t1c - gap) / max(hi - t1c - gap, 1e-30), 1e-6, 1.0 - 1e-6)
-            z1 = float(np.log(s1 / (1.0 - s1)))
-            z2 = float(np.log(s2 / (1.0 - s2)))
-            m = 0.5 * (t1c + t2c)                                                                       # q(t)の中心は2つの極値の中点に置く
-            p_unit, _, tu1, tu2 = shape_to_coeffs(np.array([1.0, z1, z2, m]))                           # λ=1 のときの5次関数係数
-            if p_unit is None:                                                                          # 無効な形状ならシードを作れない
-                return None
-            g1 = poly(tu1, *p_unit)                                                                     # λ=1 のときの1つ目の極値の大きさ
-            g2 = poly(tu2, *p_unit)                                                                     # λ=1 のときの2つ目の極値の大きさ
-            den = float(g1 * g1 + g2 * g2)
-            if not np.isfinite(den) or den < 1e-30:                                                     # 退化した形状ならシードを作れない
-                return None
-            lam = float((y1a * g1 + y2a * g2) / den)                                                    # 極値の大きさを最小二乗で合わせる振幅λ
-            if not np.isfinite(lam):
-                return None
-            return np.array([lam, z1, z2, m])
-
-        # 3次関数族 f(t)=C t(t-tm)(t-T) の最小二乗フィット（山1つ谷1つを必ず満たす保険）
-        def fit_cubic_family():
-            best_c, best_res = None, np.inf                                                             # 最良の係数と残差
-            for tm in np.linspace(0.05 * self.T, 0.95 * self.T, 91):                                    # 中間の零点 tm を走査
-                g = t_ff * (t_ff - tm) * (t_ff - self.T)                                                # 形が決まれば振幅Cについて線形
-                gg = float(g @ g)
-                if gg < 1e-30:
-                    continue
-                C = float(g @ u_opt_ff) / gg                                                            # 二乗和誤差が最小となる振幅
-                res_val = float(np.sum((C * g - u_opt_ff) ** 2))                                        # そのときの残差
-                if res_val < best_res:                                                                  # より誤差が小さければ更新
-                    best_res = res_val
-                    best_c = np.array([0.0, 0.0, C, -C * (tm + self.T)])                                # C t³ - C(tm+T) t² の係数
-            return best_c
-
-        # 決定論的な初期値（この順に試し、以降はランダム初期値）
-        #   アンカーが有効なら、その極値から作ったシードを最初に試して確実にベスト近傍を探索させる。
-        z_seeds = []                                                                                    # 決定論的な初期値のリスト
-        if anchor_extrema is not None:                                                                  # アンカーが有効な場合
-            z_anchor = seed_from_extrema(anchor_extrema)                                                 # ベスト極値からのウォームスタート用シード
-            if z_anchor is not None:
-                z_seeds.append(z_anchor)
-        z_seeds.append(cubic_seed(sgn * peak_ref))                                                      # 従来どおりの3次関数シード
-
-        # 山1つ谷1つを必ず満たす形の中で、u_optとの二乗和誤差が最小のフィットを探す
-        #   ・形状パラメータ表現により、探索中の候補はすべて極値2個を構造的に満たす
-        #   ・初期値依存の悪い解を掴まないよう最低 FIT_MIN_TRIAL 個の初期値を試して最良を採用する
-        #   ・条件を満たした候補は (フィット精度, アンカーからの距離, 係数) の組で全部ためておき、
-        #     最後にガード付きで選ぶ
-        cand_list = []                                                                                  # 条件を満たした候補 [(フィット精度, 近接項, 係数)]
-        for attempt in range(FIT_MAX_RETRY):                                                            # フィット再試行ループ
-            if attempt < len(z_seeds):                                                                  # 決定論的な初期値がある間はそれを使う
-                z0 = z_seeds[attempt]
-            else:                                                                                       # 以降は振幅・極値位置・q(t)の中心をランダムに変えて別の解を狙う
-                z0 = cubic_seed(sgn * peak_ref * np.random.uniform(0.2, 1.5))
-                z0 = z0 + np.array([
-                    z0[0] * np.random.uniform(-0.5, 0.5),
-                    np.random.normal(0.0, 0.8),
-                    np.random.normal(0.0, 0.8),
-                    np.random.uniform(-0.5, 0.5) * self.T,
-                ])
-
-            res = scipy.optimize.minimize(                                                              # fit_lossが最小になる形状パラメータを取得
-                fit_loss, z0, method='Nelder-Mead',
-                options={'maxiter': 2000, 'maxfev': 2000, 'xatol': 1e-8, 'fatol': 1e-8},
-            )
-            p_cand, violation, t1_cand, t2_cand = shape_to_coeffs(res.x)                                # 得られた形状から係数を計算
-
-            if p_cand is not None and violation <= 0.0 and len(extrema_times(*p_cand)) == 2:            # 念のため実際の係数でも極値2個を確認
-                err_cand = fit_error(p_cand)                                                            # 近接項を含まない純粋なフィット精度
-                if np.isfinite(err_cand):                                                               # 有効な候補として保存
-                    cand_list.append((err_cand, prox_of(t1_cand, t2_cand, p_cand), p_cand))
-                    if attempt + 1 >= FIT_MIN_TRIAL:                                                    # 最低試行回数を満たしていればフィット完了
-                        break
-
-        # 候補の選択（フィット品質のガード付き）
-        #   近接項は「u_optへの近似精度をわざと捨てる」操作なので、精度が実質同等な候補に限って
-        #   アンカーに近いものを選ぶ。u_optが本当に大きく変わったとき（＝精度が明確に落ちるとき）は
-        #   アンカーに縛らず精度優先の解を採用し、必要な変化を殺さないようにする。
-        if cand_list:                                                                                   # 条件を満たす候補がある場合
-            err_min = min(c[0] for c in cand_list)                                                      # 最良のフィット精度
-            tol = err_min * (1.0 + FIT_MSE_TOL) + 1e-12                                                 # 許容するフィット精度の劣化（εは FIT_MSE_TOL）
-            best_p = min((c for c in cand_list if c[0] <= tol), key=lambda c: c[1])[2]                  # 同等な候補の中でアンカーに最も近い解を採用
-        else:                                                                                           # 条件を満たす解が得られなかった場合は3次関数族で近似する
-            best_p = fit_cubic_family()
-            print(f"[FF fit] 警告: 5次関数で条件を満たす解が得られなかったため3次関数で近似しました。")
-
-        a, b, c, d = best_p                                                                             # 最適化した5次関数パラメータを取得
-        e = calc_e(a, b, c, d)                                                                          # 5次関数パラメータeを計算
-
-        # 極値 (t1,y1), (t2,y2) を抽出
-        real_roots = extrema_times(a, b, c, d)                                                          # 極値を計算
-        if len(real_roots) >= 2:                                                                        # 極値が2つ以上なら、一番早い極値と二番目の極値を使う
-            t1, t2 = real_roots[0], real_roots[1]
-        elif len(real_roots) == 1:                                                                      # 極値が1つなら、その極値とFF入力時間の半分の値を使う
-            t1 = real_roots[0]
-            t2 = self.T / 2.0
-        else:                                                                                           # 極値が0なら、FF入力時間から算出する
-            t1 = self.T * 0.33
-            t2 = self.T * 0.66
-
+        # CMA-ESで5次関数近似（極値条件を満たす解のみ採用し、満たすまで初期値を変えて再探索）
+        (a, b, c, d), (t1, t2) = self.fit_ff_poly(t_ff, u_opt_ff)                                       # 5次関数パラメータと、条件を満たす極値時刻を取得
+        e = -(a * self.T ** 4 + b * self.T ** 3 + c * self.T ** 2 + d * self.T)                         # 5次関数パラメータeを計算
+        
         y1 = poly(t1, a, b, c, d)                                                                       # t1における5次関数値y1を計算
         y2 = poly(t2, a, b, c, d)                                                                       # t2における5次関数値y2を計算
 
@@ -766,6 +580,16 @@ class OptimalControlSequencer(Node):
         self.T = T                                                                                                                              # FF制御入力時間を格納
         self.max_outer_iter = max_iter                                                                                                          # 外側ループ最大回数を格納
         self.target_mode = target_mode                                                                                                          # 目標値の与え方のモードを格納
+
+        # ビューア用スナップショットの実行識別
+        #   スナップショットは実行が終わってもファイルとして残るため、そのままだとビューアが
+        #   前回の実行の残りを読んでしまう。実行ごとのIDを埋め込み、起動時に古いファイルを消す。
+        self.session_id = time.strftime('%Y%m%d_%H%M%S')                                                                                        # この実行を識別するID
+        if ENABLE_SNAPSHOT and os.path.exists(SNAPSHOT_PATH):                                                                                   # 前回の実行が残したスナップショットを削除する
+            try:
+                os.remove(SNAPSHOT_PATH)
+            except OSError as exc:
+                self.get_logger().warn(f"古いスナップショットを削除できません: {exc}")
 
         self.current_outer = 0                                                                                                                  # 外側ループ回数
         self.current_inner = 0                                                                                                                  # 内側ループ回数
@@ -824,7 +648,10 @@ class OptimalControlSequencer(Node):
         self.best_debug_data = None                                                                                                             # デバック情報
         self.prev_u_pred_full = [None] * 24                                                                                                      # 前回ループで計算した5次関数FF入力（今回の実測データを生成した入力）
         self.prev_u_opt = [None] * 24                                                                                                            # 前回ループで計算した最適制御入力（今回の実測データを生成した入力）
-        self.fit_anchors = [ExtremaAnchor() for _ in range(24)]                                                                                 # 5次多項式フィットの極値アンカー（DOFごとのベストJ・ベスト極値・探索半径）
+        self.prev_tgt_params = [None] * 24                                                                                                       # 前回の目標モデル同定結果[T1, wn]（次回同定の初期値に使う）
+        self.prev_sys_params = [None] * 24                                                                                                       # 前回のシステムモデル同定結果[a2, a1, a0, b0]（次回同定の初期値に使う）
+        self.prev_fit_restart = [0] * 24                                                                                                         # 前回ループのCMA-ES再探索回数（ビューア用）
+        self.param_history = []                                                                                                                  # 内側ループごとのパラメータ・評価値の履歴（ビューア用、外側ループごとにリセット）
 
         self.buffer_time_series = {f'board{i}': [] for i in range(1, 6)}                                                                        # 5board分のデータバッファ
         self.target_pot = self.get_next_target_positions()                                                                                      # 最初にロボットへ送る目標値を決定
@@ -902,11 +729,10 @@ class OptimalControlSequencer(Node):
                     a, b, c, d, e = self.current_ff_matrix[dof_idx]                                             # FFパラメータを取り出す
                     t1, y1, t2, y2 = solver.calc_extrema_from_ff([a, b, c, d, e])                               # 極値を計算
                     data.extend([float(a), float(b), float(c), float(d), float(e), float(self.T)])              # データに格納
-                    f_T = a * self.T ** 5 + b * self.T ** 4 + c * self.T ** 3 + d * self.T ** 2 + e * self.T    # 端点 t=T でのFF入力値（0になることの確認用）
-                    self.get_logger().info(                                                                     # ログ出力（丸めた値では f(T)=0 を確認できないため有効数字を多く表示する）
+                    self.get_logger().info(                                                                     # ログ出力
                         f"  B{b_id}-D{_ + 1} (DOF {dof_idx + 1:02d}): "
                         f"a={a:.6e}, b={b:.6e}, c={c:.6e}, d={d:.6e}, e={e:.6e} | "
-                        f"t1={t1:.3f}, y1={y1:.2f}, t2={t2:.3f}, y2={y2:.2f} | f(T)={f_T:.2e}"
+                        f"t1={t1:.3f}, y1={y1:.2f}, t2={t2:.3f}, y2={y2:.2f}"
                     )
                     dof_idx += 1                                                                                # DOF番号更新
             msg.data = data                                                                                     # ROS2メッセージに格納
@@ -994,6 +820,7 @@ class OptimalControlSequencer(Node):
             debug_info = []                                                                                             # デバッグExcelへ保存する情報の空リスト
             extrema_list = []                                                                                           # 保存する極大値と極小値の空リスト
             used_extrema_list = []                                                                                      # 極値のリスト
+            snap_dof = []                                                                                               # ビューア用データ（自由度ごと）の空リスト
 
             # 今回ロボットへ送信したFF（更新前）を保存
             ff_used_this_iteration = [row[:] for row in self.current_ff_matrix]                                         # パラメータの保存
@@ -1012,8 +839,22 @@ class OptimalControlSequencer(Node):
                 # Shift data so it converges to 0
                 y_shifted = raw_y - Pf                                                                      # 目標位置を原点（0）に移動するための処理
 
+                # ビューア表示用に「今回印加したFFを作るのに使った値」を、同定で上書きされる前に控えておく
+                #   prev_u_opt が None のときは初回同定（最適制御前）なので、モデルパラメータもu_optも無い
+                if self.prev_u_opt[dof_idx] is None:                                                         # 初回同定（印加したのは初期励振FF）
+                    u_opt_used = np.full(N_samples, np.nan)                                                  # 表示なし（NaNはグラフに描かれない）
+                    tgt_used = [np.nan, np.nan]                                                              # 表示なし
+                    sys_used = [np.nan] * 4                                                                  # 表示なし
+                    restart_used = -2                                                                        # 表示なしを示す値
+                else:                                                                                        # 2回目以降（前回の最適制御結果を印加している）
+                    u_opt_used = self.prev_u_opt[dof_idx]                                                    # 今回のFFの元になったu_opt
+                    tgt_used = list(self.prev_tgt_params[dof_idx])                                           # そのu_optを計算するのに使った目標モデル
+                    sys_used = list(self.prev_sys_params[dof_idx])                                           # そのu_optを計算するのに使ったシステムモデル
+                    restart_used = self.prev_fit_restart[dof_idx]                                            # そのFFを作ったときのCMA-ES再探索回数
+
                 # 1. Target Model ID
-                tgt_params = solver.fit_target_model(y_shifted, y0)                                         # 目標モデルの同定をして、パラメータを取得
+                tgt_params = solver.fit_target_model(y_shifted, y0, self.prev_tgt_params[dof_idx])          # 目標モデルの同定をして、パラメータを取得（前回の同定結果を初期値に使う）
+                self.prev_tgt_params[dof_idx] = list(tgt_params)                                            # 次回同定の初期値として保存
 
                 # 2. System Model ID
                 a, b, c, d, e = self.current_ff_matrix[dof_idx]                                             # 現在のDOFのFFパラメータを取り出す
@@ -1021,20 +862,15 @@ class OptimalControlSequencer(Node):
                 u_ff = np.zeros(N_samples)                                                                  # 入力ベクトルの生成
                 u_ff[:len(t_ff)] = a * t_ff ** 5 + b * t_ff ** 4 + c * t_ff ** 3 + d * t_ff ** 2 + e * t_ff # FF入力時間だけ、そのときのFF入力を格納する
 
-                sys_params = solver.fit_system_model(y_shifted, u_ff, y0)                                   # システムモデルの同定をして、パラメータを取得
+                sys_params = solver.fit_system_model(y_shifted, u_ff, y0, self.prev_sys_params[dof_idx])    # システムモデルの同定をして、パラメータを取得（前回の同定結果を初期値に使う）
+                self.prev_sys_params[dof_idx] = list(sys_params)                                            # 次回同定の初期値として保存
 
                 # 3. Calculate squared error J
                 a2_sys, a1_sys, a0_sys, b0_sys = sys_params                                                 # システムモデル係数を取り出す
                 y_sys_sim, _, _ = solver.simulate_forced(solver.t_eval, a2_sys, a1_sys, a0_sys, b0_sys, u_ff, y0)   # 同定したシステムモデルの応答を取り出す
 
                 # 4. 離散時間オイラー・ラグランジュ最適制御入力計算 + 5次多項式フィット
-                #    今回の実測データ y_shifted を生んだFFの極値をアンカー候補として渡す
-                #    （calculate_el_ff 内で今回のJが確定し、ベスト極値と探索半径が更新される）
-                self.fit_anchors[dof_idx].pending_extrema = used_extrema_list[dof_idx]                   # 今回印加したFFの極値をアンカー候補に設定
-                new_ff, extrema, u_pred_full, y_tgt, u_opt = solver.calculate_el_ff(                     # 最適入力を計算して、その結果の、FFパラメータ、極値、5次関数のFF制御入力、目標モデルの応答、最適入力を格納
-                    tgt_params, sys_params, u_ff, y0,
-                    y_meas=y_shifted, anchor=self.fit_anchors[dof_idx],
-                )
+                new_ff, extrema, u_pred_full, y_tgt, u_opt = solver.calculate_el_ff(tgt_params, sys_params, u_ff, y0)     # 最適入力を計算して、その結果の、FFパラメータ、極値、5次関数のFF制御入力、目標モデルの応答、最適入力を格納
                 self.current_ff_matrix[dof_idx] = new_ff                                                    # FFパラメータの更新
                 extrema_list.append(extrema)                                                                # 極値を保存
 
@@ -1058,9 +894,37 @@ class OptimalControlSequencer(Node):
                     'u_opt': u_opt_for_J,               # 今回のJを生成した最適制御入力（最小J時の値）
                 })
 
+                # ビューア用データを保存
+                #   波形と極値・モデルパラメータは「この内側ループで実際に使った値」に揃える。
+                #   ・応答(Time-POT) は今回の実測と今回同定したモデル
+                #   ・入力(Time-PWM) は今回印加したFFと、その元になった前回のu_opt
+                #   ・モデルパラメータ履歴は、そのu_optを計算するのに使った前回の同定値
+                if ENABLE_SNAPSHOT:
+                    snap_dof.append({
+                        'y_data': raw_y,                                                    # 実測POT値
+                        'y_sys': y_sys_sim + Pf,                                            # 今回同定したシステムモデルの応答
+                        'y_tgt': y_tgt + Pf,                                                # 今回同定した目標モデルの応答
+                        'u_opt_used': u_opt_used,                                           # 今回印加したFFの元になったu_opt（初回同定時はNaN）
+                        'u_ff_applied': u_ff,                                               # 今回ロボットへ送信したFF入力（この実測データを生成した入力）
+                        'tgt_params_id': list(tgt_params),                                  # 今回同定した目標モデル[T1, wn]（Time-POTの破線に対応）
+                        'sys_params_id': list(sys_params),                                  # 今回同定したシステムモデル[a2, a1, a0, b0]（Time-POTの点線に対応）
+                        'tgt_params_used': tgt_used,                                        # 今回のFFを作るのに使った目標モデル（初回同定時はNaN）
+                        'sys_params_used': sys_used,                                        # 今回のFFを作るのに使ったシステムモデル（初回同定時はNaN）
+                        'ff': list(ff_used_this_iteration[dof_idx]),                         # 今回印加したFFパラメータ[a, b, c, d, e]
+                        'extrema': list(used_extrema_list[dof_idx]),                         # 今回印加したFFの極値[t1, y1, t2, y2]
+                        'J': float(J),                                                      # このDOFの評価関数値（実測と目標モデルの差）
+                        'Pi': float(Pi),                                                    # 初期位置
+                        'Pf': float(Pf),                                                    # 目標位置
+                        'pot_idx': dof_map[dof_idx],                                        # 26要素配列でのインデックス
+                        'fit_res': float(np.sum((u_ff - u_opt_used) ** 2)),                  # 印加したFFの近似残差 Σ(FF-u_opt)²（初回同定時はNaN）
+                        'fit_restart': restart_used,                                        # そのFFを作ったときのCMA-ES再探索回数（-1は退避, -2は該当なし）
+                        'id_res_sys': float(np.sum((y_sys_sim - y_shifted) ** 2)),           # 今回のシステムモデル同定の残差
+                    })
+
                 # 次回ループで印加する（＝次回の実測データを生成する）入力を保存
                 self.prev_u_pred_full[dof_idx] = u_pred_full                                                 # 次回ループ用の5次関数FF入力を保存
                 self.prev_u_opt[dof_idx] = u_opt                                                             # 次回ループ用の最適制御入力を保存
+                self.prev_fit_restart[dof_idx] = solver.last_fit_restart                                     # 次回ループ用のCMA-ES再探索回数を保存
 
             total_J = sum(J_array)                                                                                      # 各自由度の評価関数値Jを足す
 
@@ -1087,6 +951,9 @@ class OptimalControlSequencer(Node):
                 self.best_debug_data = debug_info                                                           # ベストJのときのデバック情報を保存
 
             self.current_inner += 1                                                                                     # 内側ループ回数更新
+
+            if ENABLE_SNAPSHOT:                                                                                         # ビューア用スナップショットを書き出す
+                self.save_snapshot(snap_dof, total_J)
 
             # 内側ループ終了判定
             if total_J < self.threshold_J or self.current_inner >= self.max_inner_iter:                                             # 評価関数Jが閾値より小さくなったか、or、内側ループの最大回数を超えたか
@@ -1117,7 +984,7 @@ class OptimalControlSequencer(Node):
                 self.current_ff_matrix = [list(MathematicalSolver.initial_ff_params(self.T)) for _ in range(24)]        # FFパラメータを初回励振用の非ゼロ初期値へリセット
                 self.prev_u_pred_full = [None] * 24                                                                     # FFリセットに伴い前回入力もリセット（初回はu_ffで代用）
                 self.prev_u_opt = [None] * 24                                                                           # FFリセットに伴い前回最適入力もリセット（初回はu_ffで代用）
-                self.fit_anchors = [ExtremaAnchor() for _ in range(24)]                                                 # 目標値が変わりJの基準も変わるため極値アンカーもリセット
+                self.param_history = []                                                                                 # ビューアの横軸を新しい外側ループの内側ループ番号に戻す
 
             self.state = "INIT_ROBOT"                                                                                   # 初期状態に戻す
             self.state_start_time = self.get_clock().now()                                                              # 現在時刻を取得
@@ -1126,6 +993,66 @@ class OptimalControlSequencer(Node):
             self.get_logger().error(f"最適化パイプライン異常: {exc}\n{traceback.format_exc()}")
             self.state = "FINISHED"
             self.state_start_time = self.get_clock().now()
+
+    # ビューア用スナップショットを書き出す関数
+    def save_snapshot(self, snap_dof, total_J):                                                                                                 # 引数(自由度ごとのビューア用データ, 今回の評価関数値の合計)
+        """最新の波形と、内側ループごとのパラメータ履歴を1つの .npz にまとめて保存する。
+
+        別プロセスのビューア（view_optimization.py）がこのファイルの更新時刻を監視し、
+        更新されていれば読み直して再描画する。一時ファイルへ書いてから os.replace で
+        アトミックに差し替えるため、ビューアが書き込み途中のファイルを掴むことはない。
+        保存に失敗しても最適化は続行する（ビューアは実験の必須要素ではないため）。
+        """
+        if not snap_dof:                                                                                                # データが無ければ何もしない
+            return
+
+        # 自由度方向に積んだ配列を作る関数（24行の2次元配列になる）
+        def stack(key):
+            return np.array([np.asarray(d[key], dtype=np.float32) for d in snap_dof], dtype=np.float32)
+
+        # 内側ループごとのスカラー値を履歴へ追加する（横軸 Inner loop = 0 が初回同定）
+        self.param_history.append({
+            'tgt': stack('tgt_params_used'), 'sys': stack('sys_params_used'),                                           # そのループのu_optを計算するのに使ったモデル
+            'ext': stack('extrema'),                                                                                    # そのループで印加したFFの極値
+            'J': stack('J'),                                                                                            # DOF別評価関数値（実測と目標モデルの差）
+            'total_J': float(total_J), 'best_J': float(self.min_J_sum),                                                 # 全DOF合計J・ベストJ
+        })
+        hist = self.param_history                                                                                       # 履歴の参照
+
+        snap = {
+            # --- 現在の状態 ---
+            'session': self.session_id,                                                                                 # この実行の識別ID（ビューアが前回の実行と区別するために使う）
+            'outer': self.current_outer + 1, 'max_outer': self.max_outer_iter,                                          # 外側ループ番号
+            'inner': self.current_inner, 'max_inner': self.max_inner_iter,                                              # 内側ループ番号
+            'total_J': float(total_J), 'best_J': float(self.min_J_sum),                                                 # 今回のJ・ベストJ
+            'T': float(self.T), 'time': time.strftime('%Y-%m-%d %H:%M:%S'),                                             # FF制御時間・更新時刻
+            # --- 最新の波形（24自由度 × 時系列） ---
+            't': np.arange(0, SIM_TIME, self.dt, dtype=np.float32),                                                     # 時間軸
+            'y_data': stack('y_data'), 'y_sys': stack('y_sys'), 'y_tgt': stack('y_tgt'),                                # 実測・システムモデル・目標モデル
+            'u_opt_used': stack('u_opt_used'), 'u_ff_applied': stack('u_ff_applied'),                                   # 使用したu_opt・印加したFF
+            # --- 最新のパラメータ（24自由度分） ---
+            'tgt_params_id': stack('tgt_params_id'), 'sys_params_id': stack('sys_params_id'),                           # 今回同定したモデル
+            'tgt_params_used': stack('tgt_params_used'), 'sys_params_used': stack('sys_params_used'),                   # 今回のFFを作るのに使ったモデル
+            'ff': stack('ff'), 'extrema': stack('extrema'),                                                             # 印加したFFのパラメータ・極値
+            'J': stack('J'), 'Pi': stack('Pi'), 'Pf': stack('Pf'),                                                      # 評価関数値・初期位置・目標位置
+            'pot_idx': np.array([d['pot_idx'] for d in snap_dof], dtype=np.int32),                                      # 26要素配列でのインデックス
+            'fit_res': stack('fit_res'), 'fit_restart': np.array([d['fit_restart'] for d in snap_dof], dtype=np.int32),  # 近似残差・CMA-ES再探索回数
+            'id_res_sys': stack('id_res_sys'),                                                                          # システムモデル同定の残差
+            # --- 履歴（内側ループ × 24自由度） ---
+            'hist_tgt': np.array([r['tgt'] for r in hist]), 'hist_sys': np.array([r['sys'] for r in hist]),             # 使用した目標モデル・システムモデルの推移
+            'hist_ext': np.array([r['ext'] for r in hist]),                                                             # 印加したFFの極値の推移
+            'hist_J': np.array([r['J'] for r in hist]),                                                                 # 評価関数値の推移
+            'hist_total_J': np.array([r['total_J'] for r in hist], dtype=np.float32),                                   # 全DOF合計Jの推移
+            'hist_best_J': np.array([r['best_J'] for r in hist], dtype=np.float32),                                     # ベストJの推移
+        }
+
+        try:
+            tmp_path = SNAPSHOT_PATH + ".tmp"                                                                           # 一時ファイル名
+            with open(tmp_path, 'wb') as fp:                                                                            # 拡張子を勝手に付けられないようファイルオブジェクトで渡す
+                np.savez(fp, **snap)
+            os.replace(tmp_path, SNAPSHOT_PATH)                                                                         # アトミックに差し替える
+        except Exception as exc:
+            self.get_logger().warn(f"スナップショット保存失敗: {exc}")                                                    # 失敗しても最適化は続行する
 
     # 外側ループが終了した時点で得られた最良のFFパラメータを一覧表示する関数
     def _print_best_params(self, dof_map):
