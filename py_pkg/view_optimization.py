@@ -1,688 +1,702 @@
 #!/usr/bin/env python3
-"""最適化ビューア（test_code3.py が書き出すスナップショットを監視して表示する別プロセス）
+"""optimize_EL_ff_ROS2.py（ADRC＋FF最適制御）の最適化ビューア
 
-test_code3.py は内側ループが1回終わるごとに、24自由度分の波形とパラメータ履歴を
-1つの .npz へ書き出す。本ビューアはそのファイルの更新時刻を監視し、更新されていれば
-読み直して自動で再描画する。別プロセスなので、ビューアを閉じても最適化は影響を受けない。
+optimize_EL_ff_ROS2.py が内側ループごとに書き出す .npz スナップショットの更新時刻を監視し、
+更新されていれば読み直して再描画する別プロセスのプログラム。最適化本体を止めないよう、
+描画はこちらのプロセスだけで行う。
 
-自由度を切り替えると、その自由度のすべての情報が表示される。
-    ・実測 / システムモデル / 目標モデル の応答フィット
-    ・ELのFF入力 u_FF_opt / それを5次関数で近似したFF入力 u_FF と極値
-    ・目標モデルパラメータ (T1, wn) の推移
-    ・システムモデルパラメータ (T1, zeta, wn, b0) の推移
-    ・FF極値 (t1, t2, y1, y2) の推移
-    ・評価関数値 J・近似残差・同定残差 の推移
-    ・現在の数値一覧（左パネル）
+  起動: python3 <このファイル>              （引数でスナップショットのパスを上書きできる）
+        ros2 run py_pkg view_optimization
 
-使い方
-    ros2 run py_pkg view_optimization
-    python3 view_optimization.py [スナップショットのパス]
+表示する8種類のグラフ（画面は2行4列。time_adrc と time_simPWM は枠の中を上下2段に分ける）
+  1. time_pot      応答（Time-POT）。Q_k の切替時刻 k_s と ±10% 帯も描く
+  2. time_pwm      ELで計算した u_FF_opt と、それを近似した5次関数 u_FF（極値に印と値）
+  3. time_adrc     同定判定に使ったモデルの u_ADRC replica・z3 replica を、ROS2実測値と上下2段で重ねる
+  4. time_simPWM   ELの解 u_opt = u_FF_opt + u_ADRC と、その u_opt を与えたシミュレーションの z3 sim
+  5. inner_cost    評価関数の推移
+  6. inner_extrema 印加したFF極値の推移
+  7. inner_model   u_opt の計算に使った目標モデル（T1, wn）の推移（view_optimization_1.py と同じ表示）
+  8. inner_system  u_opt の計算に使ったシステムモデル（T1, zeta, wn, b0）の推移（view_optimization_1.py と同じ表示）
+  最適化対象外の自由度は表示枠を保ったまま実測POT値だけを描く。
 
-注意: この環境には日本語フォントが入っていない（fc-list :lang=ja が0件）ため、Tkの部品も
-      matplotlibのラベルも日本語は □ になる。したがって画面上の文字はすべて英語にしている。
-      日本語表示にしたい場合は `sudo apt install fonts-noto-cjk` を入れてから文字列を戻すこと。
+監視するパスは test_code3.py が使う /tmp/el_optimization_snapshot.npz とは分けてある
+（同時に起動したときに互いのスナップショットを誤読しないようにするため）。
+
+日本語フォントが入っていない環境では matplotlib のラベルが □ になるため、
+画面上の文字はすべて英語にしている（コメントは日本語のまま）。
 """
-import os                                                   # OSライブラリ
-import select                                               # 端末入力の有無の確認
-import signal                                               # Ctrl+C などのシグナル処理
-import sys                                                  # Pythonを扱うライブラリ
-import time                                                 # 時間
+import os                                                       # ファイルの存在確認・更新時刻の取得を行う標準ライブラリ
+import sys                                                      # コマンドライン引数の取得を行う標準ライブラリ
+import signal                                                   # Ctrl+C / kill を捕まえて終了処理を行うための標準ライブラリ
+import time                                                     # 保存先フォルダ名に使う日時の取得
 
-import matplotlib                                           # グラフライブラリ
-matplotlib.use('TkAgg')                                     # Tkinterへ埋め込む描画バックエンド
-from matplotlib.backends.backend_agg import FigureCanvasAgg  # 画像保存専用のキャンバス
-from matplotlib.backends.backend_tkagg import (             # Tkinter用のキャンバスとツールバー
+import numpy as np                                              # 数値計算ライブラリ
+
+import matplotlib                                               # グラフライブラリ
+matplotlib.use('TkAgg')                                         # Tkinterへ埋め込む描画バックエンド
+from matplotlib.backends.backend_agg import FigureCanvasAgg     # 画像保存専用のキャンバス
+from matplotlib.backends.backend_tkagg import (                 # Tkinter用のキャンバスとツールバー
     FigureCanvasTkAgg, NavigationToolbar2Tk,
 )
-from matplotlib.figure import Figure                        # pyplotを使わないOO APIの図
-from matplotlib.ticker import FuncFormatter                 # 目盛り表記の指定
-import numpy as np                                          # 数学計算
+from matplotlib.figure import Figure                            # pyplotを使わないOO APIの図
 
-import tkinter as tk                                        # GUIライブラリ
-from tkinter import ttk                                     # GUI部品
+import tkinter as tk                                            # GUIライブラリ
+from tkinter import ttk                                         # Tkinterのテーマ付きウィジェット
 
-# ==============================================================================
-# ビューアの設定（チューニング要素）
-# ==============================================================================
-SNAPSHOT_PATH = "/tmp/el_optimization_snapshot.npz"         # test_code3.py の SNAPSHOT_PATH と同じにすること
-POLL_INTERVAL_MS = 1000                                     # スナップショットの更新確認の間隔[ms]
-QUIT_CHECK_MS = 200                                         # 端末でEnterが押されたかの確認間隔[ms]
-N_DOF = 24                                                  # 自由度数
-PWM_LIMIT = 255.0                                           # PWMの上下限（入力グラフの補助線）
-LEGEND_FONTSIZE = 7                                         # 凡例の文字サイズ
+SNAPSHOT_PATH = "/tmp/el_optimization_snapshot_v7.npz"          # 監視するスナップショット（optimize_EL_ff_ROS2.py 側と同じパスにすること）
+POLL_MS = 400                                                   # スナップショットの更新を確認する間隔 [ms]
+N_DOF_ALL = 24                                                  # 表示する自由度の総数
+PWM_LIMIT = 255.0                                               # 実機PWMの絶対上限 [PWM]（グラフの補助線に使う）
+SETTLE_BAND = 0.10                                              # 整定判定の帯幅（optimize_EL_ff_ROS2.py の SETTLE_BAND と合わせること）
 
 # ==============================================================================
-# 終了時のグラフ保存の設定（チューニング要素）
+# 終了時に保存するグラフの設定
+#   スナップショットは最新の内側ループ1回分しか残らないため、内側ループごとのグラフを
+#   保存するにはビューア側で読み込んだものを貯めておく必要がある（_record 参照）。
+#   保存先は  <実行ディレクトリ>/YYYYMMDD_HHMMSS/DOF01/OuterLoop00/*.png
+#     ・time_pot_InnerLoopNN.png / time_pwm_InnerLoopNN.png / time_adrc_InnerLoopNN.png /
+#       time_simPWM_InnerLoopNN.png
+#         … 内側ループごとに1枚ずつ
+#     ・inner_cost / inner_extrema / inner_model / inner_system
+#         … その外側ループの最後のスナップショット（＝終了・中断時点の最新の履歴グラフ）から1枚ずつ
 # ==============================================================================
-SAVE_FIGSIZE = (7.0, 4.5)                                   # 保存する画像1枚のサイズ[inch]
-SAVE_DPI = 100                                              # 保存する画像の解像度
+SAVE_FIGSIZE = (7.0, 4.5)                                       # 保存する画像1枚のサイズ [inch]
+SAVE_DPI = 100                                                  # 保存する画像の解像度
+SAVE_MARGIN = dict(left=0.13, right=0.87, top=0.90, bottom=0.13)  # 保存する図の余白（左右に軸ラベルぶんを確保する）
+SAVE_HSPACE = 0.45                                              # 上下2段のグラフを保存するときの段の間隔（各段の見出しが重ならない幅）
+
+# 5次フィットの経路を表す値と、その意味（optimize_EL_ff_ROS2.py の last_fit_mode と対応）
+FIT_MODE_TEXT = {
+    2: "extrema match",                                         # u_FF の2極値を u_FF_opt の最初の2ピークのあたりに通した（正常）
+    0: "L2 projection",                                         # 閉形式の最小二乗で決まった（目標ピークが2個そろわないとき）
+    1: "extrema param (windowed LS)",                           # 極値(t1,t2,y1,y2)を座標にして、最初の2極値が入る窓の中で最小二乗を解いた解
+    -1: "FAILED -> seed shape",                                 # 退避経路でも見つからず初期励振形へ退避した
+    -2: "n/a",                                                  # 該当なし（初回同定など）
+    -3: "f=0 (no motion)",                                      # 動かす必要がない自由度
+}
 
 
 # ==============================================================================
-# 最適化ビューア本体
+# ビューア本体
 # ==============================================================================
 class OptimizationViewer:
+    # 表示するグラフの一覧（画面の並び順＝左上から右下へ。保存名・描画関数名・段数・保存単位）
+    #   段数 2 のグラフは枠の中を上下2段に分け、描画関数には (上段, 下段) の2つの軸を渡す。
+    #   保存単位 'inner' は内側ループごとに1枚、'outer' は外側ループごとに1枚保存する。
+    PANELS = [
+        ('time_pot',      '_plot_response',        1, 'inner'),                             # 1: 応答（Time-POT）
+        ('time_pwm',      '_plot_input',           1, 'inner'),                             # 2: 入力（u_FF_opt と u_FF）
+        ('time_adrc',     '_plot_adrc',            2, 'inner'),                             # 3: ADRC照合（u_ADRC と z3）
+        ('time_simPWM',   '_plot_sim_pwm',         2, 'inner'),                             # 4: ELの解のシミュレーション（u_opt と z3 sim）
+        ('inner_cost',    '_plot_cost_history',    1, 'outer'),                             # 5: 評価関数の推移
+        ('inner_extrema', '_plot_extrema_history', 1, 'outer'),                             # 6: FF極値の推移
+        ('inner_model',   '_plot_target_history',  1, 'outer'),                             # 7: 目標モデルの推移
+        ('inner_system',  '_plot_system_history',  1, 'outer'),                             # 8: システムモデルの推移
+    ]
+
     # コンストラクタ
-    def __init__(self, root, path, save_dir=None):          # 引数(Tkのルートウィンドウ, スナップショットのパス, 終了時の保存先フォルダ)
-        self.root = root                                    # ルートウィンドウを保存
-        self.path = path                                    # 監視するスナップショットのパス
-        self.save_dir = save_dir                            # 終了時にグラフを保存するフォルダ（Noneなら保存しない）
-        self.data = None                                    # 読み込んだスナップショット
-        self.mtime = None                                   # 読み込み済みスナップショットの更新時刻
-        self.records = {}                                   # 保存用に蓄積したスナップショット {外側ループ番号: {...}}
-        self.session = None                                 # 表示中のスナップショットの実行ID
-        self.start_time = time.time()                       # ビューアの起動時刻（これより古いファイルは前回の実行の残りとみなす）
-        self.quit_requested = False                         # 終了要求（Enter または Ctrl+C）が来たか
-        self.watch_stdin = True                             # 端末入力を監視するか（EOFなら止める）
-        self.dof = tk.IntVar(value=1)                       # 表示中の自由度番号（1始まり）
-        self.auto = tk.BooleanVar(value=True)               # 自動更新のON/OFF
+    def __init__(self, root, path, save_dir=None):                                          # 引数(Tkのルートウィンドウ, スナップショットのパス, 終了時の保存先フォルダ)
+        self.root = root                                                                    # Tkのルートウィンドウ
+        self.path = path                                                                    # 監視するスナップショットのパス
+        self.save_dir = save_dir                                                            # 終了時にPNGを保存するフォルダ
+        self.data = None                                                                    # 読み込んだスナップショット（辞書）
+        self.mtime = None                                                                   # 最後に読み込んだファイルの更新時刻
+        self.dof = 0                                                                        # 表示している自由度の添字（0始まり）
+        self.auto = tk.BooleanVar(value=True)                                               # 自動更新のON/OFF
+        self.quit_requested = False                                                         # シグナルで終了を要求されたか
+        self.records = {}                                                                   # 保存用に蓄積したスナップショット {外側ループ番号: {'snaps': {内側ループ番号: データ}}}
+        self.session = None                                                                 # 蓄積中のスナップショットの実行ID（別の実行が始まったら捨てる）
+        self.root.title("optimize_EL_ff_ROS2 optimization viewer")                          # ウィンドウのタイトル
+        self._build_ui()                                                                    # ウィジェットを作る
+        self._reload(force=True)                                                            # 起動時に1度読み込む
+        self.root.after(POLL_MS, self._poll)                                                # 定期監視を開始
+        self.root.after(200, self._check_quit)                                              # シグナルによる終了要求の監視を開始
 
-        self.root.title("Optimal Control Monitor")          # ウィンドウタイトル
-        self.root.geometry("1600x950")                      # ウィンドウサイズ
+    # シグナルによる終了要求を監視する関数
+    def _check_quit(self):                                                                  # 引数なし（Tkのafterから定期的に呼ばれる）
+        """Tkのmainloopは KeyboardInterrupt を握りつぶすため、フラグを定期的に見て終了する"""
+        if self.quit_requested:                                                             # 終了要求が来ている場合
+            self.root.quit()                                                                # mainloopを抜ける（保存は main() の finally で行う）
+            return
+        self.root.after(200, self._check_quit)                                              # まだなら次回の確認を予約する
 
-        self._build_ui()                                    # 画面部品を作る
-        self._poll()                                        # スナップショットの監視を開始する
-        # 終了要求の監視は after で予約する（ここで直接呼ぶと、mainloop開始前に quit() が
-        # 空振りしたうえで再予約されず、終了できなくなる）
-        self.root.after(QUIT_CHECK_MS, self._check_quit)
+    # ウィジェットを作る関数
+    def _build_ui(self):                                                                    # 引数なし（コンストラクタから1度だけ呼ばれる）
+        bar = ttk.Frame(self.root)                                                          # 上部の操作バー
+        bar.pack(side=tk.TOP, fill=tk.X, padx=4, pady=2)                                    # 操作バーを上端へ横いっぱいに配置する
 
-    # 端末でEnterが押されたかを定期的に確認する関数
-    def _check_quit(self):
-        """端末の入力を待ち受け、Enterが押されていたら mainloop を抜ける。
+        ttk.Button(bar, text="<", width=3, command=lambda: self._step_dof(-1)).pack(side=tk.LEFT)   # 1つ前の自由度へ
+        self.dof_var = tk.StringVar(value="DOF 01")                                         # 表示中の自由度を示す文字列
+        ttk.Label(bar, textvariable=self.dof_var, width=8, anchor=tk.CENTER).pack(side=tk.LEFT)   # 表示中の自由度番号
+        ttk.Button(bar, text=">", width=3, command=lambda: self._step_dof(+1)).pack(side=tk.LEFT)   # 1つ次の自由度へ
+        ttk.Checkbutton(bar, text="Auto reload", variable=self.auto).pack(side=tk.LEFT, padx=8)     # 自動更新のON/OFF
+        ttk.Button(bar, text="Reload now", command=lambda: self._reload(force=True)).pack(side=tk.LEFT, padx=6)  # 手動で読み直す
+        self.status = tk.StringVar(value="waiting for snapshot...")                         # 状態表示（更新時刻など）
+        ttk.Label(bar, textvariable=self.status).pack(side=tk.LEFT, padx=12)                # ループ番号・J・更新時刻の表示欄
 
-        input() を別スレッドで待つとインタプリタ終了時に stdin のロックが解放されず
-        異常終了するため、Tkのタイマーから select で「入力があるか」だけを見る。
-        Ctrl+C（SIGINT）で立てられた終了フラグもここで拾う。
-        """
-        if self.watch_stdin and not self.quit_requested:
-            try:
-                if select.select([sys.stdin], [], [], 0)[0]:                                 # 入力が来ているか（待たない）
-                    if sys.stdin.readline() == '':                                           # EOF（端末が無い起動）なら監視をやめるだけ
-                        self.watch_stdin = False
-                    else:                                                                    # Enterが押された
-                        self.quit_requested = True
-            except Exception:                                                                # stdinが使えない環境では監視しない
-                self.watch_stdin = False
+        body = ttk.Frame(self.root)                                                         # 本体（左：数値一覧 / 右：グラフ）
+        body.pack(side=tk.TOP, fill=tk.BOTH, expand=True)                                   # 本体を残り全体へ広げる
+
+        self.text = tk.Text(body, width=46, font=("monospace", 9), state=tk.DISABLED)        # 数値一覧のテキスト欄
+        self.text.pack(side=tk.LEFT, fill=tk.Y, padx=(4, 0), pady=4)                        # 数値一覧を左端へ縦いっぱいに配置する
+
+        right = ttk.Frame(body)                                                             # グラフ側のフレーム
+        right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)                                 # グラフを残り全体へ広げる
+        self.fig = Figure(figsize=(15.5, 7.6), dpi=100)                                     # 図（pyplotを使わないOO API）
+        gs = self.fig.add_gridspec(2, 4, left=0.045, right=0.985, top=0.92, bottom=0.07,    # 2行4列の8枠（右軸の目盛りが隣の枠のラベルと重ならない間隔）
+                                   hspace=0.50, wspace=0.40)
+        self.panel_axes = []                                                                # 枠ごとの軸のリスト（1段なら1個、2段なら上下2個）
+        for k, (_, _, n_rows, _) in enumerate(self.PANELS):                                 # 並び順どおりに枠を作る
+            cell = gs[k // 4, k % 4]                                                        # その枠の位置
+            if n_rows == 1:                                                                 # 1段のグラフ
+                self.panel_axes.append([self.fig.add_subplot(cell)])
+            else:                                                                           # 上下2段のグラフ（時間軸を共有する）
+                sub = cell.subgridspec(2, 1, hspace=0.35)
+                ax0 = self.fig.add_subplot(sub[0])
+                self.panel_axes.append([ax0, self.fig.add_subplot(sub[1], sharex=ax0)])
+        self.canvas = FigureCanvasTkAgg(self.fig, master=right)                             # Tkinterへ埋め込むキャンバス
+        self.canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)            # 描画キャンバスを配置する
+        NavigationToolbar2Tk(self.canvas, right)                                            # 拡大・保存などのツールバー
+
+    # 表示する自由度を切り替える関数
+    def _step_dof(self, delta):                                                             # 引数(移動量)
+        self.dof = (self.dof + delta) % N_DOF_ALL                                           # 端まで行ったら巻き戻す
+        self.dof_var.set(f"DOF {self.dof + 1:02d}")                                         # 表示を更新
+        self._redraw()                                                                      # 再描画
+
+    # スナップショットの更新を定期的に確認する関数
+    def _poll(self):                                                                        # 引数なし（Tkのafterから定期的に呼ばれる）
+        if self.auto.get():                                                                 # 自動更新がONの場合
+            self._reload()                                                                  # 更新されていれば読み直す
+        self.root.after(POLL_MS, self._poll)                                                # 次回の確認を予約する
+
+    # スナップショットを読み直す関数
+    def _reload(self, force=False):                                                         # 引数(自動更新OFFでも読み込むか)
+        if not os.path.exists(self.path):                                                   # ファイルがまだ無い場合
+            self.status.set(f"snapshot not found: {self.path}")
+            return
         try:
-            if self.quit_requested:
-                self.root.quit()                                                             # mainloopを抜ける（保存はmain側のfinallyで行う）
-                return
-            self.root.after(QUIT_CHECK_MS, self._check_quit)
-        except tk.TclError:                                                                  # 既にウィンドウが閉じられている場合
-            pass
-
-    # ------------------------------------------------------------------
-    # 画面の組み立て
-    # ------------------------------------------------------------------
-    def _build_ui(self):
-        # 上段: 自由度の切り替えと更新設定
-        bar = ttk.Frame(self.root, padding=6)                                               # 上段のフレーム
-        bar.pack(side=tk.TOP, fill=tk.X)
-
-        ttk.Label(bar, text="DOF:").pack(side=tk.LEFT)
-        ttk.Button(bar, text="<", width=3, command=lambda: self._step_dof(-1)).pack(side=tk.LEFT)    # 1つ前の自由度へ
-        spin = ttk.Spinbox(                                                                 # 自由度を直接指定するスピンボックス
-            bar, from_=1, to=N_DOF, width=5, textvariable=self.dof,
-            command=self._redraw, justify=tk.CENTER,
+            mtime = os.path.getmtime(self.path)                                             # ファイルの更新時刻
+        except OSError:                                                                     # 差し替えの瞬間に読むと失敗しうる
+            return
+        if not force and self.mtime is not None and mtime <= self.mtime:                    # 更新されていない場合
+            return
+        try:
+            with np.load(self.path, allow_pickle=False) as z:                               # スナップショットを読み込む
+                self.data = {k: z[k] for k in z.files}                                      # 辞書へ展開する
+        except Exception as exc:                                                            # 書き込み途中を掴んだ場合（次回のpollで読み直す）
+            self.status.set(f"read failed (retry): {exc}")
+            return
+        self.mtime = mtime                                                                  # 読み込んだ更新時刻を記録
+        self._record(self.data)                                                             # 内側ループごとの保存用に貯めておく
+        d = self.data
+        self.status.set(
+            f"outer {int(d['outer'])}/{int(d['max_outer'])}  "
+            f"inner {int(d['inner'])}/{int(d['max_inner'])}  "
+            f"J={float(d['total_J']):.4g}  best={float(d['best_J']):.4g}  "
+            f"updated {str(d['time'])}"
         )
-        spin.pack(side=tk.LEFT, padx=2)
-        spin.bind("<Return>", lambda _e: self._redraw())                                    # Enterでも反映する
-        ttk.Button(bar, text=">", width=3, command=lambda: self._step_dof(+1)).pack(side=tk.LEFT)    # 1つ次の自由度へ
-        ttk.Label(bar, text="(arrow keys)").pack(side=tk.LEFT, padx=4)
+        self._redraw()                                                                      # 再描画
 
-        ttk.Separator(bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=12)
-        ttk.Checkbutton(bar, text="Auto update", variable=self.auto).pack(side=tk.LEFT)      # 自動更新のON/OFF
-        ttk.Button(bar, text="Reload now", command=lambda: self._reload(force=True)).pack(side=tk.LEFT, padx=6)
-
-        self.status = ttk.Label(bar, text="Waiting for snapshot...")                        # 状態表示ラベル
-        self.status.pack(side=tk.LEFT, padx=16)
-
-        # 中段: 左に数値一覧、右にグラフ
-        main = ttk.Frame(self.root)                                                         # 中段のフレーム
-        main.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
-
-        self.text = tk.Text(main, width=46, font="TkFixedFont", wrap=tk.NONE, bg="#f5f5f5")  # 数値一覧のパネル（等幅・折り返しなし）
-        self.text.pack(side=tk.LEFT, fill=tk.Y)
-        self.text.configure(state=tk.DISABLED)                                              # 読み取り専用にする
-
-        right = ttk.Frame(main)                                                             # グラフ側のフレーム
-        right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-
-        self.fig = Figure(figsize=(12, 8), dpi=100)                                          # 図（pyplotは使わない）
-        self.axes = self.fig.subplots(2, 4).ravel()                                          # 2行4列の8枚（7枚使い、8枚目は非表示）
-        self.fig.subplots_adjust(left=0.045, right=0.93, top=0.92, bottom=0.07, hspace=0.50, wspace=0.50)   # 右軸のラベルが隣や図の外と重ならない間隔（2行タイトルぶん上下を広げる）
-        self.canvas = FigureCanvasTkAgg(self.fig, master=right)                              # Tkinterへ埋め込む
-        self.canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
-        NavigationToolbar2Tk(self.canvas, right)                                             # 拡大・保存などのツールバー
-
-        self.root.bind("<Left>", lambda _e: self._step_dof(-1))                              # ←キーで自由度を戻す
-        self.root.bind("<Right>", lambda _e: self._step_dof(+1))                             # →キーで自由度を進める
-
-    # 表示する自由度を1つ動かす関数
-    def _step_dof(self, delta):                                                              # 引数(移動量)
-        self.dof.set(int(np.clip(self.dof.get() + delta, 1, N_DOF)))                         # 1～24の範囲に収める
-        self._redraw()
-
-    # ------------------------------------------------------------------
-    # スナップショットの監視と読み込み
-    # ------------------------------------------------------------------
-    def _poll(self):
-        """一定間隔でスナップショットの更新を確認し続ける（監視ループ本体）"""
-        self._reload()                                                                       # 更新を確認する
-        self.root.after(POLL_INTERVAL_MS, self._poll)                                        # 次回の監視を予約する（ここだけで予約すること）
-
-    def _reload(self, force=False):                                                          # 引数(自動更新OFFでも読み込むか)
-        """スナップショットが更新されていれば読み直して再描画する。
-
-        スナップショットは test_code3.py が終了してもファイルとして残るため、ビューアの
-        起動より前に書かれたファイルは「前回の実行の残り」とみなして読み込まない。
-        これをしないと、起動直後に前回の実行のデータが表示され、そのまま保存対象にも
-        入ってしまう（さらに内側ループ番号が衝突して今回のデータを弾いてしまう）。
-        """
-        try:
-            if not ((self.auto.get() or force) and os.path.exists(self.path)):
-                return
-            mtime = os.path.getmtime(self.path)                                              # 更新時刻を取得
-            if mtime < self.start_time:                                                      # ビューア起動より前＝前回の実行の残り
-                if self.data is None:                                                        # まだ何も表示していないときだけ知らせる
-                    old = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(mtime))
-                    self.status.configure(
-                        text=f"Waiting for the current run...   "
-                             f"(the file on disk is from a previous run: {old} — ignored)")
-                return
-            if mtime == self.mtime and not force:                                            # 前回から更新されていなければ何もしない
-                return
-            with np.load(self.path, allow_pickle=False) as npz:
-                self.data = {k: npz[k] for k in npz.files}                                    # メモリへ展開してからファイルを閉じる
-            self.mtime = mtime
-            self._record(self.data)                                                          # 終了時の保存用に蓄積する
-            self._redraw()
-        except Exception as exc:                                                             # 読み込み失敗時は次回の監視で再試行する
-            self.status.configure(text=f"Load failed: {exc}")
-
-    # 終了時のグラフ保存用に、読み込んだスナップショットを蓄積する関数
-    def _record(self, d):                                                                    # 引数(読み込んだスナップショット)
+    # 読み込んだスナップショットを、内側ループごとの保存用に貯めておく関数
+    def _record(self, d):                                                                   # 引数(読み込んだスナップショット)
         """外側ループごとに、各内側ループのスナップショットをそのまま貯める。
 
-        スナップショットは最新の内側ループ1回分しか残らないため、内側ループごとの
-        Time-POT/Time-PWM を保存するにはビューア側で貯めておく必要がある。
+        スナップショットのファイルは最新の内側ループ1回分しか残らないため、内側ループごとの
+        time_pot / time_pwm / time_adrc / time_simPWM を保存するにはビューア側で貯めておく必要がある。
         自動更新をOFFにしている間や、ビューアを起動する前の内側ループは記録されない。
         """
-        session = str(d['session']) if 'session' in d else ''                                # test_code3.py の実行ID
-        if self.session is not None and session != self.session:                             # 別の実行が始まった（ビューアを開いたまま再実行した）
+        session = str(d['session']) if 'session' in d else ''                               # optimize_EL_ff_ROS2.py の実行ID
+        if self.session is not None and session != self.session:                            # 別の実行が始まった（ビューアを開いたまま再実行した）
             print(f"新しい実行を検出しました（{self.session or '不明'} -> {session or '不明'}）。"
                   f"それまでに蓄積した保存対象を破棄します。")
-            self.records.clear()                                                             # 実行をまたいだデータを混ぜない
-        self.session = session
+            self.records.clear()                                                            # 実行をまたいだデータを混ぜない
+        self.session = session                                                              # 現在の実行IDを覚える
+        outer, inner = int(d['outer']), int(d['inner'])                                     # 外側・内側ループ番号
+        rec = self.records.setdefault(outer, {'snaps': {}})                                 # その外側ループの記録枠
+        rec['snaps'].setdefault(inner, d)                                                   # 同じ内側ループは1回だけ記録する
 
-        outer, inner = int(d['outer']), int(d['inner'])
-        rec = self.records.setdefault(outer, {'snaps': {}})
-        rec['snaps'].setdefault(inner, d)                                                    # 同じ内側ループは1回だけ記録する
+    # 描画関数に軸を渡す関数（1段なら軸そのもの、2段なら (上段, 下段) を渡す）
+    def _draw_panel(self, func_name, axes, d, i):                                           # 引数(描画関数名, 軸のリスト, スナップショット, 自由度の添字)
+        func = getattr(self, func_name)                                                     # 描画関数
+        func(axes[0] if len(axes) == 1 else tuple(axes), d, i)                              # 段数に合わせて軸を渡す
 
-    # ------------------------------------------------------------------
-    # 再描画
-    # ------------------------------------------------------------------
-    def _redraw(self):
-        if self.data is None:                                                                # まだデータが無ければ何もしない
+    # 全パネルを描き直す関数
+    def _redraw(self):                                                                      # 引数なし（表示中の自由度を描き直す）
+        if self.data is None:                                                               # まだ読み込めていない場合
             return
-        d = self.data                                                                        # スナップショット
-        i = self.dof.get() - 1                                                               # 表示する自由度の添字（0始まり）
-
-        self.status.configure(                                                               # 状態表示を更新（どの実行のデータかも表示する）
-            text=(f"Run {self.session or '?'}   "
-                  f"Outer {int(d['outer'])}/{int(d['max_outer'])}   "
-                  f"Inner {int(d['inner'])}/{int(d['max_inner'])}   "
-                  f"J = {float(d['total_J']):.4g}   Best J = {float(d['best_J']):.4g}   "
-                  f"Updated {str(d['time'])}")
+        d, i = self.data, self.dof                                                          # スナップショットと表示中の自由度
+        for axes in self.panel_axes:                                                        # 全パネルを消す
+            for ax in axes:
+                ax.clear()                                                                  # 前回の描画内容を消す
+                for tw in getattr(ax, '_twins', []):                                        # 前回作った右軸も消す
+                    tw.remove()                                                             # 前回作った右軸を消す（残すと重なって増え続ける）
+                ax._twins = []                                                              # 右軸の記録を初期化する
+        for (_, func_name, _, _), axes in zip(self.PANELS, self.panel_axes):                # 並び順どおりに描く
+            self._draw_panel(func_name, axes, d, i)
+        opt = self._is_opt(d, i)                                                            # この自由度が最適化対象か
+        self.fig.suptitle(
+            f"DOF {i + 1:02d}   Pi={float(d['Pi'][i]):.0f} -> Pf={float(d['Pf'][i]):.0f} "
+            f"(step={float(d['Pf'][i]) - float(d['Pi'][i]):+.0f} count)   T={float(d['T']):.2f}s   "
+            f"{'[optimized]' if opt else '[NOT optimized - measurement only]'}",
+            fontsize=11,
         )
+        self._update_text(d, i)                                                             # 左の数値一覧を更新
+        self.canvas.draw_idle()                                                             # 画面へ反映する
 
-        for ax in list(self.fig.axes):                                                       # 前回 twinx() で作った右軸を取り除く
-            if ax not in self.axes:                                                          # （ax.clear() では右軸が消えず、再描画のたびに積み重なるため）
-                ax.remove()
-        for ax in self.axes:                                                                 # 8枚のグラフを消してから描き直す
-            ax.clear()
-        self.axes[7].set_visible(False)                                                      # 8枚目は使わない（clear()が可視状態を戻すので毎回ここで消す）
-        self._plot_response(self.axes[0], d, i)                                              # 応答フィット
-        self._plot_input(self.axes[1], d, i)                                                 # 入力
-        self._plot_adrc(self.axes[2], d, i)                                                  # 内部ADRCと実測PWMの照合
-        self._plot_target_history(self.axes[3], d, i)                                        # 目標モデルパラメータの推移
-        self._plot_system_history(self.axes[4], d, i)                                        # システムモデルパラメータの推移
-        self._plot_extrema_history(self.axes[5], d, i)                                       # 極値の推移
-        self._plot_cost_history(self.axes[6], d, i)                                          # 評価関数値・残差の推移
-        for ax in self.axes[:7]:                                                             # 2行4列は1枚が細いのでタイトルが隣とぶつかる。
-            ax.title.set_fontsize(8)                                                         # 画面表示のときだけ小さくする（保存する単独図は元の大きさのまま）
-        self.canvas.draw_idle()                                                              # キャンバスを更新
+    # 右軸を作る関数
+    def _make_twin(self, ax, ylabel, color=None):                                           # 引数(左軸, 右軸のラベル, ラベルと目盛りの色)
+        tw = ax.twinx()                                                                     # 右軸を作る
+        tw.set_ylabel(ylabel, fontsize=8, color=color or 'k')                               # ラベル
+        tw.tick_params(axis='y', labelsize=7, colors=color or 'k')                          # 目盛り
+        getattr(ax, '_twins', []).append(tw)                                                # 次回消せるよう控えておく
+        return tw                                                                           # 作った右軸を返す
 
-        self._update_text(d, i)                                                              # 数値一覧を更新
-
-    # 右軸(twinx)を作る関数
-    def _make_twin(self, ax, ylabel, color=None):                                            # 引数(左軸, 右軸のラベル, ラベルと目盛りの色)
-        """右軸を作り、目盛りを各ラベルが桁を含む自己完結した表記にする。
-
-        既定のフォーマッタは値が大きいと "1e8" のような倍率を軸の外側へ別に描くが、
-        その文字が隣のグラフに隠れて読めなくなる（目盛りが 0.0〜1.0 に見えてしまう）ため。
-        """
-        ax2 = ax.twinx()
-        if color is None:                                                                    # 色指定なし（set_ylabelはcolor=Noneを受け付けない）
-            ax2.set_ylabel(ylabel)
-        else:
-            ax2.set_ylabel(ylabel, color=color)
-            ax2.tick_params(axis='y', labelcolor=color)
-        ax2.yaxis.set_major_formatter(FuncFormatter(lambda v, _pos: f"{v:.4g}"))              # 例: 8.298e+07
-        return ax2
-
-    # 実際にプロットしたデータの範囲に合わせて縦軸の目盛りを決める関数
-    def _fit_ylim(self, ax, series, margin=0.08):                                            # 引数(グラフ, 範囲に含めるデータ列, 上下に足す余白の割合)
-        """縦軸をプロットしたデータの範囲に合わせる。
-
-        axhline で引いた補助線（PWMの±255、目標位置）は matplotlib の自動スケールに
-        含まれてしまい、データが小さいときに波形が潰れて形が見えなくなる。そこで
-        補助線を除いたデータだけから範囲を決め直す。NaN は無視する。
-        """
-        vals = np.concatenate([np.asarray(s, dtype=float).ravel() for s in series])
-        vals = vals[np.isfinite(vals)]                                                       # NaN・infは範囲計算から除く
-        if vals.size == 0:
-            return
-        lo, hi = float(vals.min()), float(vals.max())
-        pad = (hi - lo) * margin if hi > lo else max(abs(hi) * 0.1, 1e-3)                     # データが一定値のときも潰れないようにする
-        ax.set_ylim(lo - pad, hi + pad)
-
-    # 描画済みの線から凡例を作る関数
-    def _add_legend(self, ax, twin=None, ncol=1):                                            # 引数(グラフ, 右軸, 凡例の列数)
-        lines = list(ax.get_lines()) + (list(twin.get_lines()) if twin is not None else [])   # 左右の軸の凡例を1つにまとめる
-        lines += list(ax.patches)                                                             # 欠測を示す帯（axvspan）も凡例に載せる
-        lines = [ln for ln in lines if not str(ln.get_label()).startswith('_')]               # 補助線（ラベル無し）は除く
-        self._legend_from_handles(ax, lines, ncol=ncol, twin=twin)
-
-    # 凡例がプロット線と重ならないよう、凡例の高さぶんだけ縦軸を広げる関数
-    def _legend_from_handles(self, ax, handles, ncol=1, twin=None):                          # 引数(グラフ, 凡例に載せる線, 凡例の列数, 右軸)
-        """凡例をグラフ上部に置き、その高さのぶんだけ縦軸の上端を広げる。
-
-        凡例の実寸をレンダラから測って必要な分だけ広げるので、固定の余白率と違って
-        データの表示領域を無駄に狭めない。実寸が取れない場合は既定値で広げる。
-        対数軸のときは比で広げる。
-        """
-        if not handles:
-            return
-        leg = ax.legend(handles=handles, fontsize=LEGEND_FONTSIZE, ncol=ncol,
-                        loc='upper center', framealpha=0.85)
-
-        try:                                                                                 # 凡例の下端を軸座標(0～1)で実測する
-            bbox = leg.get_window_extent(ax.get_figure().canvas.get_renderer())              # 画面用・保存用どちらの図でも動くよう ax から図を辿る
-            frac = bbox.transformed(ax.transAxes.inverted()).y0 - 0.02                        # 凡例の下端よりわずかに下まででデータを収める
-        except Exception:
-            frac = 0.75                                                                       # 実測できないときの既定値
-        frac = float(np.clip(frac, 0.45, 0.98))                                               # 広げすぎ・狭めすぎを防ぐ
-
-        for a in (ax, twin):                                                                 # データの上端が frac の高さに来るよう縦軸を広げる
-            if a is None:
-                continue
-            lo, hi = a.get_ylim()
-            if a.get_yscale() == 'log' and lo > 0 and hi > lo:
-                a.set_ylim(lo, lo * (hi / lo) ** (1.0 / frac))
-            elif hi > lo:
-                a.set_ylim(lo, lo + (hi - lo) / frac)
-
-    # 実測・システムモデル・目標モデルの応答を描く関数
-    def _plot_response(self, ax, d, i):
-        """受信が途切れた区間（y_gap）は実測ではなく補間の直線なので、実測の線としては描かない。
-
-        描いてしまうと「実機は振動しているのにグラフは水平で、途中から急に振動する」という
-        誤解を招く形になる。線を切って背景に帯を出し、欠測だと一目で分かるようにする。
-        """
-        t = d['t']
-        y_act = np.array(d['y_data'][i], dtype=float)                                        # 実測POT値
-        gap = np.asarray(d['y_gap'][i], dtype=bool) if 'y_gap' in d else None                # 欠測区間（古いスナップショットには無い）
-        if gap is not None and gap.any():
-            y_act[gap] = np.nan                                                              # 補間で作った区間は線を切る
-            for k, (lo, hi) in enumerate(self._mask_spans(t, gap)):                          # 欠測区間を帯で示す
-                ax.axvspan(lo, hi, color='tab:red', alpha=0.12, zorder=0,
-                           label='No data (interpolated)' if k == 0 else '_nolegend_')       # 凡例には1つだけ載せる
-        ax.plot(t, y_act, label='Actual', linewidth=1.2)                                     # 実測POT値
-        ax.plot(t, d['y_tgt'][i], '--', label='Target model', linewidth=1.2)                 # 目標モデル応答
-        ax.plot(t, d['y_sys'][i], ':', label='System model', linewidth=1.5)                  # システムモデル応答
-        ax.axhline(float(d['Pf'][i]), color='gray', linewidth=0.7, alpha=0.6)                # 目標位置
-        title = f"DOF {i + 1}  Response fit  (J = {float(d['J'][i]):.4g})"
-        if gap is not None and gap.any():                                                    # 欠測があればタイトルにも出す
-            title += f"   [no data: {gap.mean() * 100:.0f}%]"
-        ax.set_title(title, fontsize=10)
-        ax.set_xlabel('Time [s]'); ax.set_ylabel('POT')
-        ax.grid(alpha=0.3)
-        self._fit_ylim(ax, [y_act, d['y_tgt'][i], d['y_sys'][i]])                            # 3本の応答に合わせて縦軸を決める
-        self._add_legend(ax, ncol=3)
-
-    # 真になっている区間を (開始時刻, 終了時刻) の一覧へ変換する関数
+    # 補助線を無視して表示範囲を決める関数
     @staticmethod
-    def _mask_spans(t, mask):                                                                # 引数(時間軸, マスク)
-        spans = []                                                                           # 空のリスト
-        edges = np.flatnonzero(np.diff(np.concatenate(([0], mask.astype(np.int8), [0]))))    # 立ち上がり・立ち下がりの位置
-        for lo, hi in zip(edges[0::2], edges[1::2]):                                         # 2つずつ取り出して1区間にする
-            spans.append((float(t[lo]), float(t[min(hi, t.size - 1)])))
-        return spans
-
-    # この内側ループで使用したu_FF_optと、それを5次関数で近似したFF入力を描く関数
-    def _plot_input(self, ax, d, i):
-        """u_FF_opt: ELが計算したFF入力 / u_FF: それを5次関数で近似した実際に送ったFF入力。
-        u_opt: ELが想定した総入力（最適制御の内部で計算されたADRC分 ＋ u_FF_opt）。
-
-        いずれも1つ前の内側ループで計算された値（＝今回ロボットを動かした入力）。
-        u_opt と u_FF_opt の差が、閉ループ内のADRCが出していた入力にあたる。
+    def _fit_ylim(ax, series, margin=0.08):                                                 # 引数(グラフ, 範囲に含めるデータ列, 上下に足す余白の割合)
+        """axhline で引いた補助線（PWMの±255、目標位置）は自動スケールの対象になるため、
+        補助線だけが遠くにあると実際のデータが潰れて見えなくなる。データ列だけから範囲を決める。
         """
-        t = d['t']
-        u_ff_opt = d['u_ff_opt_used'][i]                                                     # ELが計算したFF入力 u_FF_opt（初回同定時はNaN）
-        has_u_opt = bool(np.any(np.isfinite(u_ff_opt)))                                      # 初回同定かどうかの判定
-        u_total = d['u_opt_used'][i] if 'u_opt_used' in d else None                          # ELが想定した総入力（古いスナップショットには無い）
-        if has_u_opt:
-            ax.plot(t, u_ff_opt, label='u_FF_opt (EL)', linewidth=1.2)                       # ELの最適化で得られたFF入力
-            if u_total is not None and np.any(np.isfinite(u_total)):
-                ax.plot(t, u_total, ':', label='u_opt = u_ADRC + u_FF_opt', linewidth=1.0)   # 内部ADRC分を含む総入力
-        ax.plot(t, d['u_ff_applied'][i], '--', label='u_FF (5th-order fit, sent)', linewidth=1.5)   # u_FF_optを5次関数で近似して送信したFF入力
-        t1, y1, t2, y2 = d['extrema'][i]
-        ax.plot([t1, t2], [y1, y2], 'o', color='red', markersize=6, label='FF extrema t1, t2')   # 印加したFFの極値
-        ax.axhline(PWM_LIMIT, color='gray', linewidth=0.7, alpha=0.6)                        # PWM上限（範囲外なら画面に出ない）
-        ax.axhline(-PWM_LIMIT, color='gray', linewidth=0.7, alpha=0.6)                       # PWM下限（範囲外なら画面に出ない）
-        ax.axvline(float(d['T']), color='gray', linewidth=0.7, alpha=0.6)                    # FF入力時間T
-        x_max = min(float(d['T']) * 1.6, float(t[-1]))                                        # FF区間まわりを拡大表示
-        ax.set_xlim(0, x_max)
-        shown = t <= x_max                                                                    # 表示している時間範囲だけで縦軸を決める
-        series = [d['u_ff_applied'][i][shown], [y1, y2]]                                      # 印加FFと極値
-        if has_u_opt:
-            series.append(u_ff_opt[shown])                                                    # u_FF_optも範囲に含める
-            if u_total is not None and np.any(np.isfinite(u_total)):
-                series.append(u_total[shown])                                                 # 総入力も範囲に含める
-        self._fit_ylim(ax, series)                                                            # PWMの±255線に引きずられないようにする
-        if has_u_opt:                                                                        # 通常のループ
-            title = (f"FF input: u_FF_opt vs 5th-order fit  (fit residual = {float(d['fit_res'][i]):.4g}, "
-                     f"CMA restarts = {int(d['fit_restart'][i])})")
-        else:                                                                                # 初回同定（最適制御前）
-            title = "Applied input  (initial excitation FF, before optimal control)"
-        ax.set_title(title, fontsize=10)
-        ax.set_xlabel('Time [s]'); ax.set_ylabel('PWM')
-        ax.grid(alpha=0.3)
-        self._add_legend(ax, ncol=2)
-
-    # 最適制御の内部で計算されたADRC入力が、実測PWMと合っているかを描く関数
-    def _plot_adrc(self, ax, d, i):
-        """u_ADRC measured: 実機が実際に出した入力（配信PWM から 印加したFF を引いたもの）。
-        u_ADRC closed-loop : 閉ループ同定の仕上げ後、シミュレーションの内部ADRCが出した入力。
-
-        この2本が重なっていれば、最適制御の中で計算している u_ADRC が実機を再現できている。
-        離れている場合はシステムモデルが実機を表せていないので、u_FF_opt の最適化もその分だけ
-        的外れになる。FF区間だけでなく5秒全体を見る（区間外はADRC単独で姿勢を保持している）。
-        """
-        t = d['t']
-        if 'u_adrc_meas' not in d:                                                           # 古いスナップショットには無いキー
-            ax.set_title("ADRC replica check  (no data in this snapshot)", fontsize=10)
-            ax.grid(alpha=0.3)
+        vals = np.concatenate([np.asarray(s, dtype=float).ravel() for s in series if s is not None])  # データ列を1本にまとめる
+        vals = vals[np.isfinite(vals)]                                                      # NaN/Infを除く
+        if vals.size == 0:                                                                  # 有効な値が無い場合
             return
-        u_meas = d['u_adrc_meas'][i]                                                         # 実機が実際に出したADRC入力
-        u_cl = d['u_adrc_cl'][i]                                                             # シミュレーション内部のADRC入力（仕上げできなかった自由度はNaN）
-        series = []
-        if np.any(np.isfinite(u_meas)):
-            ax.plot(t, u_meas, label='u_ADRC measured (u_pwm - u_FF)', linewidth=1.2)        # 実測
-            series.append(u_meas)
-        if np.any(np.isfinite(u_cl)):
-            ax.plot(t, u_cl, '--', label='u_ADRC closed-loop sim', linewidth=1.2)            # シミュレーション
-            series.append(u_cl)
-        ax.axhline(PWM_LIMIT, color='gray', linewidth=0.7, alpha=0.6)                        # PWM上限（範囲外なら画面に出ない）
-        ax.axhline(-PWM_LIMIT, color='gray', linewidth=0.7, alpha=0.6)                       # PWM下限（範囲外なら画面に出ない）
-        ax.axvline(float(d['T']), color='gray', linewidth=0.7, alpha=0.6)                    # FF入力時間T
-        if series:
-            self._fit_ylim(ax, series)                                                       # PWMの±255線に引きずられないようにする
-        res, res_open = float(d['adrc_res'][i]), float(d['adrc_res_open'][i])                # 仕上げ後・仕上げ前の残差
-        kick, rho = float(d['adrc_kick'][i]), float(d['cl_radius'][i])                       # 比例キック比・閉ループのスペクトル半径
-        ok = 'yes' if float(d['cl_ok'][i]) > 0.5 else 'NO'                                   # 閉ループ同定の仕上げを採用したか
-        ax.set_title(f"ADRC replica vs measured PWM\n"
-                     f"res {self._num(res)} PWM (was {self._num(res_open)}), "
-                     f"kick {self._num(kick, '{:.2f}')}, rho {self._num(rho, '{:.4f}')}, refined {ok}",
-                     fontsize=9)
-        ax.set_xlabel('Time [s]'); ax.set_ylabel('PWM')
-        ax.grid(alpha=0.3)
-        self._add_legend(ax, ncol=2)
+        lo, hi = float(vals.min()), float(vals.max())                                       # データの上下端
+        pad = max((hi - lo) * margin, 1e-9)                                                 # 余白
+        ax.set_ylim(lo - pad, hi + pad)                                                     # データが収まる範囲へ設定する
 
-    # NaN を "--" として表示する共通ヘルパ
+    # その自由度が最適制御の対象かどうかを取り出す関数
     @staticmethod
-    def _num(v, fmt='{:.4g}'):                                                               # 引数(値, 書式)
-        return '--' if v is None or not np.isfinite(v) else fmt.format(v)
+    def _is_opt(d, i):                                                                      # 引数(スナップショット, 自由度の添字)
+        """optimize_EL_ff_ROS2.py の OPT_DOF_IDS にその自由度が含まれていたかを返す（'opt' が無い古い形式は対象扱い）"""
+        return float(d['opt'][i]) > 0.5 if 'opt' in d else True
 
-    # 履歴グラフの共通設定を行う関数
-    def _setup_history_axis(self, ax, n, title):                                             # 引数(グラフ, 履歴の点数, タイトル)
-        ax.set_title(title, fontsize=10)
-        ax.set_xlabel('Inner loop')
-        ax.grid(alpha=0.3)
-        if n <= 12:                                                                          # 点数が少ないときは全ループ番号を目盛りにする
-            ax.set_xticks(np.arange(n))
+    # 最適制御の対象外の自由度に対して、表示枠だけを残したグラフを描く関数（view_optimization_1.py と同じ）
+    @staticmethod
+    def _plot_not_optimized(ax, title, xlabel, ylabel):                                     # 引数(グラフ, タイトル, 横軸ラベル, 縦軸ラベル)
+        """レイアウト・体裁（タイトルと軸ラベル）は対象自由度と同じまま、中身を空にする。
 
-    # 目標モデルパラメータ(T1, wn)の推移を描く関数
-    def _plot_target_history(self, ax, d, i):
-        h = d['hist_tgt'][:, i, :]                                                           # (履歴数, 2)
-        x = np.arange(len(h))
-        ax.plot(x, h[:, 0], 'o-', color='tab:blue', markersize=3, label='T1')                # 1次遅れの時定数
-        ax.set_ylabel('T1 [s]', color='tab:blue'); ax.tick_params(axis='y', labelcolor='tab:blue')
-        ax2 = self._make_twin(ax, 'wn [rad/s]', color='tab:red')                             # 右軸
-        ax2.plot(x, h[:, 1], 's-', color='tab:red', markersize=3, label='wn')                # 固有振動数
-        self._setup_history_axis(ax, len(h), 'Target model params used for u_FF_opt')
-        self._add_legend(ax, twin=ax2, ncol=2)
+        対象外の自由度では計算そのものを行っていないので、描くべき値が存在しない。
+        グラフを消してしまうと自由度を切り替えるたびに画面構成が変わって見比べにくいため、
+        枠と見出しは残したうえで「最適化していない」ことだけを本文に出す。
+        """
+        ax.text(0.5, 0.5, 'Not optimized\n(measured POT only)', transform=ax.transAxes,
+                ha='center', va='center', fontsize=9, color='gray')
+        ax.set_title(title, fontsize=9)
+        ax.set_xlabel(xlabel, fontsize=8); ax.set_ylabel(ylabel, fontsize=8)
+        ax.set_xticks([]); ax.set_yticks([])                                                # 目盛りは意味を持たないので消す
+        ax.grid(False)
 
-    # システムモデルパラメータ(T1, zeta, wn, b0)の推移を描く関数
-    def _plot_system_history(self, ax, d, i):
-        h = d['hist_sys'][:, i, :]                                                           # (履歴数, 4)
-        x = np.arange(len(h))
+    # 実測とモデルの一致度（誤差のrms と実測の振れ幅）を求める関数
+    @staticmethod
+    def _match_stats(meas, model):                                                          # 引数(実測の系列, モデルの系列)
+        """両方が有限値の点だけで rms(実測 - モデル) と std(実測) を返す（比べられなければ NaN）"""
+        meas = np.asarray(meas, dtype=float); model = np.asarray(model, dtype=float)
+        ok = np.isfinite(meas) & np.isfinite(model)                                         # 両方そろっている点
+        if not ok.any():
+            return float('nan'), float('nan')
+        err = meas[ok] - model[ok]                                                          # 実測とモデルの差
+        return float(np.sqrt(np.mean(err ** 2))), float(np.std(meas[ok]))
+
+    # z3 を見やすい桁へそろえる倍率を決める関数
+    @staticmethod
+    def _z3_scale(series):                                                                  # 引数(z3 の系列のリスト)
+        """z3 は 1e6〜1e7 の大きさなので、そのまま描くと軸の上に出る指数表記が見出しと重なる。
+        10 のべき乗で割って描き、桁は軸ラベルに書く。戻り値は (倍率, 指数)。
+        """
+        vals = np.concatenate([np.asarray(s, dtype=float).ravel() for s in series])         # 全系列を1本にまとめる
+        vals = np.abs(vals[np.isfinite(vals)])                                              # 有限値の絶対値
+        if vals.size == 0 or vals.max() <= 0.0:                                             # 描くものが無い場合
+            return 1.0, 0
+        exp = int(np.floor(np.log10(vals.max())))                                           # 最大値の桁
+        return 10.0 ** exp, exp
+
+    # データが無いことを枠の中央に書く関数
+    @staticmethod
+    def _note_empty(ax, series, text):                                                      # 引数(グラフ, 判定に使う系列のリスト, 表示する文)
+        """全系列が NaN（初回の内側ループなど）のときだけ、枠の中央に理由を出す"""
+        if not any(np.isfinite(np.asarray(s, dtype=float)).any() for s in series):
+            ax.text(0.5, 0.5, text, transform=ax.transAxes, ha='center', va='center', fontsize=8, color='gray')
+
+    # 応答（Time-POT）を描く関数
+    def _plot_response(self, ax, d, i):                                                     # 引数(描画先のグラフ, スナップショット, 自由度の添字)
+        t = d['t']                                                                          # 時間軸 [s]
+        y_data, y_sys, y_tgt = d['y_data'][i], d['y_sys'][i], d['y_tgt'][i]                 # 実測・システムモデル・目標モデル
+        gap = d['y_gap'][i]                                                                 # 実測が無く補間の直線になっている区間
+        y_show = np.where(gap, np.nan, y_data)                                              # 補間の直線は実測として描かない
+        Pf = float(d['Pf'][i]); Pi = float(d['Pi'][i]); step = Pf - Pi                      # 目標位置・初期位置・目標変位
+        ax.plot(t, y_show, 'k-', lw=1.2, label='measured')                                  # 実測POT値
+        ax.plot(t, y_sys, 'b--', lw=1.0, label='system model')                              # 同定したシステムモデルの応答
+        ax.plot(t, y_tgt, 'r:', lw=1.4, label='target model')                               # 同定した目標モデルの応答
+        ax.axhline(Pf, color='g', lw=0.8, ls='-.')                                          # 目標位置
+        band = SETTLE_BAND * abs(step)                                                      # 整定判定の帯幅
+        if np.isfinite(band) and band > 0:                                                  # 目標変位がある場合だけ帯を描く
+            ax.axhspan(Pf - band, Pf + band, color='g', alpha=0.08)                         # ±10% 帯
+        k_s = float(d['k_s'][i]) if 'k_s' in d else np.nan                                  # Q_k の切替インデックス
+        if np.isfinite(k_s) and 0 <= k_s < len(t):                                          # 切替時刻が有効な場合
+            ax.axvline(t[int(k_s)], color='m', lw=1.0, ls='--')                             # k_s（整定区間の開始）
+            ax.text(t[int(k_s)], ax.get_ylim()[1], ' k_s', color='m', fontsize=7, va='top')
+        ax.axvline(float(d['T']), color='0.5', lw=0.8, ls=':')                              # FF入力の終了時刻 T
+        ax.set_title('Response  (Time-POT)', fontsize=9)
+        ax.set_xlabel('time [s]', fontsize=8); ax.set_ylabel('POT [count]', fontsize=8)
+        ax.tick_params(labelsize=7); ax.grid(alpha=0.3)                                     # 目盛りの大きさとグリッド
+        self._fit_ylim(ax, [y_show, y_sys, y_tgt, np.array([Pf])])                          # 補助線を無視して範囲を決める
+        ax.legend(fontsize=6, loc='best')                                                   # 凡例（重ならない位置へ自動配置）
+
+    # 入力（Time-PWM）を描く関数
+    def _plot_input(self, ax, d, i):                                                        # 引数(描画先のグラフ, スナップショット, 自由度の添字)
+        """ELで計算した u_FF_opt と、それを近似して今回ロボットへ送った5次関数 u_FF を重ねる。
+        u_FF の極値2点に印を付け、その (時刻, 値) を書き添える。
+        """
+        t = d['t']                                                                          # 時間軸 [s]
+        u_ff_opt = d['u_ff_opt_used'][i]                                                    # 今回印加したFFの元になった u_FF_opt（ELの解）
+        u_ff = d['u_ff_applied'][i]                                                         # 今回ロボットへ送信した5次関数FF入力（u_FF_opt の近似）
+        ax.plot(t, u_ff_opt, 'c-', lw=1.0, label='u_FF_opt (EL)')                            # ELが出した最適FF入力
+        ax.plot(t, u_ff, 'r-', lw=1.4, label='u_FF (5th-order, sent)')                       # 実機へ送った5次関数FF
+        t1, y1, t2, y2 = [float(v) for v in d['extrema'][i]]                                 # 印加したFFの極値
+        ax.plot([t1, t2], [y1, y2], 'ro', ms=5)                                              # 極値マーカー
+        ax.annotate(f'({t1:.3f}, {y1:+.1f})', (t1, y1), fontsize=6, xytext=(3, 4), textcoords='offset points')
+        ax.annotate(f'({t2:.3f}, {y2:+.1f})', (t2, y2), fontsize=6, xytext=(3, -9), textcoords='offset points')
+        ax.axhline(0.0, color='k', lw=0.6)                                                   # 0線
+        ax.axvline(float(d['T']), color='0.5', lw=0.8, ls=':')                               # FF入力の終了時刻 T
+        ax.set_title('Input  (Time-PWM)', fontsize=9)
+        ax.set_xlabel('time [s]', fontsize=8); ax.set_ylabel('PWM', fontsize=8)
+        ax.tick_params(labelsize=7); ax.grid(alpha=0.3)                                     # 目盛りの大きさとグリッド
+        ax.set_xlim(0, min(float(d['T']) * 1.6, float(t[-1])))                               # FF区間まわりを拡大して見る
+        self._fit_ylim(ax, [u_ff_opt, u_ff])                                                 # 補助線を無視して範囲を決める
+        ax.legend(fontsize=6, loc='best')                                                   # 凡例（重ならない位置へ自動配置）
+
+    # ADRC照合（同定判定に使ったモデル vs ROS2実測）を上下2段で描く関数
+    def _plot_adrc(self, axes, d, i):                                                       # 引数((上段, 下段) のグラフ, スナップショット, 自由度の添字)
+        """上段: u_ADRC、下段: z3。どちらも黒実線が ROS2実測、色付き破線が同定判定に使ったモデル。
+
+        モデル側は、同定したシステムモデルを実測と同じ条件（印加したFF・目標変位・保持PWM・
+        z3(0⁻)）でADRC込みの閉ループで回した値である（optimize_EL_ff_ROS2.py の閉ループ同定が合わせる対象）。
+        段ごとに単位の違う量を分けて描き、見出しに誤差の rms と実測の振れ幅を出すので、
+        一致しているかどうかが1目で分かる。ここが合っていないと、u_FF の最適化もその分だけ的外れになる。
+        """
+        ax_u, ax_z = axes                                                                    # 上段・下段
+        t = d['t']                                                                           # 時間軸 [s]
+        T = float(d['T'])                                                                    # FF入力の終了時刻
+
+        u_meas, u_rep = d['u_adrc_meas'][i], d['u_adrc_cl'][i]                               # 実測ADRC出力・モデルのADRC出力
+        rms_u, std_u = self._match_stats(u_meas, u_rep)                                      # 一致度
+        ax_u.plot(t, u_meas, 'k-', lw=1.0, label='u_ADRC measured')                          # 実測ADRC出力（u_pwm - u_ff）
+        ax_u.plot(t, u_rep, '--', color='tab:blue', lw=1.1, label='u_ADRC replica')          # 同定モデルの内部複製が出したADRC出力
+        ax_u.axvline(T, color='0.5', lw=0.8, ls=':')                                         # FF入力の終了時刻 T
+        ax_u.set_title(f'u_ADRC: measured vs replica   rms err {rms_u:.1f} / meas std {std_u:.1f} PWM', fontsize=8)
+        ax_u.set_ylabel('PWM', fontsize=8)
+        ax_u.tick_params(labelsize=7); ax_u.tick_params(labelbottom=False); ax_u.grid(alpha=0.3)
+        self._fit_ylim(ax_u, [u_meas, u_rep])                                                # データだけから範囲を決める
+        ax_u.legend(fontsize=6, loc='best')
+
+        z3_meas = d['z3_meas'][i] if 'z3_meas' in d else np.full(len(t), np.nan)             # 実測 z3（ESO外乱推定値）
+        z3_rep = d['z3_replica'][i] if 'z3_replica' in d else np.full(len(t), np.nan)        # 同定モデルの内部複製の ζ3
+        rms_z, std_z = self._match_stats(z3_meas, z3_rep)                                    # 一致度（元の単位）
+        sc, ex = self._z3_scale([z3_meas, z3_rep])                                           # 表示の桁
+        ax_z.plot(t, z3_meas / sc, 'k-', lw=1.0, label='z3 measured')                        # 実測 z3
+        ax_z.plot(t, z3_rep / sc, '--', color='tab:red', lw=1.1, label='z3 replica')         # 同定モデルの内部複製の ζ3
+        ax_z.axvline(T, color='0.5', lw=0.8, ls=':')                                         # FF入力の終了時刻 T
+        ax_z.set_title(f'z3: measured vs replica   rms err {rms_z:.3g} / meas std {std_z:.3g}', fontsize=8)
+        ax_z.set_xlabel('time [s]', fontsize=8); ax_z.set_ylabel(f'z3 [1e{ex} count/s^2]' if ex else 'z3 [count/s^2]', fontsize=8)
+        ax_z.tick_params(labelsize=7); ax_z.grid(alpha=0.3)
+        ax_z.set_xlim(float(t[0]), float(t[-1]))                                             # 評価ホライズン全体を見る（上段も共有）
+        self._fit_ylim(ax_z, [z3_meas / sc, z3_rep / sc])                                    # データだけから範囲を決める
+        ax_z.legend(fontsize=6, loc='best')
+
+    # ELの解（振動のない解が得られた場合のシミュレーション値）を上下2段で描く関数
+    def _plot_sim_pwm(self, axes, d, i):                                                    # 引数((上段, 下段) のグラフ, スナップショット, 自由度の添字)
+        """上段: ELで計算した総最適入力 u_opt = u_FF_opt + u_ADRC（絶対PWM）、
+        下段: その u_opt を与えたシミュレーションの z3 sim。
+
+        time_pwm の u_FF_opt と同じ回のELの解（＝今回印加したFFの元になった解）である。
+        time_adrc の実測と見比べると、ELが想定した理想の動きと実機の差が分かる。
+        初回の内側ループは初期励振FFを印加しているので、対応するELの解は無い。
+        """
+        ax_u, ax_z = axes                                                                    # 上段・下段
+        t = d['t']                                                                           # 時間軸 [s]
+        T = float(d['T'])                                                                    # FF入力の終了時刻
+        u_hold = float(d['u_hold'][i]) if 'u_hold' in d else 0.0                             # 保持PWM（z形式の u_opt を絶対PWMへ戻す）
+        if not np.isfinite(u_hold):                                                          # 保持PWMが無い（対象外の自由度など）場合
+            u_hold = 0.0
+        u_opt = np.asarray(d['u_opt_used'][i], dtype=float) + u_hold                          # u_opt = u_FF_opt + u_ADRC（絶対PWM）
+        ax_u.plot(t, u_opt, '-', color='tab:purple', lw=1.2, label='u_opt = u_FF_opt + u_ADRC (EL)')
+        ax_u.axvline(T, color='0.5', lw=0.8, ls=':')                                         # FF入力の終了時刻 T
+        ax_u.set_title('EL solution (simulation): u_opt', fontsize=8)
+        ax_u.set_ylabel('PWM', fontsize=8)
+        ax_u.tick_params(labelsize=7); ax_u.tick_params(labelbottom=False); ax_u.grid(alpha=0.3)
+        self._fit_ylim(ax_u, [u_opt])                                                        # データだけから範囲を決める
+        self._note_empty(ax_u, [u_opt], 'n/a (no EL solution for this loop)')
+        ax_u.legend(fontsize=6, loc='best')
+
+        z3_sim = d['z3_sim_used'][i] if 'z3_sim_used' in d else np.full(len(t), np.nan)      # その u_opt を与えたときの ζ3
+        sc, ex = self._z3_scale([z3_sim])                                                    # 表示の桁
+        ax_z.plot(t, z3_sim / sc, '-', color='tab:green', lw=1.2, label='z3 sim (EL)')
+        ax_z.axvline(T, color='0.5', lw=0.8, ls=':')                                         # FF入力の終了時刻 T
+        ax_z.set_title('EL solution (simulation): z3 sim', fontsize=8)
+        ax_z.set_xlabel('time [s]', fontsize=8); ax_z.set_ylabel(f'z3 [1e{ex} count/s^2]' if ex else 'z3 [count/s^2]', fontsize=8)
+        ax_z.tick_params(labelsize=7); ax_z.grid(alpha=0.3)
+        ax_z.set_xlim(float(t[0]), float(t[-1]))                                             # 評価ホライズン全体を見る（上段も共有）
+        self._fit_ylim(ax_z, [z3_sim / sc])                                                  # データだけから範囲を決める
+        self._note_empty(ax_z, [z3_sim], 'n/a (no EL solution for this loop)')
+        ax_z.legend(fontsize=6, loc='best')
+
+    # 履歴パネルの共通設定を行う関数
+    @staticmethod
+    def _setup_history_axis(ax, n, title):                                                    # 引数(グラフ, 履歴の点数, タイトル)
+        ax.set_title(title, fontsize=9)                                                     # パネルのタイトル
+        ax.set_xlabel('inner loop', fontsize=8)                                             # 横軸は内側ループ番号
+        ax.tick_params(labelsize=7); ax.grid(alpha=0.3)                                     # 目盛りの大きさとグリッド
+        if n > 0:
+            ax.set_xlim(-0.5, max(n - 0.5, 0.5))                                            # 点が端で切れないよう少し余白を取る
+
+    # 目標モデルパラメータ(T1, wn)の推移を描く関数（view_optimization_1.py と同じ表示）
+    def _plot_target_history(self, ax, d, i):                                               # 引数(描画先のグラフ, スナップショット, 自由度の添字)
+        title = 'Target model params used for u_opt'
+        if not self._is_opt(d, i):                                                          # 最適制御の対象外の自由度は同定していない
+            self._plot_not_optimized(ax, title, 'inner loop', 'T1 [s]')
+            return
+        h = d['hist_tgt'][:, i, :] if d['hist_tgt'].size else np.zeros((0, 2))              # [T1, wn] の推移
+        x = np.arange(len(h))                                                               # 内側ループ番号
+        ax.plot(x, h[:, 0], 'o-', color='tab:blue', ms=3, label='T1')                       # 1次遅れの時定数
+        ax.set_ylabel('T1 [s]', color='tab:blue', fontsize=8)
+        ax.tick_params(axis='y', labelcolor='tab:blue')
+        tw = self._make_twin(ax, 'wn [rad/s]', color='tab:red')                             # 右軸
+        tw.plot(x, h[:, 1], 's-', color='tab:red', ms=3, label='wn')                        # 固有振動数
+        h1, l1 = ax.get_legend_handles_labels(); h2, l2 = tw.get_legend_handles_labels()   # 左軸・右軸の凡例要素を集める
+        ax.legend(h1 + h2, l1 + l2, fontsize=6, loc='best', ncol=2)                         # 左右の凡例をまとめて出す
+        self._setup_history_axis(ax, len(h), title)
+
+    # システムモデルパラメータ(T1, zeta, wn, b0)の推移を描く関数（view_optimization_1.py と同じ表示）
+    def _plot_system_history(self, ax, d, i):                                               # 引数(描画先のグラフ, スナップショット, 自由度の添字)
+        title = 'System model params used for u_opt'
+        if not self._is_opt(d, i):                                                          # 最適制御の対象外の自由度は同定していない
+            self._plot_not_optimized(ax, title, 'inner loop', 'T1, wn, b0 (symlog)')
+            return
+        h = d['hist_sys'][:, i, :] if d['hist_sys'].size else np.zeros((0, 4))              # [T1, zeta, wn, b0] の推移
+        x = np.arange(len(h))                                                               # 内側ループ番号
         for k, name in [(0, 'T1 [s]'), (2, 'wn [rad/s]'), (3, 'b0')]:                        # T1・wnは正、b0は符号自由なので symlog 軸に載せる
-            ax.plot(x, h[:, k], 'o-', markersize=3, label=name)
-        ax.set_yscale('symlog', linthresh=1e-2); ax.set_ylabel('T1, wn, b0 (symlog)')        # 桁が離れるうえ b0 は負にもなるため symlog
-        ax2 = self._make_twin(ax, 'zeta', color='tab:purple')                                # 減衰比は範囲が狭いので線形の右軸
-        ax2.plot(x, h[:, 1], 's-', color='tab:purple', markersize=3, label='zeta')
-        ax2.axhline(0.0, color='tab:purple', lw=0.8, ls=':')                                 # zeta=0: 振動モードの安定限界（下回ると振幅が増大する）
-        ax2.axhline(1.0, color='tab:purple', lw=0.8, ls='--')                                # zeta=1: 臨界減衰（上回ると3実極で振動しない）
-        self._setup_history_axis(ax, len(h), 'System model params used for u_FF_opt')
-        self._add_legend(ax, twin=ax2, ncol=4)
+            ax.plot(x, h[:, k], 'o-', ms=3, label=name)
+        ax.set_yscale('symlog', linthresh=1e-2)                                             # 桁が離れるうえ b0 は負にもなるため symlog
+        ax.set_ylabel('T1, wn, b0 (symlog)', fontsize=8)
+        tw = self._make_twin(ax, 'zeta', color='tab:purple')                                # 減衰比は範囲が狭いので線形の右軸
+        tw.plot(x, h[:, 1], 's-', color='tab:purple', ms=3, label='zeta')
+        tw.axhline(0.0, color='tab:purple', lw=0.8, ls=':')                                 # zeta=0: 振動モードの安定限界（下回ると振幅が増大する）
+        tw.axhline(1.0, color='tab:purple', lw=0.8, ls='--')                                # zeta=1: 臨界減衰（上回ると3実極で振動しない）
+        h1, l1 = ax.get_legend_handles_labels(); h2, l2 = tw.get_legend_handles_labels()   # 左軸・右軸の凡例要素を集める
+        ax.legend(h1 + h2, l1 + l2, fontsize=6, loc='best', ncol=4)                         # 左右の凡例をまとめて出す
+        self._setup_history_axis(ax, len(h), title)
 
-    # FF極値(t1, t2, y1, y2)の推移を描く関数
-    def _plot_extrema_history(self, ax, d, i):
-        h = d['hist_ext'][:, i, :]                                                           # (履歴数, 4) = t1,y1,t2,y2
-        x = np.arange(len(h))
-        ax.plot(x, h[:, 0], 'o-', color='tab:blue', markersize=3, label='t1')                # 1つ目の極値時刻
-        ax.plot(x, h[:, 2], 'o--', color='tab:cyan', markersize=3, label='t2')               # 2つ目の極値時刻
-        ax.set_ylabel('t1, t2 [s]'); ax.set_ylim(0, float(d['T']))
-        ax2 = self._make_twin(ax, 'y1, y2 [PWM]')                                            # 右軸に極値の大きさ
-        ax2.plot(x, h[:, 1], 's-', color='tab:red', markersize=3, label='y1')
-        ax2.plot(x, h[:, 3], 's--', color='tab:orange', markersize=3, label='y2')
-        self._setup_history_axis(ax, len(h), 'FF extrema sent to robot')
-        self._add_legend(ax, twin=ax2, ncol=4)
+    # FF極値の推移を描く関数
+    def _plot_extrema_history(self, ax, d, i):                                              # 引数(描画先のグラフ, スナップショット, 自由度の添字)
+        ext = d['hist_ext'][:, i, :] if d['hist_ext'].size else np.zeros((0, 4))                # [t1, y1, t2, y2] の推移
+        n = len(ext); x = np.arange(n)                                                          # 内側ループ番号
+        if n:                                                                               # 履歴が1点でもある場合だけ描く
+            ax.plot(x, ext[:, 1], 'r.-', lw=1.0, ms=4, label='y1')                              # 1つ目の極値
+            ax.plot(x, ext[:, 3], 'b.-', lw=1.0, ms=4, label='y2')                              # 2つ目の極値
+            ax.axhline(0.0, color='k', lw=0.6)                                                  # 0線
+            tw = self._make_twin(ax, 't [s]', color='0.4')                                      # 右軸に極値時刻
+            tw.plot(x, ext[:, 0], '.--', color='0.4', lw=0.8, ms=3, label='t1')
+            tw.plot(x, ext[:, 2], '.--', color='0.7', lw=0.8, ms=3, label='t2')
+            h1, l1 = ax.get_legend_handles_labels(); h2, l2 = tw.get_legend_handles_labels()   # 左軸・右軸の凡例要素を集める
+            ax.legend(h1 + h2, l1 + l2, fontsize=6, loc='best')                             # 左右の凡例をまとめて出す
+        ax.set_ylabel('PWM', fontsize=8)
+        self._setup_history_axis(ax, n, 'FF extrema')
 
-    # 評価関数値Jの推移を描く関数
-    def _plot_cost_history(self, ax, d, i):
-        """J は常に「実測データと同定した目標モデルとの差」。Inner loop=0 は初回同定時のJ"""
-        x = np.arange(len(d['hist_J']))
-        ax.plot(x, d['hist_J'][:, i], 'o-', markersize=3, label='J (this DOF)')              # このDOFの評価関数値
-        ax.set_yscale('log'); ax.set_ylabel('Squared error (log)')
-        self._setup_history_axis(ax, len(x), 'J = actual vs target model')
-        self._add_legend(ax, ncol=1)
+    # 評価関数の推移を描く関数
+    def _plot_cost_history(self, ax, d, i):                                                 # 引数(描画先のグラフ, スナップショット, 自由度の添字)
+        hJ = d['hist_J'][:, i] if d['hist_J'].size else np.zeros(0)                             # このDOFの評価関数値の推移
+        tot = d['hist_total_J']; best = d['hist_best_J']                                        # 全DOF合計J・ベストJ の推移
+        n = len(hJ); x = np.arange(n)                                                           # 内側ループ番号
+        if n:                                                                               # 履歴が1点でもある場合だけ描く
+            ax.semilogy(x, np.maximum(hJ, 1e-12), 'k.-', lw=1.2, ms=4, label='J (this DOF)')    # このDOFのJ
+            ax.semilogy(x, np.maximum(tot, 1e-12), 'b.--', lw=0.9, ms=3, label='J (all opt DOF)')  # 合計J
+            ax.semilogy(x, np.maximum(best, 1e-12), 'r.:', lw=0.9, ms=3, label='best J')         # ベストJ
+            if 'threshold_J' in d:                                                               # 収束判定閾値
+                ax.axhline(float(d['threshold_J']), color='g', lw=0.8, ls='-.')
+            ax.legend(fontsize=6, loc='best')                                                   # 凡例（重ならない位置へ自動配置）
+        ax.set_ylabel('J = sum (meas - target)^2', fontsize=8)
+        self._setup_history_axis(ax, n, 'Cost history')
 
-    # ------------------------------------------------------------------
-    # 終了時のグラフ保存
-    # ------------------------------------------------------------------
-    def save_all(self):
-        """蓄積したスナップショットから、自由度ごと・外側ループごとにグラフを保存する。
+    # 数値を安全に文字列へ整形する関数
+    @staticmethod
+    def _num(v, fmt='{:14.4g}'):                                                                  # 引数(値, 書式)
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return f"{'n/a':>14s}"
+        return f"{'n/a':>14s}" if not np.isfinite(f) else fmt.format(f)
+
+    # スナップショットに無い項目を NaN として取り出す関数
+    @staticmethod
+    def _get(d, key, i):                                                                          # 引数(スナップショット, 項目名, 自由度の添字)
+        return d[key][i] if key in d else np.nan
+
+    # 左の数値一覧を更新する関数
+    def _update_text(self, d, i):                                                           # 引数(スナップショット, 自由度の添字)
+        num = self._num                                                                           # 整形関数の別名
+        opt = self._is_opt(d, i)                                                                  # この自由度が最適化対象か
+        ff = d['ff'][i]; ext = d['extrema'][i]                                                     # 印加したFFのパラメータと極値
+        lines = [
+            f" DOF {i + 1:02d}   {'OPTIMIZED' if opt else 'measurement only'}",
+            f" session {str(d['session'])}",
+            f" outer {int(d['outer'])}/{int(d['max_outer'])}   inner {int(d['inner'])}/{int(d['max_inner'])}",
+            f" opt DOF = {list(np.asarray(d['opt_dof']).ravel()) if 'opt_dof' in d else '?'}",
+            "",
+            " [Motion]",
+            f"   Pi            {num(d['Pi'][i])} count",
+            f"   Pf            {num(d['Pf'][i])} count",
+            f"   step          {num(float(d['Pf'][i]) - float(d['Pi'][i]))} count",
+            f"   T             {num(d['T'])} s",
+            f"   dt (CTRL_DT)  {num(d['dt']) if 'dt' in d else '':>14s} s",
+            "",
+            " [Applied FF]  f(t)=a t^5+..+e t",
+            f"   a             {num(ff[0], '{:14.4e}')}",
+            f"   b             {num(ff[1], '{:14.4e}')}",
+            f"   c             {num(ff[2], '{:14.4e}')}",
+            f"   d             {num(ff[3], '{:14.4e}')}",
+            f"   e             {num(ff[4], '{:14.4e}')}",
+            f"   t1 / y1       {num(ext[0], '{:6.3f}')} /{num(ext[1], '{:7.2f}')}",
+            f"   t2 / y2       {num(ext[2], '{:6.3f}')} /{num(ext[3], '{:7.2f}')}",
+            f"   fit residual  {num(d['fit_res'][i])}",
+            f"   fit mode      {FIT_MODE_TEXT.get(int(d['fit_mode'][i]), '?'):>14s}",
+        ]
+        if opt:
+            lines += [
+                "",
+                " [Identified models]",
+                f"   tgt T1 / wn   {num(d['tgt_params_id'][i][0], '{:6.3f}')} /{num(d['tgt_params_id'][i][1], '{:7.3f}')}",
+                f"   sys T1        {num(d['sys_params_id'][i][0])}",
+                f"   sys zeta      {num(d['sys_params_id'][i][1])}",
+                f"   sys wn        {num(d['sys_params_id'][i][2])}",
+                f"   sys b0        {num(d['sys_params_id'][i][3])}",
+                f"   id residual   {num(d['id_res_sys'][i])}",
+                "",
+                " [ADRC replica]  vs measured (identification)",
+                f"   POT rms       {num(self._get(d, 'id_res_pot', i))} count",
+                f"   u_ADRC rms    {num(self._get(d, 'id_res_pwm', i))} PWM",
+                f"   z3 rms        {num(self._get(d, 'id_res_z3', i))}",
+                f"   u_ADRC before {num(d['adrc_res_open'][i])} PWM",
+                f"   closed-loop   {'adopted' if float(d['cl_ok'][i]) > 0.5 else 'NO':>14s}",
+                f"   kick meas/th  {num(d['adrc_kick'][i])}",
+                f"   delay         {num(d['adrc_delay'][i], '{:14.0f}')} samples",
+                f"   rho(A_cl)     {num(d['cl_radius'][i], '{:14.5f}')}",
+                "",
+                " [Cost weighting]",
+                f"   k_s (settle)  {num(d['k_s'][i], '{:14.0f}')} samples",
+                f"   k_s time      {num(float(d['k_s'][i]) * float(d['dt'])) if 'dt' in d else '':>14s} s",
+                f"   FF update     {'accepted' if float(d['accept'][i]) > 0.5 else 'SKIPPED':>14s}",
+            ]
+        lines += [
+            "",
+            " [Cost]  J = sum (measured - target)^2",
+            f"   J (this DOF)  {num(d['J'][i], '{:14.4e}')}",
+            f"   J (all opt)   {num(d['total_J'], '{:14.4e}')}",
+            f"   Best J        {num(d['best_J'], '{:14.4e}')}",
+        ]
+
+        self.text.configure(state=tk.NORMAL)                                                      # 一時的に書き込み可能にする
+        self.text.delete("1.0", tk.END)                                                           # 内容を消す
+        self.text.insert(tk.END, "\n".join(lines))                                                # 数値一覧を書き込む
+        self.text.configure(state=tk.DISABLED)                                                    # 読み取り専用へ戻す
+
+    # 蓄積したスナップショットから、自由度ごと・外側ループごとにグラフを保存する関数
+    def save_all(self):                                                                     # 引数なし（終了時に main() から呼ばれる）
+        """終了時に、貯めておいた全スナップショットからグラフをPNGとして保存する。
 
         保存先は  <実行ディレクトリ>/YYYYMMDD_HHMMSS/DOF01/OuterLoop00/*.png
-          ・time_pot_InnerLoopNN.png / time_pwm_InnerLoopNN.png … 内側ループごとに1枚ずつ
-          ・inner_model / inner_system / inner_extrema / inner_error … その外側ループの
-            最後のスナップショット（＝終了・中断時点の最新の履歴グラフ）から1枚ずつ
+          ・time_pot_InnerLoopNN.png / time_pwm_InnerLoopNN.png / time_adrc_InnerLoopNN.png /
+            time_simPWM_InnerLoopNN.png
+              … 内側ループごとに1枚ずつ（_record で貯めたスナップショットを1つずつ描く）
+          ・inner_cost / inner_extrema / inner_model / inner_system
+              … その外側ループの最後のスナップショット（＝終了・中断時点の最新の履歴グラフ）から1枚ずつ
         画面表示と同じ描画関数を使うので、保存された図は画面で見えていた図と一致する。
         画面用とは別に保存専用の Agg の図を使うため、Tkが閉じた後でも動く。
         """
-        if self.save_dir is None:
+        if not self.save_dir:                                                                     # 保存先が指定されていない場合
             return
-        if not self.records:
+        if not self.records:                                                                      # スナップショットを1度も読み込めなかった場合
             print("保存するデータがありません（スナップショットを1度も読み込んでいません）。")
             return
 
-        fig = Figure(figsize=SAVE_FIGSIZE, dpi=SAVE_DPI)                                     # 保存専用の図（使い回して高速化）
-        FigureCanvasAgg(fig)                                                                 # レンダラを持たせる
-        total = sum((3 * len(r['snaps']) + 4) * N_DOF for r in self.records.values())        # 保存するファイル総数
-        done = 0
-        t0 = time.perf_counter()
+        per_inner = [p for p in self.PANELS if p[3] == 'inner']                                   # 内側ループごとに1枚ずつ保存するグラフ
+        per_outer = [p for p in self.PANELS if p[3] == 'outer']                                   # 外側ループごとに1枚ずつ保存する履歴グラフ
+
+        fig = Figure(figsize=SAVE_FIGSIZE, dpi=SAVE_DPI)                                          # 保存専用の図（使い回して高速化）
+        FigureCanvasAgg(fig)                                                                      # 画像保存専用のキャンバスを結び付ける
+        total = sum((len(per_inner) * len(r['snaps']) + len(per_outer)) * N_DOF_ALL                # 保存するファイル総数
+                    for r in self.records.values())
+        done, t0 = 0, time.perf_counter()                                                         # 保存した枚数と開始時刻
         print(f"\nグラフを保存します: {self.save_dir}  （{total} ファイル）")
 
-        for outer in sorted(self.records):
-            snaps = self.records[outer]['snaps']                                             # {内側ループ番号: スナップショット}
-            inners = sorted(snaps)                                                           # その外側ループで記録できた内側ループ
-            last = snaps[inners[-1]]                                                         # 履歴グラフ用の最新スナップショット
-            for i in range(N_DOF):
+        for outer in sorted(self.records):                                                        # 外側ループごとに処理する
+            snaps = self.records[outer]['snaps']                                                  # {内側ループ番号: スナップショット}
+            inners = sorted(snaps)                                                                # その外側ループで記録できた内側ループ
+            last = snaps[inners[-1]]                                                              # 履歴グラフ用の最新スナップショット
+            for i in range(N_DOF_ALL):                                                            # 全自由度ループ
                 folder = os.path.join(self.save_dir, f"DOF{i + 1:02d}", f"OuterLoop{outer - 1:02d}")
-                os.makedirs(folder, exist_ok=True)
+                os.makedirs(folder, exist_ok=True)                                                # 無ければ作る
 
-                for inner in inners:                                                         # 内側ループごとに Time-POT / Time-PWM / ADRC照合 を1枚ずつ
-                    d = snaps[inner]
-                    tag = f"InnerLoop{inner - 1:02d}"                                        # 履歴グラフの横軸と同じ0始まりの番号
-                    self._save_fig(fig, folder, f"time_pot_{tag}.png",
-                                   lambda ax, d=d, i=i, inner=inner: self._titled(
-                                       ax, self._plot_response, d, i, inner))
-                    self._save_fig(fig, folder, f"time_pwm_{tag}.png",
-                                   lambda ax, d=d, i=i, inner=inner: self._titled(
-                                       ax, self._plot_input, d, i, inner))
-                    self._save_fig(fig, folder, f"time_adrc_{tag}.png",
-                                   lambda ax, d=d, i=i, inner=inner: self._titled(
-                                       ax, self._plot_adrc, d, i, inner))
-                    done += 3
+                for inner in inners:                                                              # 内側ループごとに1枚ずつ保存する
+                    d = snaps[inner]                                                              # その内側ループのスナップショット
+                    tag = f"InnerLoop{inner - 1:02d}"                                             # 履歴グラフの横軸と同じ0始まりの番号
+                    for name, func_name, n_rows, _ in per_inner:                                  # グラフごとに保存する
+                        self._save_fig(fig, folder, f"{name}_{tag}.png", func_name, n_rows, d, i,
+                                       f"DOF {i + 1:02d}  {tag}")
+                        done += 1
 
-                for fname, draw in (                                                         # 履歴グラフは外側ループごとに1枚ずつ
-                    ('inner_model.png',   self._plot_target_history),
-                    ('inner_system.png',  self._plot_system_history),
-                    ('inner_extrema.png', self._plot_extrema_history),
-                    ('inner_error.png',   self._plot_cost_history),
-                ):
-                    self._save_fig(fig, folder, fname, lambda ax, f=draw: f(ax, last, i))
+                for name, func_name, n_rows, _ in per_outer:                                      # 履歴グラフは外側ループごとに1枚ずつ
+                    self._save_fig(fig, folder, f"{name}.png", func_name, n_rows, last, i,
+                                   f"DOF {i + 1:02d}  OuterLoop{outer - 1:02d}")
                     done += 1
 
-            print(f"  OuterLoop{outer - 1:02d}: DOF01-{N_DOF:02d} 完了  ({done}/{total})")
+            print(f"  OuterLoop{outer - 1:02d}: DOF01-{N_DOF_ALL:02d} 完了  ({done}/{total})")
 
         print(f"保存完了: {self.save_dir}  （{done} ファイル / {time.perf_counter() - t0:.1f} 秒）")
 
     # 保存用: 図を作り直して1枚保存する関数
-    @staticmethod
-    def _save_fig(fig, folder, fname, draw):                                                 # 引数(使い回す図, 保存先, ファイル名, 描画関数)
-        fig.clear()                                                                          # 前の図（右軸・凡例含む）を消す
-        draw(fig.add_subplot(111))
-        fig.tight_layout()
-        fig.savefig(os.path.join(folder, fname))
+    def _save_fig(self, fig, folder, fname, func_name, n_rows, d, i, title):                      # 引数(使い回す図, 保存先, ファイル名, 描画関数名, 段数, スナップショット, 自由度の添字, タイトル)
+        """画面用と同じ描画関数で1枚だけ描き、PNGへ保存する。
 
-    # 保存用: 画面用の描画関数を呼び、タイトルに内側ループ番号を足す関数
-    @staticmethod
-    def _titled(ax, plot_func, d, i, inner):                                                 # 引数(グラフ, 画面用の描画関数, スナップショット, 自由度の添字, 内側ループ番号)
-        plot_func(ax, d, i)
-        ax.set_title(f"{ax.get_title()}   [Inner loop {inner - 1}]", fontsize=10)
-
-    # ------------------------------------------------------------------
-    # 数値一覧パネル
-    # ------------------------------------------------------------------
-    def _update_text(self, d, i):
-        a, b, c, dd, e = d['ff'][i]
-        t1, y1, t2, y2 = d['extrema'][i]
-        T1_id, wn_id = d['tgt_params_id'][i]                                                 # 今回同定した目標モデル（Time-POTの破線）
-        T1s_id, zeta_id, wns_id, b0_id = d['sys_params_id'][i]                               # 今回同定したシステムモデル（Time-POTの点線）
-        T1_us, wn_us = d['tgt_params_used'][i]                                               # 今回のFFを作るのに使った目標モデル
-        T1s_us, zeta_us, wns_us, b0_us = d['sys_params_used'][i]                             # 今回のFFを作るのに使ったシステムモデル
-        Pi, Pf = float(d['Pi'][i]), float(d['Pf'][i])
-        restart = int(d['fit_restart'][i])                                                   # -1は退避形を使用, -2は初回同定で該当なし, -3はu_FF_opt≈0で探索不要
-        restart_msg = {                                                                      # 負値は回数ではなく状態を表すのでメッセージへ置き換える
-            -1: "  fallback used",
-            -3: "  zero u_FF_opt",
-        }.get(restart, f"{restart:14d}" if restart >= 0 else "             --")
-
-        def num(v, fmt):                                                                     # 値が無い（NaN）ときは -- と表示する関数
-            return f"{v:{fmt}}" if np.isfinite(v) else "            --"
-
-        lines = [
-            f" DOF {i + 1}   (POT array index {int(d['pot_idx'][i])})",
-            "=" * 44,
-            f" Outer loop      {int(d['outer'])} / {int(d['max_outer'])}",
-            f" Inner loop      {int(d['inner'])} / {int(d['max_inner'])}",
-            f" Updated         {str(d['time'])}",
-            "",
-            " [Position]",
-            f"   Initial   Pi  {Pi:14.2f}",
-            f"   Target    Pf  {Pf:14.2f}",
-            f"   Offset    y0  {Pi - Pf:14.2f}",
-            "",
-            " [Identified from this run]  -> Time-POT curves",
-            "   Target model  1/((T1 s+1)(s^2+2 wn s+wn^2))",
-            f"     T1          {T1_id:14.6f}",
-            f"     wn          {wn_id:14.6f}",
-            "   System model  b0/((T1 s+1)(s^2+2 zeta wn s+wn^2))",
-            f"     T1          {T1s_id:14.6f}",
-            f"     zeta        {zeta_id:14.6f}",
-            f"     wn          {wns_id:14.6f}",
-            f"     b0          {b0_id:14.4f}",
-            f"     ID residual {float(d['id_res_sys'][i]):14.4e}",
-            "",
-            " [Used for the applied FF]  -> history plots",
-            f"     T1          {num(T1_us, '14.6f')}",
-            f"     wn          {num(wn_us, '14.6f')}",
-            f"     T1(sys)     {num(T1s_us, '14.6f')}",
-            f"     zeta        {num(zeta_us, '14.6f')}",
-            f"     wn(sys)     {num(wns_us, '14.6f')}",
-            f"     b0          {num(b0_us, '14.4f')}",
-            "",
-            " [FF sent to robot]  f(t)=a t^5+...+e t",
-            f"   a             {a:14.4e}",
-            f"   b             {b:14.4e}",
-            f"   c             {c:14.4e}",
-            f"   d             {dd:14.4e}",
-            f"   e             {e:14.4e}",
-            f"   T             {float(d['T']):14.4f}",
-            "",
-            " [Extrema]  0 < t1 < t2 < T",
-            f"   t1            {t1:14.4f}",
-            f"   y1            {y1:14.2f}",
-            f"   t2            {t2:14.4f}",
-            f"   y2            {y2:14.2f}",
-            "",
-            " [Fit quality]",
-            f"   FF fit res.   {num(float(d['fit_res'][i]), '14.4e')}",
-            f"   CMA restarts  {restart_msg}",
-            "",
-        ]
-        if 'adrc_res' in d:                                                                  # 古いスナップショットには無いキー
-            lines += [
-                " [ADRC replica]  sim vs measured PWM",
-                f"   residual      {num(float(d['adrc_res'][i]), '14.4g')} PWM",
-                f"   before refine {num(float(d['adrc_res_open'][i]), '14.4g')} PWM",
-                f"   kick meas/th  {num(float(d['adrc_kick'][i]), '14.3f')}",
-                f"   delay         {num(float(d['adrc_delay'][i]), '14.0f')} samples",
-                f"   rho(A_cl)     {num(float(d['cl_radius'][i]), '14.4f')}",
-                f"   refined       {'yes' if float(d['cl_ok'][i]) > 0.5 else 'NO':>14s}",
-                "",
-            ]
-        lines += [
-            " [Cost]  J = actual vs target model",
-            f"   J (this DOF)  {float(d['J'][i]):14.4e}",
-            f"   J (all DOF)   {float(d['total_J']):14.4e}",
-            f"   Best J        {float(d['best_J']):14.4e}",
-        ]
-
-        self.text.configure(state=tk.NORMAL)                                                 # 一時的に書き込み可能にする
-        self.text.delete("1.0", tk.END)                                                      # 内容を消す
-        self.text.insert(tk.END, "\n".join(lines))                                           # 数値一覧を書き込む
-        self.text.configure(state=tk.DISABLED)                                               # 読み取り専用へ戻す
+        上下2段のグラフ（time_adrc / time_simPWM）は、時間軸を共有した2つの軸を縦に並べて描く。
+        余白は tight_layout ではなく subplots_adjust で明示的に指定する。右軸（twinx）を持つ
+        パネルでは軸ラベルのぶんだけ左右の余白が必要で、tight_layout はそれを確保しきれずに
+        「Tight layout not applied. The left and right margins cannot be made large enough to
+        accommodate all axes decorations.」という警告を出すため。余白を固定すれば警告は出ず、
+        グラフの内容そのものは一切変わらない。
+        """
+        fig.clear()                                                                               # 前の図（右軸・凡例含む）を消す
+        if n_rows == 1:                                                                           # 1段のグラフ
+            axes = [fig.add_subplot(111)]
+        else:                                                                                     # 上下2段のグラフ（時間軸を共有する）
+            ax0 = fig.add_subplot(211)
+            axes = [ax0, fig.add_subplot(212, sharex=ax0)]
+        for ax in axes:
+            ax._twins = []                                                                        # 右軸の記録を初期化する
+        try:
+            self._draw_panel(func_name, axes, d, i)                                               # 画面用と同じ描画関数を使う
+        except Exception:                                                                         # 描けないパネルは飛ばす（保存全体は続ける）
+            return
+        fig.suptitle(title, fontsize=9)                                                           # 図のタイトル
+        fig.subplots_adjust(hspace=SAVE_HSPACE, **SAVE_MARGIN)                                    # 余白を明示指定（tight_layoutの警告を出さない）
+        fig.savefig(os.path.join(folder, fname))                                                  # PNGへ保存
 
 
 # ==============================================================================
 # エントリーポイント
 # ==============================================================================
 def main(args=None):
-    path = sys.argv[1] if len(sys.argv) > 1 else SNAPSHOT_PATH                               # 引数でパスを上書きできる
-    save_dir = os.path.join(os.getcwd(), time.strftime('%Y%m%d_%H%M%S'))                     # 実行ディレクトリ直下・実行開始日時のフォルダ
+    path = sys.argv[1] if len(sys.argv) > 1 else SNAPSHOT_PATH                                    # 引数でパスを上書きできる
+    save_dir = os.path.join(os.getcwd(), time.strftime('%Y%m%d_%H%M%S'))                          # 実行ディレクトリ直下・実行開始日時のフォルダ
 
     print(f"【監視するスナップショット】 {path}")
-    print("test_code3.py 側で ENABLE_SNAPSHOT = True になっていることを確認してください。")
+    print("optimize_EL_ff_ROS2.py 側で ENABLE_SNAPSHOT = True になっていることを確認してください。")
     print(f"【終了時のグラフ保存先】 {save_dir}")
-    print("終了するには、この端末で Enter を押してください（ウィンドウを閉じても保存されます）。")
+    print("終了するには Ctrl+C を押すか、ウィンドウを閉じてください（どちらでも保存されます）。")
 
-    root = tk.Tk()                                                                           # Tkinterを起動
-    viewer = OptimizationViewer(root, path, save_dir)                                        # ビューアを生成
+    root = tk.Tk()                                                                                # Tkinterを起動
+    viewer = OptimizationViewer(root, path, save_dir)                                              # ビューアを生成
 
     # Ctrl+C（SIGINT）・kill（SIGTERM）でも保存してから終わるようにする
     #   Tkのmainloopは KeyboardInterrupt を握りつぶしてループを続けてしまうため、
@@ -695,13 +709,13 @@ def main(args=None):
         signal.signal(sig, on_signal)
 
     try:
-        root.mainloop()                                                                      # イベントループ開始
-    except KeyboardInterrupt:                                                                # 念のため（通常はシグナルハンドラ側で処理される）
+        root.mainloop()                                                                           # イベントループ開始
+    except KeyboardInterrupt:                                                                     # 念のため（通常はシグナルハンドラ側で処理される）
         pass
     finally:
-        viewer.save_all()                                                                    # 正常終了・中断のどちらでも必ず保存する
+        viewer.save_all()                                                                         # 正常終了・中断のどちらでも必ず保存する
         try:
-            root.destroy()                                                                   # ウィンドウを閉じる（既に閉じていれば何もしない）
+            root.destroy()                                                                        # ウィンドウを閉じる（既に閉じていれば何もしない）
         except tk.TclError:
             pass
 

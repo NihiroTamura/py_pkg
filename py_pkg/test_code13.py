@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""test_code7.py の評価関数の重みを自動チューニングするプログラム
+"""test_code11.py の評価関数の重みを自動チューニングするプログラム
 
-test_code7.py は離散時間オイラー・ラグランジュ法のコスト
+test_code11.py は離散時間オイラー・ラグランジュ法のコスト
     J = Σ e_k^T Q_k e_k + R Σ u_k² + R_du Σ (Δu_k)²
 の重みを手動で調整している。欲しいFF（実機で意味を持つ大きさの山と谷を持つ5次関数）を
 手作業で見つけるのは難しいため、本プログラムは重みを Optuna で自動探索する。
@@ -39,7 +39,31 @@ test_code7.py は離散時間オイラー・ラグランジュ法のコスト
   成分ごとに独立な比を持たせているのは、γ_v と γ_a を1変数にまとめると任意の
   (Q_pre, Q_post) の組を表現できず、手動値を初回トライアルとして正確に評価できなくなるためである。
 
-得られた重みは test_code7.py の COST_Q_PRE / COST_Q_POST / COST_R / COST_R_DU へ貼り替えて使う。
+得られた重みは test_code11.py の COST_Q_PRE / COST_Q_POST / COST_R / COST_R_DU へ貼り替えて使う。
+
+==============================================================================
+ test_code9.py（test_code7.py 用）からの変更点
+==============================================================================
+探索の考え方・必須条件・目的関数・探索変数の構成は test_code9.py から**変更していない**。
+Q は test_code11.py でも 3×3（位置・速度・加速度）のままなので、7変数
+（q_v, q_a, γ_p, γ_v, γ_a, R, R_du）がそのまま同じ意味を持つ。
+
+変わったのは、システムモデルの構造が可変になったことに伴う次の3点だけである。
+  1. JSONに **システムモデルの次数** を記録する
+       同じ実測データでも次数が違えば別のモデルなので、sys_order を保存する。読み込み時に、
+       いま test_code11.py に書かれている SYS_ORDER と一致するかを検証し、食い違っていれば
+       **エラーで止める**。ここを黙って通すと、探索結果がどの次数のものか分からなくなる。
+       （次数ごとに別のJSONを取れば、同じ実測データで 3次・4次・5次… を比較できる。）
+  2. 同定完了ログを生パラメータではなく **派生量** で出す
+       DCゲイン [count/PWM]・支配極の周波数 [Hz]・支配極の減衰比・等価むだ時間 [ms]。
+       次数に依らず読めるうえ、モデルが物理的に妥当かが直接分かる。
+       （b0 は分子定数であって DCゲインではなく、次数を上げると桁違いに大きくなるため。）
+  3. トライアル記録に dc_gain / dead_time を残す（トライアル間で不変だが、後から素性を追えるように）
+
+【重要】test_code7.py 用に求めた重み（COST_Q_* / COST_R / COST_R_DU）は流用できない。
+  誤差 e の速度・加速度成分の定義は test_code7.py と同じ「連続時間の真の微分」に戻っているので
+  重みの**意味**は揃っているが、システムモデルそのものが変わっているため**数値**は合わない。
+  必ずこのプログラムで探索し直すこと。次数を変えたときも同様である。
 """
 import os                                                       # ファイルパス操作を行う標準ライブラリ
 import sys                                                      # プログラム終了（sys.exit）を扱う標準ライブラリ
@@ -58,8 +82,8 @@ from rclpy.executors import MultiThreadedExecutor               # トピック�
 import tkinter as tk                                            # GUIライブラリ
 from tkinter import filedialog                                  # GUIでファイルやフォルダを選択するためのモジュール
 
-import py_pkg.test_code7 as tc7                                 # 最適制御本体（ソルバー・ROS2ノード・定数をすべて再利用する）
-from py_pkg.test_code7 import (                                 # よく使うものは直接取り込む
+import py_pkg.test_code11 as tc11                                 # 最適制御本体（ソルバー・ROS2ノード・定数をすべて再利用する）
+from py_pkg.test_code11 import (                                 # よく使うものは直接取り込む
     MathematicalSolver, OptimalControlSequencer, OPT_DOF_MASK, OPT_DOF_IDS, N_DOF_ALL,
     ADRC_KP, ADRC_KD, ADRC_INPUT_COEF, ADRC_OBS_POLE,
     CTRL_DT, SIM_TIME, PWM_LIMIT, STEP_MIN, GAP_WARN_RATIO,
@@ -68,7 +92,7 @@ from py_pkg.test_code7 import (                                 # よく使う�
 # ==============================================================================
 # チューニング対象の自由度と必須条件（チューニング要素）
 #   TUNE_DOF_IDS : 必須条件を課し、目的関数を評価する自由度番号（1始まり）。
-#                  test_code7.py の OPT_DOF_IDS ⊇ TUNE_DOF_IDS でなければならない
+#                  test_code11.py の OPT_DOF_IDS ⊇ TUNE_DOF_IDS でなければならない
 #                  （最適化していない自由度をチューニング対象にしても意味がないため、起動時に検証する）。
 #   極値の範囲   : 実機へ送る5次関数の 正の極大値 y1 と 負の極小値 y2 それぞれに課す範囲 [PWM]。
 #                  自由度ごとに TUNE_BAND_OVERRIDE で上書きできる。
@@ -98,14 +122,14 @@ TUNE_GV_RANGE = (1e-5, 1e2)                     # 探索範囲 γ_v（過渡区�
 TUNE_GA_RANGE = (1e-5, 1e2)                     # 探索範囲 γ_a（過渡区間の加速度重み / 整定区間の加速度重み）
 TUNE_R_RANGE = (1e-6, 1e3)                      # 探索範囲 R（FF入力の大きさへの重み。対数スケール）
 TUNE_R_DU_RANGE = (1e-4, 1e10)                  # 探索範囲 R_du（FF入力の変化量への重み。対数スケール）
-TUNE_SEED_MANUAL = True                         # Trueなら test_code7.py の手動値を初回トライアルとして必ず評価し、比較対象にする
+TUNE_SEED_MANUAL = True                         # Trueなら test_code11.py の手動値を初回トライアルとして必ず評価し、比較対象にする
 
 TUNE_DOF_IDX = sorted({int(v) - 1 for v in TUNE_DOF_IDS})                                       # 0始まりの添字へ変換（重複は除く）
 if not TUNE_DOF_IDX or TUNE_DOF_IDX[0] < 0 or TUNE_DOF_IDX[-1] >= N_DOF_ALL:                    # 書き間違いに気付かないまま実験するのを防ぐ
     raise ValueError(f"TUNE_DOF_IDS は 1～{N_DOF_ALL} の自由度番号を1つ以上指定してください: {TUNE_DOF_IDS!r}")
 if not all(OPT_DOF_MASK[d] for d in TUNE_DOF_IDX):                                              # 最適化していない自由度は探索しても意味がない
     raise ValueError(
-        f"TUNE_DOF_IDS {TUNE_DOF_IDS} は test_code7.py の OPT_DOF_IDS {OPT_DOF_IDS} に"
+        f"TUNE_DOF_IDS {TUNE_DOF_IDS} は test_code11.py の OPT_DOF_IDS {OPT_DOF_IDS} に"
         f"含まれている必要があります（最適化対象外の自由度はFFが常に0のため）"
     )
 
@@ -132,16 +156,16 @@ def build_weights(q_v, q_a, g_p, g_v, g_a, R, R_du):                            
     return Q_pre, Q_post, np.array([[float(R)]]), float(R_du)                                   # ソルバーへ渡す形で返す
 
 
-# test_code7.py の手動値を探索変数の形へ戻す関数
-def manual_params():                                                                            # 引数なし（test_code7.py の定数を読むだけ）
+# test_code11.py の手動値を探索変数の形へ戻す関数
+def manual_params():                                                                            # 引数なし（test_code11.py の定数を読むだけ）
     """TUNE_SEED_MANUAL=True のときに初回トライアルとして評価する、手動調整済みの重み。
 
-    test_code7.py の COST_Q_PRE / COST_Q_POST / COST_R / COST_R_DU を、
+    test_code11.py の COST_Q_PRE / COST_Q_POST / COST_R / COST_R_DU を、
     q_p_post ≡ 1 へ正規化してから7変数へ分解する。7変数は任意の (Q_pre, Q_post) を
     表現できるので、この分解は厳密であり、build_weights() で元の重みへ戻る。
     """
-    qpre = np.diag(tc7.COST_Q_PRE).astype(float)                                                # 過渡区間の重み [位置, 速度, 加速度]
-    qpost = np.diag(tc7.COST_Q_POST).astype(float)                                              # 整定区間の重み [位置, 速度, 加速度]
+    qpre = np.diag(tc11.COST_Q_PRE).astype(float)                                                # 過渡区間の重み [位置, 速度, 加速度]
+    qpost = np.diag(tc11.COST_Q_POST).astype(float)                                              # 整定区間の重み [位置, 速度, 加速度]
     s = qpost[0] if qpost[0] > 0 else 1.0                                                       # q_p_post = 1 にするための正規化係数
     return {
         'q_v': float(qpost[1] / s),                                                             # 整定区間の速度重み
@@ -149,8 +173,8 @@ def manual_params():                                                            
         'g_p': float(qpre[0] / s),                                                              # 過渡区間の位置重み / 整定区間の位置重み
         'g_v': float(qpre[1] / qpost[1]) if qpost[1] > 0 else 1.0,                              # 過渡区間の速度重み / 整定区間の速度重み
         'g_a': float(qpre[2] / qpost[2]) if qpost[2] > 0 else 1.0,                              # 過渡区間の加速度重み / 整定区間の加速度重み
-        'R': float(tc7.COST_R[0, 0] / s),                                                       # FF入力の大きさへの重み
-        'R_du': float(tc7.COST_R_DU / s),                                                       # FF入力の変化量への重み
+        'R': float(tc11.COST_R[0, 0] / s),                                                       # FF入力の大きさへの重み
+        'R_du': float(tc11.COST_R_DU / s),                                                       # FF入力の変化量への重み
     }
 
 
@@ -158,9 +182,9 @@ def manual_params():                                                            
 # 実測データを1回だけ取得して同定結果をJSONへ保存するROS2ノード
 # ==============================================================================
 class ModelCaptureSequencer(OptimalControlSequencer):
-    """test_code7.py のノードをそのまま使い、最適化パイプラインだけ「同定して保存」に差し替える。
+    """test_code11.py のノードをそのまま使い、最適化パイプラインだけ「同定して保存」に差し替える。
 
-    通信仕様・状態機械・データ収集・欠測判定・保持PWM/z3の取得はすべて test_code7.py と同一である
+    通信仕様・状態機械・データ収集・欠測判定・保持PWM/z3の取得はすべて test_code11.py と同一である
     （継承しているので実装も共有される）。ロボットを動かすのはこのノードの1周だけ。
     """
 
@@ -228,8 +252,8 @@ class ModelCaptureSequencer(OptimalControlSequencer):
                     z3_meas = np.where(gap_z3_24[dof_idx], np.nan, z3_meas)
                 adrc = (ADRC_KP[dof_idx], ADRC_KD[dof_idx], ADRC_INPUT_COEF[dof_idx], ADRC_OBS_POLE[dof_idx])  # ADRCパラメータ
 
-                tgt = solver.fit_target_model(y_shifted, y0)                                    # 目標モデルの同定
-                sysp = solver.fit_system_model(z_data, u_ident, 0.0)                            # システムモデルの開ループ同定
+                tgt = solver.fit_target_model(y_shifted, y0)                                    # 目標モデルの同定 [T1, wn, nk_tgt]
+                sysp = solver.fit_system_model(z_data, u_ident, 0.0)                            # システムモデルの開ループ同定 θ
                 cl_skip = (pwm_24[dof_idx] is None) or (gap_24[dof_idx].mean() > GAP_WARN_RATIO)  # 仕上げを行えない自由度か判定
                 if not cl_skip:                                                                 # 仕上げを行える場合
                     u_adrc_meas = u_pwm - u_ff                                                  # 実測ADRC出力（絶対PWM）
@@ -239,10 +263,13 @@ class ModelCaptureSequencer(OptimalControlSequencer):
                 else:
                     cl_ok = False                                                               # 仕上げなし
 
+                derived = solver.sys_derived(sysp)                                              # [DCゲイン, 支配極の周波数[Hz], 支配極の減衰比, むだ時間[s]]
                 entry.update({                                                                  # 同定結果を記録する
                     'valid': True,                                                              # 探索に使える自由度
-                    'tgt_params': [float(v) for v in tgt],                                      # 目標モデル [T1, wn]
-                    'sys_params': [float(v) for v in sysp],                                     # システムモデル [T1, zeta, wn, b0]
+                    'tgt_params': [float(v) for v in tgt],                                      # 目標モデル [T1, wn, nk_tgt]
+                    'sys_params': [float(v) for v in sysp],                                     # システムモデル θ=[T1,zeta,wn,tau,b0]（次数によらず5要素）
+                    'sys_struct': [float(v) for v in solver.sys_struct(sysp)],                  # モデル構造 [次数, 遅れ連鎖の長さ, 0, 0]
+                    'sys_derived': [float(v) for v in derived],                                 # モデルの派生量（読みやすさのため保存する）
                     'u_hold': float(u_hold),                                                    # 初期姿勢の保持PWM
                     'z3_init': (float(z3_init) if z3_init is not None else None),                # ζ3(0) に使う実測 z3(0⁻)
                     'cl_ok': bool(cl_ok),                                                       # 閉ループ同定の仕上げを採用したか
@@ -250,11 +277,18 @@ class ModelCaptureSequencer(OptimalControlSequencer):
                     'u_ident': [float(v) for v in u_ident],                                     # 同定入力（参考用）
                     'z3_meas': [float(v) for v in z3_meas],                                     # 実測 z3（参考用。欠測はNaN）
                 })
-                self.get_logger().info(
-                    f"DOF {dof_idx + 1:02d} 同定完了: tgt=[{tgt[0]:.4f}, {tgt[1]:.4f}]  "
-                    f"sys=[{sysp[0]:.5f}, {sysp[1]:+.3f}, {sysp[2]:.3f}, {sysp[3]:.1f}]  "
+                self.get_logger().info(                                                         # モデル構造が可変なので、生パラメータではなく派生量でログに出す
+                    f"DOF {dof_idx + 1:02d} 同定完了: tgt=[T1={tgt[0]:.4f}, wn={tgt[1]:.4f}]  "
+                    f"sys[{tc11.SYS_ORDER}次, 遅れ連鎖{solver.chain_len()}個, τ={sysp[3]*1e3:.1f} ms]: "
+                    f"DCゲイン={derived[0]:.3f} count/PWM, "
+                    f"支配極={derived[1]:.3f} Hz (ζ={derived[2]:.3f}), 等価むだ時間={derived[3] * 1e3:.1f} ms  "
                     f"u_hold={u_hold:.2f}  z3(0⁻)={entry['z3_init']}  仕上げ={'採用' if cl_ok else '不採用'}"
                 )
+                if solver.model_health(sysp):                                                   # 同定が破綻している兆候があれば残す
+                    self.get_logger().warn(
+                        f"DOF {dof_idx + 1:02d}: 同定結果に異常の兆候があります "
+                        f"({', '.join(solver.model_health(sysp))})"
+                    )
                 models.append(entry)                                                            # この自由度の同定結果を積む
 
             self.models = models                                                                # 同定結果を保持する
@@ -301,7 +335,9 @@ def save_identified_models(path, T, dt, initial_pot, target_pot, models):       
     """モード2で読み込めば、ロボットを動かさずに再探索できる"""
     payload = {
         'T': float(T), 'dt': float(dt), 'sim_time': float(SIM_TIME),                            # FF制御入力時間・刻み・評価時間
-        'ctrl_dt': float(CTRL_DT), 'eso_dt': float(tc7.ESO_DT),                                 # 実機の制御周期・ESOの式の中の係数（再現性のため残す）
+        'ctrl_dt': float(CTRL_DT), 'eso_dt': float(tc11.ESO_DT),                                 # 実機の制御周期・ESOの式の中の係数（再現性のため残す）
+        # ---- システムモデルの構成（これが違えば別のモデルなので、読み込み時に検証する） ----
+        'sys_order': int(tc11.SYS_ORDER),                                                       # システムモデルの次数 n（遅れ連鎖の長さは n-3）
         'initial_pot': [float(v) for v in initial_pot],                                         # 初期姿勢（26要素）
         'target_pot': [float(v) for v in target_pot],                                           # 目標値（26要素）
         'tune_dof': list(TUNE_DOF_IDS),                                                         # このとき同定したチューニング対象の自由度
@@ -337,6 +373,28 @@ class WeightTuner:
         self.dofs = [d for d in TUNE_DOF_IDX if self.models[d].get('valid')]                    # 探索に使える自由度
         if not self.dofs:                                                                       # 1つも使えない場合
             raise ValueError("JSONに探索へ使える自由度がありません（valid な自由度が1つもない）")
+
+        # ---- システムモデルの次数の整合を確認する（違う次数のJSONを黙って使わない） ----
+        #   同じ実測データでも次数が違えば別のモデルである。JSONを同定したときの次数と、いま
+        #   test_code11.py に書かれている SYS_ORDER が食い違ったまま探索すると、どの次数に
+        #   対する重みなのか分からない結果が出てしまう。必ず止める。
+        want = int(tc11.SYS_ORDER)                                                              # いまの次数
+        got = int(payload.get('sys_order', want))                                               # JSONを同定したときの次数
+        if want != got:                                                                         # 次数が食い違っている場合
+            raise ValueError(
+                f"JSONのシステムモデル次数と test_code11.py の設定が一致しません。\n"
+                f"  JSON           : SYS_ORDER={got}\n"
+                f"  test_code11.py : SYS_ORDER={want}\n"
+                f"  test_code11.py の SYS_ORDER を {got} に戻すか、この次数で同定し直してください"
+            )
+        self.sys_order = got                                                                    # 記録・表示用
+        for d in self.dofs:                                                                     # 探索に使う自由度の並びを検算する
+            n_got = len(self.models[d]['sys_params'])
+            if n_got != tc11.SYS_PARAM_SLOTS:                                                   # θ = [T1, zeta, wn, tau, b0] の5要素のはず
+                raise ValueError(
+                    f"DOF {d + 1:02d}: JSONの sys_params の長さ {n_got} が、期待される "
+                    f"{tc11.SYS_PARAM_SLOTS} と一致しません（同定し直してください）"
+                )
         self.best = None                                                                        # 最良トライアルの記録
         self.trials = []                                                                        # 全トライアルの記録
 
@@ -387,7 +445,7 @@ class WeightTuner:
             t1, y1, t2, y2 = [float(v) for v in extrema]                                        # 近似後FFの極値
             b1, b2 = self.band_of(dof_idx)                                                      # この自由度の許容範囲
             v_dof = self.band_distance(y1, b1) + self.band_distance(y2, b2)                     # 帯からの外れ量
-            if info['fit_mode'] not in (0, 1, 2) or y1 <= 0.0 or y2 >= 0.0:                     # 極値条件を満たしていない・山谷になっていない（2=極値一致, 0=L²射影, 1=窓付き）
+            if info['fit_mode'] not in (0, 1) or y1 <= 0.0 or y2 >= 0.0:                        # 極値条件を満たしていない・山谷になっていない
                 v_dof += abs(b1[1] - b1[0]) + abs(b2[1] - b2[0])                                # 帯幅ぶんの追加ペナルティ
             total_J += J_ff                                                                     # 目的関数へ加算
             violation += v_dof                                                                  # 違反量へ加算
@@ -397,6 +455,8 @@ class WeightTuner:
                 'fit_mode': int(info['fit_mode']), 'cl_radius': float(info['cl_radius']),
                 'k_s': int(info['k_s']), 'ff': [float(v) for v in ff],
                 'u_ff_opt_max': float(np.max(u_ff_opt)), 'u_ff_opt_min': float(np.min(u_ff_opt)),
+                'dc_gain': float(info['sys_derived'][0]),                                       # モデルのDCゲイン（トライアル間で不変。記録として残す）
+                'dead_time': float(info['sys_derived'][3]),                                     # 等価むだ時間 (n-3)*tau [s]（同上）
             })
 
         scale = max(abs(TUNE_Y1_BAND[1]), abs(TUNE_Y2_BAND[0]), 1.0)                            # ペナルティの正規化スケール
@@ -486,17 +546,20 @@ class WeightTuner:
         print("\n" + "=" * 78)
         print(f"  最良トライアル #{b['number']}   目的関数 J = {b['J']:.6g}   {verdict}")
         print("=" * 78)
-        print("  test_code7.py へ貼り替える値:")
+        print("  test_code11.py へ貼り替える値:")
         s_qv, s_qa = p['q_v'], p['q_a']                                                         # 整定区間の速度・加速度重み
         print(f"    COST_Q_PRE  = np.diag([{p['g_p']:.6g}, {p['g_v'] * s_qv:.6g}, {p['g_a'] * s_qa:.6g}])")
         print(f"    COST_Q_POST = np.diag([1.0, {s_qv:.6g}, {s_qa:.6g}])")
         print(f"    COST_R      = np.array([[{p['R']:.6g}]])")
         print(f"    COST_R_DU   = {p['R_du']:.6g}")
-        print("\n  自由度ごとの結果:")
+        print(f"\n  （このとき使ったシステムモデル: SYS_ORDER = {self.sys_order} 次）")
+        print("  自由度ごとの結果:")
         for q in b['per_dof']:
             print(f"    DOF {q['dof']:02d}: J={q['J']:.6g}  極値 ({q['t1']:.3f}, {q['y1']:+.2f}) / "
                   f"({q['t2']:.3f}, {q['y2']:+.2f})  ρ(A_cl)={q['cl_radius']:.5f}  "
                   f"k_s={q['k_s']}  fit={q['fit_mode']}  違反量={q['violation']:.4g}")
+            print(f"            model: DCゲイン={q['dc_gain']:.3f} count/PWM  "
+                  f"等価むだ時間={q['dead_time'] * 1e3:.1f} ms")
         print("=" * 78 + "\n")
 
 
@@ -506,7 +569,7 @@ class WeightTuner:
 
 # モード1: ロボットを1回だけ動かして同定結果をJSONへ保存する関数
 def capture_models_from_robot(json_path, T, args=None):                                         # 引数(保存先JSON, FF制御入力時間, ROS2引数)
-    """test_code7.py と同じ通信・データ収集で実測データを1回だけ取得し、同定してJSONへ保存する"""
+    """test_code11.py と同じ通信・データ収集で実測データを1回だけ取得し、同定してJSONへ保存する"""
     rclpy.init(args=args)                                                                       # ROS2の初期化
     node = ModelCaptureSequencer(json_path, T)                                                  # 同定専用ノードの生成
     executor = MultiThreadedExecutor(num_threads=17)                                            # 購読15 + タイマー1 + 余裕1

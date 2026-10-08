@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""test_code7.py（ADRC＋FF最適制御）の最適化ビューア
+"""test_code11.py（ADRC＋FF最適制御・n次遅れ系版）の最適化ビューア
 
-test_code7.py が内側ループごとに書き出す .npz スナップショットの更新時刻を監視し、
+test_code11.py が内側ループごとに書き出す .npz スナップショットの更新時刻を監視し、
 更新されていれば読み直して再描画する別プロセスのプログラム。最適化本体を止めないよう、
 描画はこちらのプロセスだけで行う。
 
   起動: python3 <このファイル>              （引数でスナップショットのパスを上書きできる）
-        ros2 run py_pkg test_code8
+        ros2 run py_pkg test_code12
 
 表示する8種類のグラフ（画面は2行4列。time_adrc と time_simPWM は枠の中を上下2段に分ける）
   1. time_pot      応答（Time-POT）。Q_k の切替時刻 k_s と ±10% 帯も描く
@@ -16,11 +16,22 @@ test_code7.py が内側ループごとに書き出す .npz スナップショッ
   5. inner_cost    評価関数の推移
   6. inner_extrema 印加したFF極値の推移
   7. inner_model   u_opt の計算に使った目標モデル（T1, wn）の推移（test_code5.py と同じ表示）
-  8. inner_system  u_opt の計算に使ったシステムモデル（T1, zeta, wn, b0）の推移（test_code5.py と同じ表示）
+  8. inner_system  u_opt の計算に使ったシステムモデル（T1, zeta, wn, tau, b0）の推移（test_code5.py と同じ表示）
   最適化対象外の自由度は表示枠を保ったまま実測POT値だけを描く。
 
-監視するパスは test_code3.py が使う /tmp/el_optimization_snapshot.npz とは分けてある
-（同時に起動したときに互いのスナップショットを誤読しないようにするため）。
+test_code8.py（test_code7.py 用ビューア）からの変更点は、システムモデルの次数が可変になったことに
+伴う2箇所だけである。
+  1. inner_system（_plot_system_history）
+       θ = [T1, zeta, wn, tau, b0] は次数によらず5要素なので、遅れ連鎖の時定数 tau も
+       T1・wn・b0 と同じ symlog 軸に載せる。遅れ連鎖が無い（n=3）ときの tau は式に現れない
+       ダミー値なので描かない。
+  2. 数値一覧の [Identified models] 節（_sys_model_lines）
+       システムモデルの次数が可変になったので、sys_struct = [次数 n, 遅れ連鎖の長さ n-3, 0, 0]
+       と、次数に依らない派生量 [DCゲイン, 支配極の周波数, 支配極の減衰比, 等価むだ時間] を
+       併せて表示する。目標モデルは test_code7.py と同じ [T1, wn] の2要素である。
+
+監視するパスは test_code7.py 用（..._v7.npz）や test_code3.py 用（/tmp/el_optimization_snapshot.npz）
+とは分けてある（同時に起動したときに互いのスナップショットを誤読しないようにするため）。
 
 日本語フォントが入っていない環境では matplotlib のラベルが □ になるため、
 画面上の文字はすべて英語にしている（コメントは日本語のまま）。
@@ -43,11 +54,11 @@ from matplotlib.figure import Figure                            # pyplotを使�
 import tkinter as tk                                            # GUIライブラリ
 from tkinter import ttk                                         # Tkinterのテーマ付きウィジェット
 
-SNAPSHOT_PATH = "/tmp/el_optimization_snapshot_v7.npz"          # 監視するスナップショット（test_code7.py 側と同じパスにすること）
+SNAPSHOT_PATH = "/tmp/el_optimization_snapshot_v11.npz"         # 監視するスナップショット（test_code11.py 側と同じパスにすること）
 POLL_MS = 400                                                   # スナップショットの更新を確認する間隔 [ms]
 N_DOF_ALL = 24                                                  # 表示する自由度の総数
 PWM_LIMIT = 255.0                                               # 実機PWMの絶対上限 [PWM]（グラフの補助線に使う）
-SETTLE_BAND = 0.10                                              # 整定判定の帯幅（test_code7.py の SETTLE_BAND と合わせること）
+SETTLE_BAND = 0.10                                              # 整定判定の帯幅（test_code11.py の SETTLE_BAND と合わせること）
 
 # ==============================================================================
 # 終了時に保存するグラフの設定
@@ -65,10 +76,9 @@ SAVE_DPI = 100                                                  # 保存する�
 SAVE_MARGIN = dict(left=0.13, right=0.87, top=0.90, bottom=0.13)  # 保存する図の余白（左右に軸ラベルぶんを確保する）
 SAVE_HSPACE = 0.45                                              # 上下2段のグラフを保存するときの段の間隔（各段の見出しが重ならない幅）
 
-# 5次フィットの経路を表す値と、その意味（test_code7.py の last_fit_mode と対応）
+# 5次フィットの経路を表す値と、その意味（test_code11.py の last_fit_mode と対応）
 FIT_MODE_TEXT = {
-    2: "extrema match",                                         # u_FF の2極値を u_FF_opt の最初の2ピークのあたりに通した（正常）
-    0: "L2 projection",                                         # 閉形式の最小二乗で決まった（目標ピークが2個そろわないとき）
+    0: "L2 projection",                                         # 閉形式の最小二乗で決まった（正常）
     1: "extrema param (windowed LS)",                           # 極値(t1,t2,y1,y2)を座標にして、最初の2極値が入る窓の中で最小二乗を解いた解
     -1: "FAILED -> seed shape",                                 # 退避経路でも見つからず初期励振形へ退避した
     -2: "n/a",                                                  # 該当なし（初回同定など）
@@ -106,7 +116,7 @@ class OptimizationViewer:
         self.quit_requested = False                                                         # シグナルで終了を要求されたか
         self.records = {}                                                                   # 保存用に蓄積したスナップショット {外側ループ番号: {'snaps': {内側ループ番号: データ}}}
         self.session = None                                                                 # 蓄積中のスナップショットの実行ID（別の実行が始まったら捨てる）
-        self.root.title("test_code7 optimization viewer")                                   # ウィンドウのタイトル
+        self.root.title("test_code11 optimization viewer")                                   # ウィンドウのタイトル
         self._build_ui()                                                                    # ウィジェットを作る
         self._reload(force=True)                                                            # 起動時に1度読み込む
         self.root.after(POLL_MS, self._poll)                                                # 定期監視を開始
@@ -206,7 +216,7 @@ class OptimizationViewer:
         time_pot / time_pwm / time_adrc / time_simPWM を保存するにはビューア側で貯めておく必要がある。
         自動更新をOFFにしている間や、ビューアを起動する前の内側ループは記録されない。
         """
-        session = str(d['session']) if 'session' in d else ''                               # test_code7.py の実行ID
+        session = str(d['session']) if 'session' in d else ''                               # test_code11.py の実行ID
         if self.session is not None and session != self.session:                            # 別の実行が始まった（ビューアを開いたまま再実行した）
             print(f"新しい実行を検出しました（{self.session or '不明'} -> {session or '不明'}）。"
                   f"それまでに蓄積した保存対象を破棄します。")
@@ -269,7 +279,7 @@ class OptimizationViewer:
     # その自由度が最適制御の対象かどうかを取り出す関数
     @staticmethod
     def _is_opt(d, i):                                                                      # 引数(スナップショット, 自由度の添字)
-        """test_code7.py の OPT_DOF_IDS にその自由度が含まれていたかを返す（'opt' が無い古い形式は対象扱い）"""
+        """test_code11.py の OPT_DOF_IDS にその自由度が含まれていたかを返す（'opt' が無い古い形式は対象扱い）"""
         return float(d['opt'][i]) > 0.5 if 'opt' in d else True
 
     # 最適制御の対象外の自由度に対して、表示枠だけを残したグラフを描く関数（test_code5.py と同じ）
@@ -372,7 +382,7 @@ class OptimizationViewer:
         """上段: u_ADRC、下段: z3。どちらも黒実線が ROS2実測、色付き破線が同定判定に使ったモデル。
 
         モデル側は、同定したシステムモデルを実測と同じ条件（印加したFF・目標変位・保持PWM・
-        z3(0⁻)）でADRC込みの閉ループで回した値である（test_code7.py の閉ループ同定が合わせる対象）。
+        z3(0⁻)）でADRC込みの閉ループで回した値である（test_code11.py の閉ループ同定が合わせる対象）。
         段ごとに単位の違う量を分けて描き、見出しに誤差の rms と実測の振れ幅を出すので、
         一致しているかどうかが1目で分かる。ここが合っていないと、u_FF の最適化もその分だけ的外れになる。
         """
@@ -468,24 +478,31 @@ class OptimizationViewer:
         ax.legend(h1 + h2, l1 + l2, fontsize=6, loc='best', ncol=2)                         # 左右の凡例をまとめて出す
         self._setup_history_axis(ax, len(h), title)
 
-    # システムモデルパラメータ(T1, zeta, wn, b0)の推移を描く関数（test_code5.py と同じ表示）
+    # システムモデルパラメータ(T1, zeta, wn, tau, b0)の推移を描く関数（test_code5.py と同じ表示）
     def _plot_system_history(self, ax, d, i):                                               # 引数(描画先のグラフ, スナップショット, 自由度の添字)
+        """θ = [T1, zeta, wn, tau, b0] の推移。T1・wn・tau・b0 を symlog の左軸、zeta を線形の右軸に描く。
+
+        遅れ連鎖の長さ（sys_struct の2要素目 = n-3）が0のとき、tau は式に現れないダミー値なので描かない。
+        """
         title = 'System model params used for u_opt'
         if not self._is_opt(d, i):                                                          # 最適制御の対象外の自由度は同定していない
-            self._plot_not_optimized(ax, title, 'inner loop', 'T1, wn, b0 (symlog)')
+            self._plot_not_optimized(ax, title, 'inner loop', 'T1, wn, tau, b0 (symlog)')
             return
-        h = d['hist_sys'][:, i, :] if d['hist_sys'].size else np.zeros((0, 4))              # [T1, zeta, wn, b0] の推移
+        h = d['hist_sys'][:, i, :] if d['hist_sys'].size else np.zeros((0, 5))              # [T1, zeta, wn, tau, b0] の推移
         x = np.arange(len(h))                                                               # 内側ループ番号
-        for k, name in [(0, 'T1 [s]'), (2, 'wn [rad/s]'), (3, 'b0')]:                        # T1・wnは正、b0は符号自由なので symlog 軸に載せる
+        st = np.asarray(d['sys_struct'][i]).ravel() if 'sys_struct' in d else np.full(4, np.nan)  # モデル構造 [次数, 連鎖長, 0, 0]
+        uses_tau = bool(np.isfinite(st[1]) and st[1] > 0)                                   # 遅れ連鎖があるか（tau が式に現れるか）
+        series = [(0, 'T1 [s]'), (2, 'wn [rad/s]')] + ([(3, 'tau [s]')] if uses_tau else []) + [(4, 'b0')]
+        for k, name in series:                                                              # T1・wn・tauは正、b0は符号自由なので symlog 軸に載せる
             ax.plot(x, h[:, k], 'o-', ms=3, label=name)
         ax.set_yscale('symlog', linthresh=1e-2)                                             # 桁が離れるうえ b0 は負にもなるため symlog
-        ax.set_ylabel('T1, wn, b0 (symlog)', fontsize=8)
+        ax.set_ylabel('T1, wn, tau, b0 (symlog)' if uses_tau else 'T1, wn, b0 (symlog)', fontsize=8)
         tw = self._make_twin(ax, 'zeta', color='tab:purple')                                # 減衰比は範囲が狭いので線形の右軸
         tw.plot(x, h[:, 1], 's-', color='tab:purple', ms=3, label='zeta')
         tw.axhline(0.0, color='tab:purple', lw=0.8, ls=':')                                 # zeta=0: 振動モードの安定限界（下回ると振幅が増大する）
         tw.axhline(1.0, color='tab:purple', lw=0.8, ls='--')                                # zeta=1: 臨界減衰（上回ると3実極で振動しない）
         h1, l1 = ax.get_legend_handles_labels(); h2, l2 = tw.get_legend_handles_labels()   # 左軸・右軸の凡例要素を集める
-        ax.legend(h1 + h2, l1 + l2, fontsize=6, loc='best', ncol=4)                         # 左右の凡例をまとめて出す
+        ax.legend(h1 + h2, l1 + l2, fontsize=6, loc='best', ncol=5)                         # 左右の凡例をまとめて出す
         self._setup_history_axis(ax, len(h), title)
 
     # FF極値の推移を描く関数
@@ -533,6 +550,47 @@ class OptimizationViewer:
     def _get(d, key, i):                                                                          # 引数(スナップショット, 項目名, 自由度の添字)
         return d[key][i] if key in d else np.nan
 
+    # システムモデルの生パラメータと派生量を並べる関数
+    def _sys_model_lines(self, d, i):                                                       # 引数(スナップショット, 自由度の添字)
+        """[Identified models] 節のうち、システムモデルの部分の行を作る。
+
+        test_code11.py のシステムモデルは
+
+            G(s) = b0 / [ (T1 s + 1)(s² + 2ζω s + ω²)(τ s + 1)^(n-3) ]
+
+        で、θ = [T1, zeta, wn, tau, b0] は次数によらず常に5要素である。
+        次数と遅れ連鎖の長さは 'sys_struct' = [次数 n, 連鎖長 n-3, 0, 0] から読む。
+        派生量 'sys_derived' = [DCゲイン, 支配極の周波数[Hz], 支配極の減衰比, 等価むだ時間[s]]
+        も併せて出す（こちらが「モデルが物理的に妥当か」の主な判断材料になる）。
+
+        b0 は「分子定数」であって DCゲインそのものではない点に注意（分母がモニックなので
+        DCゲイン = b0/a0）。次数を上げると a0 が急激に大きくなるため b0 も大きな値になる。
+        物理的な意味を見たいときは下の DC gain を見ること。
+        """
+        num = self._num                                                                         # 整形関数の別名
+        par = np.asarray(d['sys_params_id'][i]).ravel()                                         # 同定したシステムモデルのパラメータ（NaNパディング済み）
+        st = np.asarray(d['sys_struct'][i]).ravel() if 'sys_struct' in d else np.full(4, np.nan)  # モデル構造
+        der = np.asarray(d['sys_derived'][i]).ravel() if 'sys_derived' in d else np.full(4, np.nan)  # 派生量
+        order = int(st[0]) if np.isfinite(st[0]) else 0                                         # モデル次数 n
+        chain = int(st[1]) if np.isfinite(st[1]) else 0                                         # 遅れ連鎖の長さ n-3
+
+        lines = [f"   order / chain {order:>6d} /{chain:>3d}"]                                  # 次数と遅れ連鎖の長さ
+        if par.size >= 5:                                                                       # パラメータがそろっている場合
+            lines += [
+                f"   sys T1        {num(par[0])} s",                                            # 1次遅れの時定数
+                f"   sys zeta      {num(par[1])}",                                              # 減衰比
+                f"   sys wn        {num(par[2])} rad/s",                                        # 固有振動数
+                f"   sys tau       {num(par[3] * 1e3 if np.isfinite(par[3]) else np.nan)} ms",   # 遅れ連鎖の時定数
+                f"   sys b0        {num(par[4], '{:14.4e}')}",                                  # 分子定数（DCゲインではない）
+            ]
+        lines += [
+            f"   DC gain       {num(der[0])} count/PWM",                                        # 定常入力1PWMあたりの変位
+            f"   pole freq     {num(der[1])} Hz",                                               # 支配極の周波数
+            f"   pole damping  {num(der[2])}",                                                  # 支配極の減衰比
+            f"   dead time     {num(der[3] * 1e3 if np.isfinite(der[3]) else np.nan, '{:14.1f}')} ms",  # 等価むだ時間 (n-3)*tau
+        ]
+        return lines
+
     # 左の数値一覧を更新する関数
     def _update_text(self, d, i):                                                           # 引数(スナップショット, 自由度の添字)
         num = self._num                                                                           # 整形関数の別名
@@ -567,10 +625,7 @@ class OptimizationViewer:
                 "",
                 " [Identified models]",
                 f"   tgt T1 / wn   {num(d['tgt_params_id'][i][0], '{:6.3f}')} /{num(d['tgt_params_id'][i][1], '{:7.3f}')}",
-                f"   sys T1        {num(d['sys_params_id'][i][0])}",
-                f"   sys zeta      {num(d['sys_params_id'][i][1])}",
-                f"   sys wn        {num(d['sys_params_id'][i][2])}",
-                f"   sys b0        {num(d['sys_params_id'][i][3])}",
+            ] + self._sys_model_lines(d, i) + [
                 f"   id residual   {num(d['id_res_sys'][i])}",
                 "",
                 " [ADRC replica]  vs measured (identification)",
@@ -691,7 +746,7 @@ def main(args=None):
     save_dir = os.path.join(os.getcwd(), time.strftime('%Y%m%d_%H%M%S'))                          # 実行ディレクトリ直下・実行開始日時のフォルダ
 
     print(f"【監視するスナップショット】 {path}")
-    print("test_code7.py 側で ENABLE_SNAPSHOT = True になっていることを確認してください。")
+    print("test_code11.py 側で ENABLE_SNAPSHOT = True になっていることを確認してください。")
     print(f"【終了時のグラフ保存先】 {save_dir}")
     print("終了するには Ctrl+C を押すか、ウィンドウを閉じてください（どちらでも保存されます）。")
 
