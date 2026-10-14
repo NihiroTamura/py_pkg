@@ -10,23 +10,36 @@ GUI_android_tk.py（目標値を送るGUI）と同時に使う。このGUIは目
     実機は目標値メッセージを受信するたびに、FFを t=0 から掛け直す（同じ値の再送でも）。
 ・FF波形は2つの極値 (t1,y1),(t2,y2) と T から一意に決める。(0,T) 内の極値がちょうど2個にならない設定は送信しない。
 ・実機のFF係数を読み返すトピックはないので、「GUIが送信した値（受信確認なし）」として表示し、適用済みとは表示しない。
-  起動時は FF=0 を前提値（未送信・未確認）とする。FFを送るのは「FFパラメータ送信」「FFを全て0にして送信」を押して
-  確認したときだけで、自動では送らない。ボードの配信が途切れて再開したら、実機が起動したとみなして FF=0 として扱う。
+  起動時は FF=0 を前提値（未送信・未確認）とする。FFを送るのは「FFパラメータ送信」「FFを全て0にして送信」
+  「First（FFなし）を記録」を押して確認したときだけで、自動では送らない。
+  ボードの配信が途切れて再開したら、実機が起動したとみなして FF=0 として扱う。
 ・試行: 「● 記録待機」→ 目標値トピックの値が1自由度でも変わった時点を 0 秒として、記録時間のあいだ全自由度の
   実測POT・目標値・z3・PWM を記録する。0〜EVAL_TIME 秒は評価区間で、この間は他の目標値を送らない。
 ・評価: 目標値が変わった自由度ごとに、減衰係数 ζ=1 の3次遅れ系 1/((T1·s + 1)(s² + 2ζωn·s + ωn²)) を
         実測POTに同定し（test_code7.py と同じ）
         J_i = Σ_k (POT_meas − POT_model)² / ΔPOT_i²   （評価区間を CTRL_DT 刻みに補間した EVAL_M 点）
-  を求める。試行の評価値 J は J_i の平均で、J が最小の試行が best。評価できた自由度がない試行と、
-  評価区間中に別の目標値を受信した試行は best の候補にしない。
-・now（今回）/ last（直前）/ best の試行データは TRIAL_DIR に保存し、再起動後も引き継ぐ。
-・各試行の行の「保存」: <保存先>/<now|last|best>_YYYYMMDD_HHMM/（日時は試行の記録開始時刻）
-      <フォルダ名>.csv          … 時系列（GUI_android_tk.py の記録CSVと同じ列 ＋ PWMの組に FF{d}・ADRC{d}、
-                                  最後に受信した目標値メッセージ Time_cmd, cmd{d}）
-      <フォルダ名>_results.csv  … 試行結果（test_code7.py の結果CSVと同じ列 Init_n, Target_n, T_n, t1_n, y1_n, t2_n, y2_n。
-                                  n は test_code7.py のFF番号 1〜24）
-      DOF/DOF<d>/<now|last|best>_<time-pot|time-FF|time-PWM|time-z3>_YYYYMMDD_HHMM.png
-・設定（T・y上下限・プリセット・保存先・記録時間）は SETTINGS_FILE に保存する。FFの極値は起動時に必ず 0（FFなし）から始める。
+  を求める。試行の評価値 J は J_i の平均で、J が最小の試行が best。評価できた自由度がない試行、
+  評価区間中に別の目標値を受信した試行、First と目標姿勢（変化前・変化後の目標値）が違う試行は best の候補にしない。
+・First（FFなし）: 「First（FFなし）を記録」で全自由度に FF=0 を送ってから記録した試行（ADRCだけの応答）。
+  now・last・best とは別に1つだけ持ち、best の候補にしない。確認して取り直すとき以外は置き換えない。
+  First で同定した3次遅れ系の T10・T90（10%・90% 到達時刻）を、極値の時刻 t1・t2 の初期値にする。
+  t1・t2 を手動で変えた自由度はその値を引き継ぎ（試行の後も変えない）、「x を First の T10・T90 に戻す」で戻す。
+・First・now（今回）/ last（直前）/ best の試行データは TRIAL_DIR に保存し、再起動後も引き継ぐ。
+・各試行の行の「保存」: <保存先>/<名前>/（同じ名前があれば _2, _3 … を付け、既存のフォルダには書かない）
+      <名前> = {保存名}_D{DOF}R{変化前の目標値}-{変化後の目標値}_…_{now|last|First|best}_YYYYMMDD_HHMM
+               日時は試行の記録開始時刻。D… はその試行でFFを与えていた自由度（First・FFなしの試行は目標値が変わった
+               自由度）。保存名が空なら付けない。ファイル名の上限を超える分の自由度は省いて _他N を付ける。
+      <名前>.csv          … 時系列（GUI_android_tk.py の記録CSVと同じ列 ＋ PWMの組に FF{d}・ADRC{d}、
+                             最後に受信した目標値メッセージ Time_cmd, cmd{d}）
+      <名前>_results.csv  … 試行結果（test_code7.py の結果CSVと同じ列 Init_n, Target_n, T_n, t1_n, y1_n, t2_n, y2_n。
+                             n は test_code7.py のFF番号 1〜24）
+      DOF/DOF<d>/<now|last|First|best>_<time-pot|time-FF|time-PWM|time-z3>_YYYYMMDD_HHMM.png
+・探索終了: best と First を保存するか選び（はい / いいえ / キャンセル）、どちらでも再開用データを
+      <保存先>/{保存名}_{best の D…}_search_YYYYMMDD_HHMM/（search.json ＋ 試行データ trial_<id>.npz）
+  に書いてから、First・試行・プリセット1〜3・極値を空にする。「探索を再開」でそのフォルダを読み込むと、
+  First・試行・FF設定・プリセット1〜4・保存名を戻す（FF設定は送信しない）。
+・設定（T・y上下限・極値・手動のx・プリセット・保存先・記録時間・保存名）は SETTINGS_FILE に保存する。
+  FF あり/なしは起動時に必ず「FFなし」から始める（極値は覚えておき、FFを与えると戻る）。
 """
 import csv
 import json
@@ -34,6 +47,7 @@ import math
 import multiprocessing
 import os
 import queue
+import re
 import sys
 import threading
 import time
@@ -130,9 +144,16 @@ BOARD_RESTART_GAP = 3.0     # ボードの配信がこの時間途切れてか�
 # ------------------------------
 SETTINGS_FILE = os.path.expanduser('~/.armrobot_gui_ff_setting.json')
 TRIAL_DIR = os.path.expanduser('~/.armrobot_gui_ff_trials')
-ROW_KEYS = ('now', 'last', 'best')
+FIRST = 'First'             # FFなしの初回試行（ADRCだけの応答）。T10・T90 を極値の時刻の初期値にする
+ROW_KEYS = ('now', 'last', FIRST, 'best')       # 試行結果の行（表示順。First は best のすぐ上）
+PRESET_ROWS = ('now', 'last', 'best')           # プリセット1〜3 に登録する試行
 GRAPH_NAMES = ('time-pot', 'time-FF', 'time-PWM', 'time-z3')
 NUM_PRESETS = 4             # プリセット1〜3 = now/last/best の試行で使ったFF、4 = ユーザー設定
+POSTURE_TOL = 0.5           # 目標値の差がこれ以下なら、First と同じ目標姿勢とみなす
+SEARCH_FILE = 'search.json' # 探索の再開用データ（探索終了で保存するフォルダの中）
+NAME_MAX_BYTES = 255        # ファイル名の上限（ext4 など）[byte]
+NAME_RESERVE = len('_results.csv') + 4      # フォルダ内の <フォルダ名>_results.csv と、同名のときに付ける _2 … の分
+NAME_FORBIDDEN = '/\\:*?"<>|'              # 保存名で '-' に置き換える文字（Windows 側のフォルダにも保存できるように）
 
 
 # ==============================================================================
@@ -613,12 +634,14 @@ class Trial:
 
     meta（JSONにできる値）:
       id, start (ISO形式), stamp (YYYYMMDD_HHMM), duration [s]
+      kind       … 'First'（「First（FFなし）を記録」で記録した試行）または 'trial'
       init_target / target … 26自由度の目標値（変化前 / 変化後。分からなければ None）
       ff_table   … この試行でGUIが送信済みだったFF [24][a,b,c,d,e,T]
       ff_setting … そのFFの元にした設定 [24]{enabled,T,t1,y1,t2,y2}（FFなしは None）
       ff_status  … ボードごとのFFの状態（'startup' 起動時の前提値 / 'sent' 送信済み / 'nosub' 受信側なしで送信 /
                    'restart' 実機起動の検出で0とみなした）
-      warnings, eval（DOFごとの評価）, J, n_eval, candidate, candidate_note, next_init
+      warnings, eval（DOFごとの評価）, J, n_eval, candidate, candidate_note
+      first_problems … First にできない理由（First の試行だけ。空なら First にできる）
     series: board名 → {'pot_t','pot_v','pwm_t','pwm_v','z3_t','z3_v'}（時刻は試行開始からの秒）
     cmd_t, cmd_v … 試行中に受信した目標値メッセージ（FFを掛け直した時刻）
     """
@@ -636,6 +659,10 @@ class Trial:
     @property
     def J(self):
         return self.meta.get('J')
+
+    @property
+    def kind(self):
+        return self.meta.get('kind', 'trial')
 
     def ff6(self, dof):
         """この試行で DOF に掛かっていたFF [a,b,c,d,e,T]（FFのないDOFは全0）"""
@@ -709,12 +736,48 @@ class Trial:
         return cls(p['meta'], p['series'], p['cmd_t'], p['cmd_v'])
 
 
-def evaluate_trial(trial):
+def _known(v):
+    return v is not None and math.isfinite(v)
+
+
+def _same_target(a, b):
+    if not _known(a) or not _known(b):
+        return _known(a) == _known(b)
+    return abs(a - b) <= POSTURE_TOL
+
+
+def posture_diff(meta, first_meta):
+    """目標姿勢（変化前・変化後の目標値）が First と違う自由度"""
+    return [d for d in range(N_DOF)
+            if not (_same_target(meta['init_target'][d], first_meta['init_target'][d])
+                    and _same_target(meta['target'][d], first_meta['target'][d]))]
+
+
+def _dof_list(dofs, n=8):
+    return ", ".join(map(str, dofs[:n])) + (" …" if len(dofs) > n else "")
+
+
+def first_ff_problems(meta):
+    """First（FFなし）にできない理由のうち、FFに関するもの（FFが0でない・0を送っていない・他プログラムが送った）"""
+    probs = []
+    nonzero = [FF_DOF_MAP[n] for n, row in enumerate(meta['ff_table']) if any(v != 0 for v in row[:5])]
+    if nonzero:
+        probs.append(f"FFが0ではない自由度があります（DOF {_dof_list(nonzero)}）")
+    for k, (status, _) in sorted(meta['ff_status'].items()):
+        if status == 'startup':
+            probs.append(f"board{k} に FF=0 を送信していません")
+        elif status == 'foreign':
+            probs.append(f"board{k} のFFを他のプログラムが送信しました")
+    return probs
+
+
+def evaluate_trial(trial, first=None):
     """試行の評価（GUIとは別スレッドで呼ぶ）。meta に eval・J・n_eval・candidate・warnings を書き込む
 
     目標値が変わった自由度（ΔPOT ≠ 0）ごとに、評価区間 0〜EVAL_TIME の実測POTを CTRL_DT 刻みに補間し、
     3次遅れ系 1/((T1·s+1)(s²+2ζωn·s+ωn²))（ζ=1）を同定して J_i = Σ(POT_meas − POT_model)² / ΔPOT² を求める。
-    J = 平均(J_i)。
+    J = 平均(J_i)。first（First の試行）と目標姿勢が違う試行は best の候補にしない。
+    First の試行は best の候補にせず、First にできない理由を meta['first_problems'] に書く。
     """
     meta = trial.meta
     grid = eval_grid()
@@ -770,61 +833,97 @@ def evaluate_trial(trial):
         notes.append(f"評価区間中に別の目標値を受信しました（{', '.join(f'{t:.2f}' for t in early)} s）")
     if meta['duration'] < EVAL_TIME:
         notes.append("記録時間が評価区間より短い")
+    if trial.kind == FIRST:
+        meta['first_problems'] = notes + first_ff_problems(meta)
+        meta['candidate'] = False
+        meta['candidate_note'] = "First（FFなし）は best の候補にしません"
+        return trial
+    if first is not None:
+        diff = posture_diff(meta, first.meta)
+        if diff:
+            notes.append(f"First と目標姿勢が違います（DOF {_dof_list(diff)}）")
+            warnings.append(f"First（{first.meta['start'].replace('T', ' ')}）と目標姿勢が違うため、best の候補にしません"
+                            f"（DOF {_dof_list(diff)}）。別の姿勢を探索するときは「探索終了」で区切ってください")
     meta['candidate'] = not notes
     meta['candidate_note'] = "、".join(notes)
     return trial
 
 
-def next_initial(trial, dof, T, ylo, yhi):
-    """次の試行の極値の初期値（試行 trial の結果から）
+def first_rise(first, dof):
+    """First の T10・T90。戻り値 (T10, T90, 理由)。使えないときは T10・T90 が None で、理由を返す"""
+    if first is None:
+        return None, None, "First（FFなし）が未取得です"
+    ev = first.meta['eval'][dof]
+    status = ev.get('status')
+    if status == 'ok':
+        T10, T90 = ev.get('T10'), ev.get('T90')
+        if _known(T10) and _known(T90):
+            return float(T10), float(T90), None
+        return None, None, "First の応答から T10・T90 を計算できませんでした"
+    if status == 'unchanged':
+        return None, None, "First でこの自由度の目標値が変わっていないため、T10・T90 がありません"
+    return None, None, f"First で同定できなかったため、T10・T90 がありません（{ev.get('note') or status}）"
 
-    時刻: 同定した3次遅れ系の 10%・90% 到達時刻 (T10, T90)
-    y   : その試行で使ったFFの極値の y
+
+def initial_extrema(dof, T, ylo, yhi, first, now, saved=None, manual_x=False):
+    """FFを与えるときの極値の初期値
+
+    時刻 t1・t2: 手動で変えた値（manual_x）があればそれ、なければ First の T10・T90。
+                 First の値がなければ前に設定した値、それもなければ t(t−T/2)(t−T) 形の極値の時刻。
+    y1・y2    : 前に設定した値（saved）、なければ now の試行で使ったFFの y、
+                 それもなければ ±DEFAULT_FF_PEAK（向きは ΔPOT から）。
     条件を満たさなければ最も近い実現可能な点へ動かし、その理由を返す。
-    戻り値: {'values': (t1,y1,t2,y2) または None, 'target': 目標の値, 'reasons': [...], 'exact': bool}
+    戻り値: {'values': (t1,y1,t2,y2) または None, 'target': 目標の値, 'reasons': [...], 'exact': bool,
+             'x_src': 'manual' | 'First' | 'saved' | 'default'}
     """
-    ev = trial.meta['eval'][dof]
-    setting = trial.ff_setting(dof)
     reasons = []
-    if ev.get('status') == 'ok' and ev.get('T10') is not None and np.isfinite(ev['T10']):
-        t1s, t2s = ev['T10'], ev['T90']
-    elif setting is not None and setting.get('enabled'):
-        t1s, t2s = setting['t1'], setting['t2']
-        reasons.append(f"前回の試行で同定できなかったため（{ev.get('note') or ev.get('status')}）、"
-                       "時刻は前回のFFの極値の時刻を使います")
+    T10, T90, why = first_rise(first, dof)
+    if manual_x and saved is not None:
+        t1s, t2s, x_src = saved['t1'], saved['t2'], 'manual'
+    elif T10 is not None:
+        t1s, t2s, x_src = T10, T90, 'First'
+    elif saved is not None:
+        t1s, t2s, x_src = saved['t1'], saved['t2'], 'saved'
+        reasons.append(f"{why}。時刻は前に設定した値を使います")
     else:
-        t1s, t2s = T * (3 - math.sqrt(3)) / 6, T * (3 + math.sqrt(3)) / 6
-        reasons.append(f"前回の試行で同定できなかったため（{ev.get('note') or ev.get('status')}）、"
-                       "時刻は t(t−T/2)(t−T) 形の極値の時刻を使います")
-    if setting is not None and setting.get('enabled'):
+        t1s, t2s, x_src = T * (3 - math.sqrt(3)) / 6, T * (3 + math.sqrt(3)) / 6, 'default'
+        reasons.append(f"{why}。時刻は t(t−T/2)(t−T) 形の極値の時刻を使います")
+    setting = now.ff_setting(dof) if now is not None else None
+    if saved is not None:
+        y1s, y2s = saved['y1'], saved['y2']
+    elif setting is not None and setting.get('enabled'):
         y1s, y2s = setting['y1'], setting['y2']
     else:
-        dpot = ev.get('dpot') or 0.0
+        dpot = 0.0
+        for trial in (first, now):
+            if trial is not None and _known(trial.meta['eval'][dof].get('dpot')):
+                dpot = trial.meta['eval'][dof]['dpot']
+                break
         sign = -1.0 if dpot < 0 else 1.0
         y1s, y2s = sign * DEFAULT_FF_PEAK, -sign * DEFAULT_FF_PEAK
-        reasons.append(f"前回の試行はFFなし（極値の y = 0）で、y = 0 では極値が2つになりません。"
-                       f"y は ±{DEFAULT_FF_PEAK:g}（{'山→谷' if sign > 0 else '谷→山'}）を提案します")
+        reasons.append(f"前に設定した y がないため、y は ±{DEFAULT_FF_PEAK:g}（{'山→谷' if sign > 0 else '谷→山'}）を使います")
     target = (float(t1s), float(y1s), float(t2s), float(y2s))
-    for name, tv in (("t1(T10)", t1s), ("t2(T90)", t2s)):
+    names = {'First': ("t1(T10)", "t2(T90)")}.get(x_src, ("t1", "t2"))
+    for name, tv in zip(names, (t1s, t2s)):
         if tv >= T:
             reasons.append(f"{name} = {tv:.3f} s が FF終了時刻 T = {T:g} s 以上です")
     values = nearest_feasible(T, t1s, y1s, t2s, y2s, ylo, yhi)
     exact = values is not None and np.allclose(values, target, rtol=0, atol=1e-12)
     if values is None:
-        reasons.append("条件を満たす初期値が見つかりませんでした（y の上下限を確認してください）")
+        reasons.append("条件を満たす初期値が見つかりませんでした（T・y の上下限を確認してください）")
     elif not exact:
         moved = [f"{n} {a:.4g}→{b:.4g}" for n, a, b in zip(("t1", "y1", "t2", "y2"), target, values)
                  if abs(a - b) > 1e-9]
         reasons.append("そのままでは (0,T) 内の極値が2つにならない（または上下限を超える）ため、"
                        "最も近い実現可能な値へ動かしました: " + ", ".join(moved))
-    return {'values': values, 'target': target, 'reasons': reasons, 'exact': exact}
+    return {'values': values, 'target': target, 'reasons': reasons, 'exact': exact, 'x_src': x_src}
 
 
 class TrialStore:
-    """now・last・best の試行を保持し、TRIAL_DIR に保存する（再起動後も引き継ぐ）
+    """First・now・last・best の試行を保持し、TRIAL_DIR に保存する（再起動後も引き継ぐ）
 
-    index.json: {"now": id, "last": id, "best": id}。試行ごとに trial_<id>.npz。
-    同じ試行が複数の行を占めることがある（例: now が best でもある）。
+    index.json: {"now": id, "last": id, "First": id, "best": id}。試行ごとに trial_<id>.npz。
+    同じ試行が複数の行を占めることがある（例: now が best でもある）。First の試行は First の行だけ。
     """
 
     def __init__(self, folder=None):
@@ -853,7 +952,10 @@ class TrialStore:
         return os.path.join(self.folder, f'trial_{tid}.npz')
 
     def add(self, trial):
-        """新しい試行を now にする（now → last）。評価値が best より小さければ best にもする。戻り値: best を更新したか"""
+        """新しい試行を now にする（now → last）。評価値が best より小さければ best にもする。戻り値: best を更新したか
+
+        First の行は変えない。
+        """
         prev_now = self.rows['now']
         self.rows['last'] = prev_now
         self.rows['now'] = trial
@@ -863,6 +965,19 @@ class TrialStore:
             self.rows['best'] = trial
         self.write_index()
         return updated
+
+    def set_first(self, trial):
+        """First（FFなし）を置き換える（取り直しの確認をしたときだけ呼ぶ）"""
+        self.rows[FIRST] = trial
+        self.write_index()
+
+    def replace(self, rows):
+        """全部の行を置き換える（探索終了で空にする・探索を再開する）"""
+        self.rows = {k: rows.get(k) for k in ROW_KEYS}
+        self.write_index()
+
+    def is_empty(self):
+        return all(t is None for t in self.rows.values())
 
     def write_index(self):
         os.makedirs(self.folder, exist_ok=True)
@@ -887,12 +1002,22 @@ class TrialStore:
 # ==============================================================================
 # 設定ファイル
 # ==============================================================================
+def default_dof_state():
+    """1自由度のFF設定のうち保存するもの（FFあり/なしは保存しない。起動時は必ずFFなし）
+
+    saved    … 最後に設定した極値 {t1,y1,t2,y2}（FFなしにしても覚えておき、FFを与えると戻す）
+    manual_x … t1・t2 を手動で変えたか（変えていなければ、FFを与えるときに First の T10・T90 を使う）
+    """
+    return {'T': FF_T_DEFAULT, 'ylo': Y_LIMIT_DEFAULT[0], 'yhi': Y_LIMIT_DEFAULT[1], 'saved': None, 'manual_x': False}
+
+
 def default_settings():
     return {
         'start_dof': FF_DOF_MAP[0],
         'record_dir': None,
         'record_duration': RECORD_DURATION_DEFAULT,
-        'dof': {str(d): {'T': FF_T_DEFAULT, 'ylo': Y_LIMIT_DEFAULT[0], 'yhi': Y_LIMIT_DEFAULT[1]} for d in FF_DOF_MAP},
+        'save_name': '',
+        'dof': {str(d): default_dof_state() for d in FF_DOF_MAP},
         'presets': [[None] * N_FF for _ in range(NUM_PRESETS)],
     }
 
@@ -901,9 +1026,38 @@ def _num(v):
     return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
 
 
+def _is_extrema(p):
+    return isinstance(p, dict) and all(_num(p.get(k)) for k in ('t1', 'y1', 't2', 'y2'))
+
+
 def _is_preset(p):
-    return (isinstance(p, dict) and isinstance(p.get('enabled'), bool) and _num(p.get('T'))
-            and all(_num(p.get(k)) for k in ('t1', 'y1', 't2', 'y2')))
+    return isinstance(p, dict) and isinstance(p.get('enabled'), bool) and _num(p.get('T')) and _is_extrema(p)
+
+
+def _read_dof_state(v, out):
+    """設定ファイル・再開用データの1自由度ぶん v を検査し、正しい項目だけ out に入れる"""
+    T, ylo, yhi = v.get('T'), v.get('ylo'), v.get('yhi')
+    if _num(T) and FF_T_RANGE[0] <= T <= FF_T_RANGE[1]:
+        out['T'] = float(T)
+    if _num(ylo) and _num(yhi) and -PWM_LIMIT <= ylo < 0 < yhi <= PWM_LIMIT:
+        out['ylo'], out['yhi'] = float(ylo), float(yhi)
+    if _is_extrema(v.get('saved')):
+        out['saved'] = {k: float(v['saved'][k]) for k in ('t1', 'y1', 't2', 'y2')}
+    if isinstance(v.get('manual_x'), bool):
+        out['manual_x'] = v['manual_x']
+
+
+def _read_presets(presets, out):
+    """プリセット [NUM_PRESETS][N_FF] を検査し、正しいものだけ out に入れる"""
+    for k in range(min(NUM_PRESETS, len(presets))):
+        row = presets[k]
+        if not isinstance(row, list):
+            continue
+        for n in range(min(N_FF, len(row))):
+            if _is_preset(row[n]):
+                out[k][n] = {key: row[n][key] for key in ('enabled', 'T', 't1', 'y1', 't2', 'y2')}
+                if 'src' in row[n] and isinstance(row[n]['src'], str):
+                    out[k][n]['src'] = row[n]['src']
 
 
 def load_settings(path=None):
@@ -936,29 +1090,21 @@ def load_settings(path=None):
         settings['record_duration'] = float(dur)
     elif dur is not None:
         bad.append('record_duration')
+    name = data.get('save_name')
+    if isinstance(name, str):
+        settings['save_name'] = name
+    elif name is not None:
+        bad.append('save_name')
     dofs = data.get('dof')
     if isinstance(dofs, dict):
         for key, v in dofs.items():
-            if key not in settings['dof'] or not isinstance(v, dict):
-                continue
-            T, ylo, yhi = v.get('T'), v.get('ylo'), v.get('yhi')
-            if _num(T) and FF_T_RANGE[0] <= T <= FF_T_RANGE[1]:
-                settings['dof'][key]['T'] = float(T)
-            if _num(ylo) and _num(yhi) and -PWM_LIMIT <= ylo < 0 < yhi <= PWM_LIMIT:
-                settings['dof'][key]['ylo'], settings['dof'][key]['yhi'] = float(ylo), float(yhi)
+            if key in settings['dof'] and isinstance(v, dict):
+                _read_dof_state(v, settings['dof'][key])
     elif dofs is not None:
         bad.append('dof')
     presets = data.get('presets')
     if isinstance(presets, list):
-        for k in range(min(NUM_PRESETS, len(presets))):
-            row = presets[k]
-            if not isinstance(row, list):
-                continue
-            for n in range(min(N_FF, len(row))):
-                if _is_preset(row[n]):
-                    settings['presets'][k][n] = {key: row[n][key] for key in ('enabled', 'T', 't1', 'y1', 't2', 'y2')}
-                    if 'src' in row[n] and isinstance(row[n]['src'], str):
-                        settings['presets'][k][n]['src'] = row[n]['src']
+        _read_presets(presets, settings['presets'])
     elif presets is not None:
         bad.append('presets')
     if bad:
@@ -979,16 +1125,150 @@ def save_settings(settings, path=None):
 # ==============================================================================
 # 保存（CSV・PNG）。別プロセスで動かす
 # ==============================================================================
-def make_save_folder(base_dir, label, stamp):
-    """<保存先>/<label>_YYYYMMDD_HHMM（同じ名前があれば _2, _3 … を付ける）"""
-    name = f"{label}_{stamp}"
+def sanitize_name(text):
+    """保存名: ファイル名に使えない文字（NAME_FORBIDDEN・空白・制御文字）を '-' にする（先頭の '.' も除く）"""
+    out = ''.join('-' if (c in NAME_FORBIDDEN or c.isspace() or ord(c) < 32) else c for c in (text or ''))
+    return out.strip('-').lstrip('.')
+
+
+def format_target(v):
+    """フォルダ名の目標値（整数ならそのまま、小数は有効6桁、分からなければ NA）"""
+    if not _known(v):
+        return 'NA'
+    if abs(v - round(v)) < 1e-6:
+        return str(int(round(v)))
+    return f"{v:.6g}"
+
+
+def name_dofs(trial):
+    """フォルダ名に入れる自由度: その試行で実際にFFを与えていた自由度（DOF番号順）。
+    First と、FFを与えた自由度がない試行は、目標値が変わった自由度"""
+    meta = trial.meta
+    if trial.kind != FIRST:
+        dofs = sorted(FF_DOF_MAP[n] for n, st in enumerate(meta['ff_setting']) if st is not None and st.get('enabled'))
+        if dofs:
+            return dofs
+    return [d for d in range(N_DOF)
+            if _known(meta['init_target'][d]) and _known(meta['target'][d]) and meta['init_target'][d] != meta['target'][d]]
+
+
+def dof_name_parts(trial):
+    """['D3R300-700', ...]（D の番号は DOF番号、R は変化前の目標値-変化後の目標値）"""
+    meta = trial.meta
+    return [f"D{d}R{format_target(meta['init_target'][d])}-{format_target(meta['target'][d])}" for d in name_dofs(trial)]
+
+
+def build_name(save_name, parts, tail):
+    """{保存名}_{parts…}_{tail}。保存名が空なら付けない。
+
+    ファイル名の上限（中の <名前>_results.csv と、同名のときの _2 … を含めて NAME_MAX_BYTES）を超えるなら、
+    後ろの自由度から省いて _他N（N = 省いた数）を付ける。保存名だけで超えるなら保存名を切り詰める。
+    """
+    user = sanitize_name(save_name)
+    limit = NAME_MAX_BYTES - NAME_RESERVE
+
+    def make(k, u):
+        items = ([u] if u else []) + parts[:k] + ([f"他{len(parts) - k}"] if k < len(parts) else []) + [tail]
+        return '_'.join(items)
+    for k in range(len(parts), -1, -1):
+        name = make(k, user)
+        if len(name.encode('utf-8')) <= limit:
+            return name
+    room = limit - len(make(0, '').encode('utf-8')) - 1
+    user = user.encode('utf-8')[:max(0, room)].decode('utf-8', 'ignore').rstrip('-')
+    return make(0, user)
+
+
+def trial_folder_name(trial, kind, save_name=''):
+    """試行の保存フォルダ名 {保存名}_D3R300-700_…_{now|last|First|best}_YYYYMMDD_HHMM（日時は記録開始時刻）"""
+    return build_name(save_name, dof_name_parts(trial), f"{kind}_{trial.meta['stamp']}")
+
+
+def make_save_folder(base_dir, name):
+    """<保存先>/<name> を作る。同じ名前があれば _2, _3 … を付ける（既存のフォルダには書かない）"""
+    os.makedirs(base_dir, exist_ok=True)
     path = os.path.join(base_dir, name)
     n = 2
-    while os.path.exists(path):
-        path = os.path.join(base_dir, f"{name}_{n}")
-        n += 1
-    os.makedirs(path)
-    return path
+    while True:
+        try:
+            os.mkdir(path)
+            return path
+        except FileExistsError:
+            path = os.path.join(base_dir, f"{name}_{n}")
+            n += 1
+
+
+# ==============================================================================
+# 探索の再開用データ（探索終了で保存し、「探索を再開」で読む）
+# ==============================================================================
+def write_search_state(folder, rows, dof_states, presets, save_name):
+    """folder に search.json と試行データ trial_<id>.npz を書く
+
+    rows: 行 → Trial / dof_states: {DOF: {T, ylo, yhi, saved, manual_x, enabled}} / presets: [NUM_PRESETS][N_FF]
+    """
+    for t in {t.id: t for t in rows.values() if t is not None}.values():
+        t.save(os.path.join(folder, f'trial_{t.id}.npz'))
+    data = {
+        'version': 1,
+        'saved_at': datetime.now().isoformat(timespec='seconds'),
+        'save_name': save_name,
+        'rows': {k: (t.id if t is not None else None) for k, t in rows.items()},
+        'dof': {str(d): v for d, v in dof_states.items()},
+        'presets': presets,
+    }
+    path = os.path.join(folder, SEARCH_FILE)
+    with open(path + '.tmp', 'w') as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+    os.replace(path + '.tmp', path)
+
+
+def read_search_state(folder):
+    """write_search_state で書いたデータを読む。読めなければ ValueError（何も変えない）
+
+    戻り値: {'rows': 行 → Trial, 'dof': {DOF: {T, ylo, yhi, saved, manual_x, enabled}}, 'presets', 'save_name'}
+    """
+    path = os.path.join(folder, SEARCH_FILE)
+    if not os.path.isfile(path):
+        raise ValueError(f"{SEARCH_FILE} がありません（「探索終了」で保存したフォルダを選んでください）")
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except (OSError, ValueError) as e:
+        raise ValueError(f"{SEARCH_FILE} を読めません: {e}")
+    if not isinstance(data, dict) or not isinstance(data.get('rows'), dict):
+        raise ValueError(f"{SEARCH_FILE} の形式が違います")
+    rows, cache = {}, {}
+    for key in ROW_KEYS:
+        tid = data['rows'].get(key)
+        if tid is None:
+            rows[key] = None
+            continue
+        if not isinstance(tid, str) or not re.fullmatch(r'[0-9A-Za-z_]+', tid):
+            raise ValueError(f"試行の番号が不正です: {tid!r}")
+        if tid not in cache:
+            try:
+                cache[tid] = Trial.load(os.path.join(folder, f'trial_{tid}.npz'))
+            except Exception as e:
+                raise ValueError(f"試行データ trial_{tid}.npz を読めません: {e}")
+        rows[key] = cache[tid]
+    if rows[FIRST] is not None and rows[FIRST].kind != FIRST:
+        raise ValueError("First の行に First（FFなし）ではない試行が入っています")
+    dofs = data.get('dof') if isinstance(data.get('dof'), dict) else {}
+    dof = {}
+    for d in FF_DOF_MAP:
+        st = default_dof_state()
+        v = dofs.get(str(d))
+        if isinstance(v, dict):
+            _read_dof_state(v, st)
+            st['enabled'] = v.get('enabled') is True and st['saved'] is not None
+        else:
+            st['enabled'] = False
+        dof[d] = st
+    presets = [[None] * N_FF for _ in range(NUM_PRESETS)]
+    if isinstance(data.get('presets'), list):
+        _read_presets(data['presets'], presets)
+    name = data.get('save_name')
+    return {'rows': rows, 'dof': dof, 'presets': presets, 'save_name': name if isinstance(name, str) else ''}
 
 
 def results_header():
@@ -1095,9 +1375,10 @@ def graph_content(trial, dof, name, lang='ja'):
             tm = np.arange(int(np.floor(dur / CTRL_DT + 1e-9)) + 1) * CTRL_DT
             out['series'].append((tm, trial.model_pot(dof, tm), '#009000', '', L('model')))
             out['note'] = f"J_i={ev['J']:.4g}"
-            out['texts'].append(f"{L('model')}: {MODEL_TEXT}   T1={ev['T1']:.4g} s, ωn={ev['wn']:.4g} rad/s"
+            rise = f"T10={ev['T10']:.3f} s, T90={ev['T90']:.3f} s"
+            out['texts'].append(f"{L('model')}: {MODEL_TEXT}   T1={ev['T1']:.4g} s, ωn={ev['wn']:.4g} rad/s, {rise}"
                                 if lang == 'ja' else
-                                f"model: {MODEL_TEXT}   T1={ev['T1']:.4g} s, wn={ev['wn']:.4g} rad/s")
+                                f"model: {MODEL_TEXT}   T1={ev['T1']:.4g} s, wn={ev['wn']:.4g} rad/s, {rise}")
         else:
             out['note'] = (ev.get('note') or '') if lang == 'ja' else GRAPH_TEXT.get(ev.get('status'), (None, ''))[1]
         t, v = trial.dof_series(dof, 'desired')
@@ -1200,8 +1481,9 @@ class Recorder:
     """待機 → 記録中 → 終了（または取消）。受信コールバック（ROSスレッド）がデータを渡す"""
     ARMED, RECORDING, DONE, CANCELLED = range(4)
 
-    def __init__(self, duration):
+    def __init__(self, duration, kind='trial'):
         self.duration = float(duration)     # 記録時間 [s]。記録中もGUIから変更される
+        self.kind = kind                    # 'First'（FFなしの初回試行）または 'trial'
         self.state = self.ARMED
         self.lock = threading.Lock()
         self.t0 = None                      # 記録開始の時刻（time.monotonic()）
@@ -1282,6 +1564,7 @@ class Recorder:
             'start': self.start.isoformat(timespec='seconds'),
             'stamp': self.start.strftime('%Y%m%d_%H%M'),
             'duration': float(self.t_end if self.t_end is not None else self.duration),
+            'kind': self.kind,
             'init_target': list(self.init_target),
             'target': list(self.target),
             'ff_table': [list(map(float, row)) for row in self.ff['table']],
@@ -1628,12 +1911,14 @@ class PlotCanvas:
 # 1自由度のFF設定（GUIスレッドだけが触る）
 # ==============================================================================
 class DofModel:
-    def __init__(self, dof, T, ylo, yhi):
+    def __init__(self, dof, T, ylo, yhi, saved=None, manual_x=False):
         self.dof = dof
         self.enabled = False            # 起動時は必ずFFなし（極値・係数すべて0）
         self.T = float(T)
         self.t1 = self.y1 = self.t2 = self.y2 = 0.0
         self.ylo, self.yhi = float(ylo), float(yhi)
+        self.saved = None if saved is None else dict(saved)     # 最後に設定した極値（FFなしにしても覚えておく）
+        self.manual_x = bool(manual_x)  # t1・t2 を手動で変えたか（変えていなければ First の T10・T90 から始める）
         self.listeners = []
         self._check = None
 
@@ -1643,10 +1928,19 @@ class DofModel:
     def setting(self):
         return {'enabled': self.enabled, 'T': self.T, 't1': self.t1, 'y1': self.y1, 't2': self.t2, 'y2': self.y2}
 
+    def state(self):
+        """設定ファイル・再開用データに保存する値（FFあり/なしは含めない）"""
+        return {'T': self.T, 'ylo': self.ylo, 'yhi': self.yhi,
+                'saved': None if self.saved is None else dict(self.saved), 'manual_x': self.manual_x}
+
     def update(self, **kw):
         for key, v in kw.items():
-            setattr(self, key, bool(v) if key == 'enabled' else float(v))
-        if not self.enabled:
+            setattr(self, key, bool(v) if key in ('enabled', 'manual_x') else float(v))
+        if self.enabled:
+            vals = self.values()
+            if any(v != 0 for v in vals.values()):
+                self.saved = vals
+        else:
             self.t1 = self.y1 = self.t2 = self.y2 = 0.0
         self._check = None
         for fn in list(self.listeners):
@@ -1751,12 +2045,12 @@ class CoordControl:
         v = float(value)
         if abs(v - getattr(m, self.coord)) <= self.res / 2:
             return      # プログラムから set() したときの呼び出し
-        m.update(**{self.coord: v})
+        self.block.app.user_set(self.block.dof, **{self.coord: v})
 
     def nudge(self, sign):
         m = self.model()
         if m.enabled:
-            m.update(**{self.coord: round(getattr(m, self.coord) + sign * self.step, 6)})
+            self.block.app.user_set(self.block.dof, **{self.coord: round(getattr(m, self.coord) + sign * self.step, 6)})
 
     def on_entry(self, _event=None):
         m = self.model()
@@ -1773,7 +2067,7 @@ class CoordControl:
             self.entry.config(bg='#ffc0c0')
             return
         self.entry.config(bg='white')
-        m.update(**{self.coord: v})
+        self.block.app.user_set(self.block.dof, **{self.coord: v})
 
     def show_range(self, intervals, valid_now):
         """条件を満たしたまま動かせる範囲（valid_now）、またはエラーを解消するための移動方向と範囲を表示する"""
@@ -1832,7 +2126,7 @@ class CoordControl:
 
 
 # ==============================================================================
-# 1自由度ぶんの表示（FF設定 ＋ now/last/best の4グラフ）
+# 1自由度ぶんの表示（FF設定 ＋ now/last/First/best の4グラフ）
 # ==============================================================================
 CONSTRAINT_HELP = (
     "条件: 0 < t1 < t2 < T、y1·y2 < 0（山→谷 か 谷→山）、下限 ≤ y1, y2 ≤ 上限、"
@@ -1900,7 +2194,7 @@ class DofBlock:
         for i, name in enumerate(self.PRESET_NAMES):
             tk.Button(top, text=f"P{i + 1} {name}", command=lambda i=i: self.app.apply_preset(self.dof, i)
                       ).pack(side=tk.LEFT, padx=1)
-        tk.Button(top, text="次試行の初期値を適用", command=lambda: self.app.apply_next_init([self.dof])
+        tk.Button(top, text="x を First の T10・T90 に戻す", command=lambda: self.app.reset_x_to_first([self.dof])
                   ).pack(side=tk.LEFT, padx=(8, 0))
 
         mid = tk.Frame(self.frame)
@@ -1995,6 +2289,7 @@ class DofBlock:
                                fg='#404040' if chk.ok else '#c00000')
             for ctl in self.coords.values():
                 ctl.show_range([], True)
+        self.show_proposal(self.app.proposal_text(self.dof))
         self.refresh_sent()
         self.draw_wave()
 
@@ -2124,7 +2419,8 @@ class DofBlock:
         self.max_t = 10.0
         self.row_labels = {}
         for i, key in enumerate(ROW_KEYS, start=1):
-            lab = tk.Label(res, text=key, font=(UI_FONT, 8), justify='left', anchor='nw', width=16, wraplength=120)
+            lab = tk.Label(res, text=key, font=(UI_FONT, 8), justify='left', anchor='nw', width=16, wraplength=120,
+                           fg='#805000' if key == FIRST else 'black')
             lab.grid(row=i, column=0, sticky='nw')
             self.row_labels[key] = lab
             for j, name in enumerate(GRAPH_NAMES, start=1):
@@ -2178,7 +2474,8 @@ class DofBlock:
             for name in GRAPH_NAMES:
                 p = self.plots[(key, name)]
                 if trial is None:
-                    p.set(f"{key}", None, self.xrange(name))
+                    p.set(f"{key}", None, self.xrange(name),
+                          empty_text="First（FFなし）は未取得です" if key == FIRST else "（試行データなし）")
                 else:
                     p.set(f"{key}  DOF {self.dof}", self.app.graph(trial, self.dof, name), self.xrange(name))
 
@@ -2217,6 +2514,9 @@ TITLE_PRESET = "Preset"
 TITLE_BULK = "Bulk setting"
 TITLE_FF = "FF setting"
 TITLE_SETTINGS = "Settings / trial data"
+TITLE_FIRST = "Record First (no FF)"
+TITLE_END = "End search"
+TITLE_RESUME = "Resume search"
 
 
 class FFSettingApp:
@@ -2245,7 +2545,7 @@ class FFSettingApp:
         self.prefs_job = None
         self.layout_job = None
         self.sent_snap = node.sent_snapshot()
-        self.next_init_cache = {}
+        self.init_notes = {}        # DOF → 直前に極値の初期値を決めたときの結果（initial_extrema の戻り値）
         self.warn_lines = deque(maxlen=4)
 
         self.root = tk.Tk()
@@ -2277,6 +2577,7 @@ class FFSettingApp:
         self.set_visible_dofs([settings['start_dof']])
         self.update_presets_from_store(save=False)
         self.refresh_sent_views()
+        self.refresh_first_label()
         self.show_record_state('idle', "「● 記録待機」を押してから、GUI_android_tk.py で目標値を送ってください")
         self.poll()
         warns = [w for w in (settings_warning, self.store.load_error) if w]
@@ -2324,6 +2625,22 @@ class FFSettingApp:
         self.zero_button.pack(side=tk.LEFT, padx=6)
         self.sent_summary = tk.Label(r3, text="", font=(UI_FONT, 9), anchor='w', justify='left')
         self.sent_summary.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        r4 = tk.Frame(bar)
+        r4.pack(fill=tk.X, padx=4, pady=2)
+        self.first_button = tk.Button(r4, text="First（FFなし）を記録", command=self.on_first_button,
+                                      bg='#f4e4c4', font=(UI_FONT, 10, 'bold'))
+        self.first_button.pack(side=tk.LEFT)
+        self.resume_button = tk.Button(r4, text="探索を再開", command=self.resume_search)
+        self.resume_button.pack(side=tk.RIGHT, padx=(2, 0))
+        self.end_button = tk.Button(r4, text="探索終了", command=self.end_search, bg='#f4d4d4')
+        self.end_button.pack(side=tk.RIGHT, padx=(8, 2))
+        self.save_name_var = tk.StringVar(value=self.settings['save_name'])
+        tk.Entry(r4, textvariable=self.save_name_var, width=22).pack(side=tk.RIGHT)
+        tk.Label(r4, text="保存名（任意。保存フォルダ名の先頭に付ける）").pack(side=tk.RIGHT, padx=(8, 0))
+        self.save_name_var.trace_add("write", lambda *a: self.on_save_name_change())
+        self.first_label = tk.Label(r4, text="", font=(UI_FONT, 9, 'bold'), anchor='w', justify='left')
+        self.first_label.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=6)
         msgs = tk.Frame(bar)
         msgs.pack(fill=tk.X, padx=4)
         msgs.columnconfigure(0, weight=1)
@@ -2338,7 +2655,6 @@ class FFSettingApp:
         text, color = self.STATE_STYLE[state]
         self.record_state.config(text=text, bg=color)
         self.record_detail.config(text=detail, fg=color if state in ('eval_window', 'recording') else 'black')
-        s = self.node.session
         if state == 'armed':
             self.record_button.config(text="待機を取消", state=tk.NORMAL)
         elif state == 'eval_window':
@@ -2349,9 +2665,18 @@ class FFSettingApp:
             self.record_button.config(text="● 記録待機", state=tk.DISABLED)
         else:
             self.record_button.config(text="● 記録待機", state=tk.NORMAL)
+        self.update_buttons()
+
+    def update_buttons(self):
+        """記録・評価の状態に合わせてボタンを有効・無効にする"""
+        s = self.node.session
         recording = s is not None and s.state == Recorder.RECORDING
-        for b in (self.send_button, self.zero_button):
-            b.config(state=tk.DISABLED if recording else tk.NORMAL)
+        first_session = s is not None and s.kind == FIRST
+        busy = s is not None or self.eval_thread is not None
+        self.send_button.config(state=tk.DISABLED if recording or first_session else tk.NORMAL)
+        self.zero_button.config(state=tk.DISABLED if recording else tk.NORMAL)
+        for b in (self.first_button, self.end_button, self.resume_button):
+            b.config(state=tk.DISABLED if busy else tk.NORMAL)
 
     def read_duration(self):
         try:
@@ -2401,6 +2726,8 @@ class FFSettingApp:
             unsent = self.unsent_dofs()
             note = (f"   ※DOF {', '.join(map(str, unsent))} のFF設定は未送信です（この試行には送信済みの値が使われます）"
                     if unsent else "")
+            if self.store.rows[FIRST] is None:
+                note += "   ※First（FFなし）が未取得です"
             self.show_record_state('armed', "目標値を送ってください。目標値が1自由度でも変わった時点を 0 秒として記録します" + note)
         elif s.state == Recorder.ARMED:
             s.finish()
@@ -2468,13 +2795,14 @@ class FFSettingApp:
             if el >= s.duration:
                 s.finish()
             self.progress['value'] = int(1000 * min(1.0, el / max(s.duration, 1e-6)))
+            pre = "First（FFなし）  " if s.kind == FIRST else ""
             if el < EVAL_TIME:
                 self.show_record_state('eval_window',
-                                       f"評価区間（0〜{EVAL_TIME:g} s）: 他の目標値を送らないでください  残り {EVAL_TIME - el:.1f} s"
-                                       f"     記録 {el:.1f} / {s.duration:g} s（受信 {s.rows} 件）")
+                                       f"{pre}評価区間（0〜{EVAL_TIME:g} s）: 他の目標値を送らないでください  "
+                                       f"残り {EVAL_TIME - el:.1f} s     記録 {el:.1f} / {s.duration:g} s（受信 {s.rows} 件）")
             else:
                 self.show_record_state('recording',
-                                       f"評価区間は終わりました。目標値（Reset pose など）を送っても構いません"
+                                       f"{pre}評価区間は終わりました。目標値（Reset pose など）を送っても構いません"
                                        f"     記録 {min(el, s.duration):.1f} / {s.duration:g} s（受信 {s.rows} 件）")
         elif s.state == Recorder.CANCELLED:
             self.node.session = None
@@ -2494,22 +2822,14 @@ class FFSettingApp:
             for k, (status, _) in st.items():
                 if status in ('nosub', 'foreign'):
                     trial.meta['warnings'].append(f"board{k}: {SENT_STATUS_TEXT[status]}")
-            params = {d: (m.T, m.ylo, m.yhi) for d, m in self.models.items()}
-            self.eval_thread = threading.Thread(target=self.eval_worker, args=(trial, params), daemon=True)
+            self.eval_thread = threading.Thread(target=self.eval_worker, args=(trial, self.store.rows[FIRST]),
+                                                daemon=True)
             self.eval_thread.start()
             self.show_record_state('evaluating', "3次遅れ系の同定と評価をしています…")
 
-    def eval_worker(self, trial, params):
+    def eval_worker(self, trial, first):
         try:
-            evaluate_trial(trial)
-            nxt = {}
-            for d in FF_DOF_MAP:
-                T, ylo, yhi = params[d]
-                r = next_initial(trial, d, T, ylo, yhi)
-                nxt[str(d)] = {'values': None if r['values'] is None else list(r['values']),
-                               'target': list(r['target']), 'reasons': r['reasons'], 'exact': bool(r['exact']),
-                               'params': [T, ylo, yhi]}
-            trial.meta['next_init'] = nxt
+            evaluate_trial(trial, first)
             trial.save(self.store.trial_path(trial.id))
             self.eval_queue.put(('ok', trial))
         except Exception:
@@ -2526,19 +2846,17 @@ class FFSettingApp:
             self.show_record_state('error', "評価中にエラーが起きました（詳細は端末に表示）")
             return
         trial = obj
+        if trial.kind == FIRST:
+            self.finish_first(trial)
+            return
         try:
             best_updated = self.store.add(trial)
         except OSError as e:
             best_updated = False
             self.add_warning(f"試行データを保存できませんでした: {e}")
-        self.graph_cache = {k: v for k, v in self.graph_cache.items()
-                            if k[0] in {t.id for t in self.store.rows.values() if t is not None}}
-        self.next_init_cache = {}
+        # 極値は変えない（x は First の T10・T90 か手動の値、y は今の設定のまま次の試行に使う）
         self.update_presets_from_store()
-        applied = self.apply_next_init([d for d in FF_DOF_MAP if self.models[d].enabled], from_trial=True)
-        for block in self.blocks.values():
-            block.refresh_results()
-        self.refresh_proposals()
+        self.after_store_change()
         J = trial.J
         text = (f"記録終了（{trial.meta['start']}）: J = {J:.4g}（評価 {trial.meta['n_eval']} 自由度）"
                 if J is not None else f"記録終了（{trial.meta['start']}）: 評価できた自由度がありません")
@@ -2546,9 +2864,46 @@ class FFSettingApp:
             text += " → best を更新"
         elif not trial.meta['candidate']:
             text += f"  ※best の候補外: {trial.meta['candidate_note']}"
-        if applied:
-            text += f"   次試行の初期値を {len(applied)} 自由度に設定しました"
         self.show_record_state('done', text)
+        for w in trial.meta['warnings']:
+            self.add_warning(w)
+
+    def finish_first(self, trial):
+        """First（FFなし）の試行の評価が終わった: First にできれば置き換える（できなければ前の First のまま）"""
+        old = self.store.rows[FIRST]
+        probs = trial.meta.get('first_problems') or []
+        if probs:
+            try:
+                self.store.write_index()        # 評価のときに書いた試行データを消す
+            except OSError:
+                pass
+            self.show_record_state('error', "First（FFなし）にできませんでした: " + "、".join(probs)
+                                   + ("（前の First はそのまま）" if old is not None else ""))
+            for w in trial.meta['warnings']:
+                self.add_warning(w)
+            return
+        try:
+            self.store.set_first(trial)
+        except OSError as e:
+            self.store.rows[FIRST] = trial
+            self.add_warning(f"First の試行データを保存できませんでした: {e}")
+        # FFを与えていて x を手動で変えていない自由度は、新しい First の T10・T90 にする
+        auto = [d for d in FF_DOF_MAP if self.models[d].enabled and not self.models[d].manual_x]
+        if auto:
+            self.reset_x_to_first(auto, quiet=True)
+        self.after_store_change()
+        rises = []
+        for d in range(N_DOF):
+            ev = trial.meta['eval'][d]
+            if ev.get('status') == 'ok':
+                rises.append(f"DOF{d} T10={ev['T10']:.3f} s・T90={ev['T90']:.3f} s")
+        self.show_record_state('done', f"First（FFなし）を{'取り直しました' if old is not None else '取得しました'}"
+                                       f"（{trial.meta['start'].replace('T', ' ')}）: " + "、".join(rises))
+        for key in ('now', 'best'):
+            t = self.store.rows[key]
+            if t is not None and posture_diff(t.meta, trial.meta):
+                self.add_warning(f"{key} の試行は新しい First と目標姿勢が違います。"
+                                 "別の姿勢を探索するときは「探索終了」で区切ってください")
         for w in trial.meta['warnings']:
             self.add_warning(w)
 
@@ -2570,15 +2925,43 @@ class FFSettingApp:
         """全自由度を「FFなし」にして送る。確認でOKを押すまで、設定も変えず何も送らない"""
         if not messagebox.askokcancel(TITLE_SEND_ZERO,
                                       "全自由度のFF設定を「FFなし」（極値・係数すべて0）にして送信します。よろしいですか？\n"
-                                      "（今の設定はプリセットに登録していなければ失われます）"):
+                                      "（今の極値は覚えておき、FFを与え直すと戻ります）"):
             return
+        self.publish_zero(TITLE_SEND_ZERO)
+
+    def publish_zero(self, title):
+        """全自由度に FF=0 を送り、送れたら設定を「FFなし」にする（極値は覚えておく）。戻り値: 送ったか"""
         table = zero_ff_table()
         for n, d in enumerate(FF_DOF_MAP):
             table[n, 5] = self.models[d].T
-        if not self.publish_all(table, [None] * N_FF, TITLE_SEND_ZERO):
-            return
+        if not self.publish_all(table, [None] * N_FF, title):
+            return False
         for d in FF_DOF_MAP:
             self.models[d].update(enabled=False)
+        return True
+
+    def on_first_button(self):
+        """全自由度に FF=0 を送ってから First（FFなし）の記録待機にする。確認でOKを押すまで何も送らない"""
+        if self.node.session is not None or self.eval_thread is not None:
+            return
+        duration = self.read_duration()
+        if duration is None:
+            messagebox.showerror(TITLE_FIRST, f"記録時間は {RECORD_DURATION_MIN:g}〜{RECORD_DURATION_MAX:g} s で入力してください")
+            return
+        old = self.store.rows[FIRST]
+        text = ("全自由度のFFを 0（FFなし）にして送信し、First（FFなし）の記録待機にします。\n"
+                "送信したら GUI_android_tk.py で目標値を送ってください（ADRCだけの応答を記録します）。\n"
+                "今の極値は覚えておき、FFを与え直すと戻ります。")
+        if old is not None:
+            text += (f"\n\nFirst は取得済みです（{old.meta['start'].replace('T', ' ')}）。取り直しますか？\n"
+                     "新しい First を評価できたときだけ置き換えます（できなければ今の First のまま）。")
+        if not messagebox.askokcancel(TITLE_FIRST, text):
+            return
+        if not self.publish_zero(TITLE_FIRST):
+            return
+        self.node.session = Recorder(duration, kind=FIRST)
+        self.show_record_state('armed', "First（FFなし）: 全自由度に FF=0 を送信しました。目標値を送ってください。"
+                                        "目標値が1自由度でも変わった時点を 0 秒として記録します")
 
     def publish_all(self, table, settings, title=None):
         """全ボードへ送る。戻り値: 送ったか（記録中・確認でキャンセルなら False で、何も送らない）"""
@@ -2614,66 +2997,57 @@ class FFSettingApp:
     # FF設定の操作（DOFブロック・一括設定・プリセットから共通）
     # =========================================================
     def set_dof_params(self, dof, **kw):
-        m = self.models[dof]
-        m.update(**kw)
-        self.settings['dof'][str(dof)] = {'T': m.T, 'ylo': m.ylo, 'yhi': m.yhi}
-        self.next_init_cache.pop(dof, None)
-        self.save_prefs_later()
+        """T・y上下限などを変える（設定ファイルへの保存は on_any_model_change で行う）"""
+        self.models[dof].update(**kw)
 
-    def default_shape(self, dof):
-        """前回の試行が使えないときの初期値: t(t−T/2)(t−T) 形（極値 ±DEFAULT_FF_PEAK）を上下限に収めたもの"""
-        m = self.models[dof]
-        t1, t2 = m.T * (3 - math.sqrt(3)) / 6, m.T * (3 + math.sqrt(3)) / 6
-        return nearest_feasible(m.T, t1, DEFAULT_FF_PEAK, t2, -DEFAULT_FF_PEAK, m.ylo, m.yhi)
+    def user_set(self, dof, **kw):
+        """ユーザーの操作（スライダー・▲▼・入力・一括設定）で極値を変える。t1・t2 を変えたら「手動の x」にする"""
+        if 't1' in kw or 't2' in kw:
+            kw['manual_x'] = True
+            self.init_notes.pop(dof, None)
+        self.models[dof].update(**kw)
 
-    def next_init_for(self, dof):
-        """now の試行から求めた次試行の初期値（今の T・上下限で計算）"""
-        trial = self.store.rows['now']
-        if trial is None:
-            return None
-        if dof not in self.next_init_cache:
-            m = self.models[dof]
-            stored = trial.meta.get('next_init', {}).get(str(dof))
-            # 評価したときと T・上下限が同じなら、そのときの結果を使う
-            if stored is not None and tuple(stored.get('params', ())) == (m.T, m.ylo, m.yhi):
-                self.next_init_cache[dof] = stored
-            else:
-                r = next_initial(trial, dof, m.T, m.ylo, m.yhi)
-                self.next_init_cache[dof] = {'values': r['values'], 'target': r['target'], 'reasons': r['reasons'],
-                                             'exact': r['exact']}
-        return self.next_init_cache[dof]
+    def initial_for(self, dof, saved=None, manual_x=None):
+        m = self.models[dof]
+        return initial_extrema(dof, m.T, m.ylo, m.yhi, self.store.rows[FIRST], self.store.rows['now'],
+                               m.saved if saved is None else saved, m.manual_x if manual_x is None else manual_x)
 
     def enable_ff(self, dof):
-        """FFを有効にする。極値は次試行の初期値（now の試行がなければ既定の形）から始める"""
+        """FFを有効にする。極値は手動の x か First の T10・T90、覚えている y（initial_extrema）から始める"""
         m = self.models[dof]
-        init = self.next_init_for(dof)
-        vals = init['values'] if init is not None else None
-        if vals is None:
-            vals = self.default_shape(dof)
-        if vals is None:
-            messagebox.showerror(TITLE_FF, f"DOF {dof}: y の上下限の中で条件を満たす初期値が見つかりません")
+        r = self.initial_for(dof)
+        if r['values'] is None:
+            messagebox.showerror(TITLE_FF, f"DOF {dof}: 条件を満たす初期値が見つかりません。\n" + "\n".join(r['reasons']))
             m.update(enabled=False)
             return
-        m.update(enabled=True, t1=vals[0], y1=vals[1], t2=vals[2], y2=vals[3])
+        v = r['values']
+        self.init_notes[dof] = r
+        m.update(enabled=True, t1=v[0], y1=v[1], t2=v[2], y2=v[3])
 
-    def apply_next_init(self, dofs, from_trial=False):
-        """次試行の初期値（T10・T90 と前回の y）を設定する。戻り値: 設定した自由度"""
-        applied = []
-        missing = []
+    def reset_x_to_first(self, dofs, quiet=False):
+        """t1・t2 を First の T10・T90 に戻す（手動の印を消す。y は今の値）。FFなしの自由度はFFを与える
+
+        First の T10・T90 がない自由度は変えない（理由を表示する）。戻り値: 設定した自由度
+        """
+        done, missing = [], []
         for d in dofs:
-            init = self.next_init_for(d)
-            if init is None or init['values'] is None:
-                missing.append(d)
+            T10, _T90, why = first_rise(self.store.rows[FIRST], d)
+            if T10 is None:
+                missing.append(f"DOF {d}: {why}")
                 continue
-            v = init['values']
-            self.models[d].update(enabled=True, t1=v[0], y1=v[1], t2=v[2], y2=v[3])
-            applied.append(d)
-        if missing and not from_trial:
-            messagebox.showinfo(TITLE_FF,
-                                "次の自由度は初期値を求められません（now の試行がない、または条件を満たす値がない）:\n  "
-                                + ", ".join(f"DOF {d}" for d in missing))
-        self.refresh_proposals()
-        return applied
+            m = self.models[d]
+            r = self.initial_for(d, saved=m.values() if m.enabled else m.saved, manual_x=False)
+            if r['values'] is None:
+                missing.append(f"DOF {d}: " + " / ".join(r['reasons']))
+                continue
+            v = r['values']
+            self.init_notes[d] = r
+            m.update(enabled=True, manual_x=False, t1=v[0], y1=v[1], t2=v[2], y2=v[3])
+            done.append(d)
+        if missing and not quiet:
+            messagebox.showinfo(TITLE_FF, "次の自由度は First の T10・T90 に戻せません（設定は変えていません）:\n  "
+                                + "\n  ".join(missing))
+        return done
 
     def refresh_proposals(self):
         for dof, block in self.blocks.items():
@@ -2681,17 +3055,29 @@ class FFSettingApp:
                 block.show_proposal(self.proposal_text(dof))
 
     def proposal_text(self, dof):
-        init = self.next_init_for(dof)
-        if init is None:
-            return "次試行の初期値: now の試行がまだありません"
-        tgt = init['target']
-        text = (f"次試行の初期値（now の試行から）: 目標 t1=T10={tgt[0]:.3f} s, y1={tgt[1]:.3f}, "
-                f"t2=T90={tgt[2]:.3f} s, y2={tgt[3]:.3f}")
-        if init['values'] is not None and not init['exact']:
-            v = init['values']
-            text += f"  → 実現可能な値 t1={v[0]:.3f}, y1={v[1]:.3f}, t2={v[2]:.3f}, y2={v[3]:.3f}"
-        if init['reasons']:
-            text += "\n  " + "\n  ".join(init['reasons'])
+        """極値の時刻の初期値（First の T10・T90）と、今の x がどこから来たかの表示"""
+        m = self.models[dof]
+        T10, T90, why = first_rise(self.store.rows[FIRST], dof)
+        if T10 is None:
+            text = f"x の初期値（First の T10・T90）: {why}"
+            if self.store.rows[FIRST] is None:
+                text += "。「First（FFなし）を記録」で取得してください"
+        else:
+            text = f"x の初期値（First の T10・T90）: t1 = T10 = {T10:.3f} s, t2 = T90 = {T90:.3f} s"
+            if T90 >= m.T:
+                text += f"   ※T90 が FF終了時刻 T = {m.T:g} s 以上です"
+        if m.enabled:
+            if m.manual_x:
+                text += "\n今の x: 手動で設定した値（試行の後も変えません。「x を First の T10・T90 に戻す」で戻せます）"
+            elif T10 is not None and abs(m.t1 - T10) < 5e-4 and abs(m.t2 - T90) < 5e-4:
+                text += "\n今の x: First の T10・T90"
+            elif T10 is not None:
+                text += "\n今の x: First の T10・T90 を、条件を満たす値へ動かしたもの"
+            else:
+                text += "\n今の x: First の値ではありません（t(t−T/2)(t−T) 形、または前に設定した値）"
+        r = self.init_notes.get(dof)
+        if r is not None and r['reasons']:
+            text += "\n直前に初期値を設定したとき: " + " / ".join(r['reasons'])
         return text
 
     def apply_preset(self, dof, k):
@@ -2704,15 +3090,18 @@ class FFSettingApp:
             messagebox.showerror(TITLE_PRESET, f"プリセット{k + 1}の T = {p['T']} は範囲外です")
             return
         m = self.models[dof]
+        self.init_notes.pop(dof, None)
         if p['enabled']:
-            m.update(T=p['T'], enabled=True, t1=p['t1'], y1=p['y1'], t2=p['t2'], y2=p['y2'])
+            # プリセットの x が First の T10・T90 と違えば「手動の x」として引き継ぐ
+            T10, T90, _ = first_rise(self.store.rows[FIRST], dof)
+            manual = T10 is None or abs(p['t1'] - T10) > 5e-4 or abs(p['t2'] - T90) > 5e-4
+            m.update(T=p['T'], enabled=True, manual_x=manual, t1=p['t1'], y1=p['y1'], t2=p['t2'], y2=p['y2'])
         else:
             m.update(T=p['T'], enabled=False)
-        self.set_dof_params(dof)
 
     def update_presets_from_store(self, save=True):
         """プリセット1〜3 に now・last・best の試行で使ったFFの極値を登録する"""
-        for k, key in enumerate(ROW_KEYS):
+        for k, key in enumerate(PRESET_ROWS):
             trial = self.store.rows[key]
             if trial is None:
                 continue
@@ -2731,6 +3120,8 @@ class FFSettingApp:
 
     def on_any_model_change(self, model):
         self.schedule_bulk_row(model.dof)
+        self.settings['dof'][str(model.dof)] = model.state()
+        self.save_prefs_later()
 
     def is_unsent(self, dof):
         """FF設定が、GUIが最後に送信した値と違うか"""
@@ -2755,16 +3146,21 @@ class FFSettingApp:
 
     def row_text(self, key, trial, dof):
         if trial is None:
+            if key == FIRST:
+                return "First（FFなし）\n未取得\n「First（FFなし）を記録」で取得してください"
             return f"{key}\n（なし）"
         m = trial.meta
-        lines = [f"{key}  {m['start'].replace('T', ' ')[5:]}"]
-        lines.append(f"J = {m['J']:.4g}（{m['n_eval']} DOF の平均）" if m['J'] is not None else "J = なし")
+        lines = [f"{'First（FFなし）' if key == FIRST else key}  {m['start'].replace('T', ' ')[5:]}"]
+        lines.append((f"J = {m['J']:.4g}（{m['n_eval']} DOF の平均）" if m['J'] is not None else "J = なし")
+                     + ("（参考）" if key == FIRST else ""))
         ev = m['eval'][dof]
         if ev.get('status') == 'ok':
             lines.append(f"このDOF: J_i = {ev['J']:.4g}\nΔPOT = {ev['dpot']:g}")
+            if key == FIRST:
+                lines.append(f"T10 = {ev['T10']:.3f} s\nT90 = {ev['T90']:.3f} s")
         else:
             lines.append(f"このDOF: {ev.get('note') or ev.get('status')}")
-        if not m.get('candidate'):
+        if key != FIRST and not m.get('candidate'):
             lines.append(f"best候補外: {m.get('candidate_note')}")
         return "\n".join(lines)
 
@@ -2774,16 +3170,26 @@ class FFSettingApp:
             messagebox.showinfo(TITLE_SAVE, f"{key} の試行はまだありません")
             return
         try:
-            folder = make_save_folder(self.base_dir(), key, trial.meta['stamp'])
+            base = self.base_dir()
         except OSError as e:
             messagebox.showerror(TITLE_SAVE, f"保存先にフォルダを作れません:\n{e}")
             return
+        self.start_save(key, trial, base)
+
+    def start_save(self, key, trial, base):
+        """試行の CSV・グラフを <保存先>/<名前>/ に書く（別プロセス）。戻り値: 作ったフォルダ（作れなければ None）"""
+        try:
+            folder = make_save_folder(base, trial_folder_name(trial, key, self.save_name_var.get()))
+        except OSError as e:
+            messagebox.showerror(TITLE_SAVE, f"保存先にフォルダを作れません:\n{e}")
+            return None
         ctx = multiprocessing.get_context('spawn')
         q = ctx.Queue()
         proc = ctx.Process(target=save_trial_outputs, args=(trial.payload(), folder, key, q), name="ff_trial_save")
         proc.start()
         self.saves.append({'proc': proc, 'queue': q, 'folder': folder, 'key': key, 'dead': 0, 'text': "開始"})
         self.update_save_status()
+        return folder
 
     def poll_saves(self):
         if not self.saves:
@@ -2827,6 +3233,151 @@ class FFSettingApp:
     def update_save_status(self):
         self.save_status.grid()
         self.save_status.config(text="保存中: " + "   ".join(f"{j['key']} {j['text']} → {j['folder']}" for j in self.saves))
+
+    # =========================================================
+    # First・探索終了・探索の再開
+    # =========================================================
+    def on_save_name_change(self):
+        self.settings['save_name'] = self.save_name_var.get()
+        self.save_prefs_later()
+
+    def refresh_first_label(self):
+        first = self.store.rows[FIRST]
+        if first is None:
+            self.first_label.config(text="First（FFなし）: 未取得 ― 極値の時刻 t1・t2 の初期値（T10・T90）に使います",
+                                    fg='#c04000')
+            return
+        dofs = name_dofs(first)
+        moves = [f"DOF{d} {format_target(first.meta['init_target'][d])}→{format_target(first.meta['target'][d])}"
+                 for d in dofs[:6]]
+        self.first_label.config(text=f"First（FFなし）: 取得済み {first.meta['start'].replace('T', ' ')}   目標値 "
+                                     + ", ".join(moves) + (" …" if len(dofs) > 6 else ""), fg='#207020')
+
+    def after_store_change(self):
+        """First・now・last・best が変わったあとの表示の更新"""
+        ids = {t.id for t in self.store.rows.values() if t is not None}
+        self.graph_cache = {k: v for k, v in self.graph_cache.items() if k[0] in ids}
+        for block in self.blocks.values():
+            block.refresh_results()
+        self.refresh_proposals()
+        self.refresh_first_label()
+        self.refresh_preset_tab()
+
+    def busy_message(self):
+        if self.node.session is not None:
+            return "記録待機中・記録中です"
+        if self.eval_thread is not None:
+            return "評価中です"
+        return None
+
+    def end_search(self):
+        """探索を終える: best・First を保存するか選び、再開用データを保存してから First・試行・極値を空にする"""
+        busy = self.busy_message()
+        if busy:
+            messagebox.showerror(TITLE_END, f"{busy}。終わってから探索を終了してください")
+            return
+        rows = dict(self.store.rows)
+        if self.store.is_empty():
+            if messagebox.askokcancel(TITLE_END, "First・試行のデータがありません。\n"
+                                                 "探索を終了して、極値の設定を空（FFなし）にしますか？（FFは送信しません）"):
+                self.clear_search()
+                self.show_record_state('idle', "探索を終了しました（保存するデータはありませんでした）")
+            return
+        missing = [k for k in ('best', FIRST) if rows[k] is None]
+        ans = messagebox.askyesnocancel(
+            TITLE_END,
+            "探索を終了します。best と First の結果（CSV・グラフ）を保存しますか？\n\n"
+            "  はい: best と First を保存先に保存する" + (f"（{'・'.join(missing)} はないので保存しません）" if missing else "")
+            + "\n  いいえ: 保存しない\n  キャンセル: 探索を続ける\n\n"
+            "どちらの場合も、探索を再開するためのデータ（First・now・last・best・FF設定・プリセット・保存名）は"
+            "保存先に保存します。\n終了すると First・試行・プリセット1〜3・極値の設定を空にします（FFは送信しません）。")
+        if ans is None:
+            return
+        try:
+            base = self.base_dir()
+            src = rows['best'] or rows[FIRST] or rows['now'] or rows['last']
+            name = build_name(self.save_name_var.get(), dof_name_parts(src),
+                              f"search_{datetime.now().strftime('%Y%m%d_%H%M')}")
+            folder = make_save_folder(base, name)
+            states = {d: dict(m.state(), enabled=m.enabled) for d, m in self.models.items()}
+            write_search_state(folder, rows, states, self.settings['presets'], self.save_name_var.get())
+        except (OSError, ValueError) as e:
+            messagebox.showerror(TITLE_END, f"再開用のデータを保存できなかったため、探索を終了しません:\n{e}")
+            return
+        saved = []
+        if ans:
+            for key in ('best', FIRST):
+                if rows[key] is not None and self.start_save(key, rows[key], base):
+                    saved.append(key)
+        self.clear_search()
+        text = f"探索を終了しました。再開用データ: {folder}"
+        if ans:
+            text += "   保存: " + ("・".join(saved) if saved else "なし（best・First がありません）")
+        self.show_record_state('idle', text)
+
+    def clear_search(self):
+        """First・now・last・best・プリセット1〜3・極値（覚えている値・手動の x）を空にする。T・y上下限・プリセット4は残す"""
+        try:
+            self.store.replace({})
+        except OSError as e:
+            self.add_warning(f"試行データを消せませんでした: {e}")
+        for k in range(len(PRESET_ROWS)):
+            self.settings['presets'][k] = [None] * N_FF
+        self.init_notes = {}
+        for m in self.models.values():
+            m.saved = None
+            m.manual_x = False
+            m.update(enabled=False)
+        self.graph_cache = {}
+        self.after_store_change()
+        self.save_prefs_later()
+
+    def resume_search(self):
+        """「探索終了」で保存したフォルダを読み込み、First・試行・FF設定・プリセット・保存名を戻す（FFは送信しない）"""
+        busy = self.busy_message()
+        if busy:
+            messagebox.showerror(TITLE_RESUME, f"{busy}。終わってから再開してください")
+            return
+        if not self.store.is_empty() and not messagebox.askokcancel(
+                TITLE_RESUME, "今の探索（First・now・last・best・極値の設定）を、読み込む探索で置き換えます。\n"
+                              "今の探索を残すには、先に「探索終了」で保存してください。\n続けますか？"):
+            return
+        try:
+            initial = self.base_dir()
+        except OSError:
+            initial = os.getcwd()
+        folder = filedialog.askdirectory(initialdir=initial, mustexist=True,
+                                         title="Select a saved search folder (*_search_*)")
+        if not folder:
+            return
+        try:
+            st = read_search_state(folder)
+        except ValueError as e:
+            messagebox.showerror(TITLE_RESUME, f"読み込めませんでした（何も変えていません）:\n{e}")
+            return
+        try:
+            self.store.replace(st['rows'])
+        except OSError as e:
+            self.add_warning(f"読み込んだ試行データを {self.store.folder} に保存できませんでした: {e}")
+        self.settings['presets'] = st['presets']
+        self.init_notes = {}
+        for d, m in self.models.items():
+            v = st['dof'][d]
+            m.saved = v['saved']
+            m.manual_x = v['manual_x']
+            if v['enabled']:
+                m.update(T=v['T'], ylo=v['ylo'], yhi=v['yhi'], enabled=True, **v['saved'])
+            else:
+                m.update(T=v['T'], ylo=v['ylo'], yhi=v['yhi'], enabled=False)
+        self.save_name_var.set(st['save_name'])
+        self.graph_cache = {}
+        self.after_store_change()
+        self.save_prefs_later()
+        enabled = [d for d in FF_DOF_MAP if self.models[d].enabled]
+        if enabled:
+            self.set_visible_dofs(enabled)
+        self.show_record_state('idle', f"探索を再開しました: {folder}   FF設定はまだ送信していません"
+                                       "（実機のFFは 0 前提・未確認。送るには「FFパラメータ送信」）")
 
     # =========================================================
     # メインタブ（表示する自由度・自由度ごとのブロック）
@@ -2961,7 +3512,7 @@ class FFSettingApp:
         tk.Button(r1, text="FFを与える", command=lambda: self.bulk(lambda d: self.enable_ff(d))).pack(side=tk.LEFT, padx=1)
         tk.Button(r1, text="FFなしにする", command=lambda: self.bulk(lambda d: self.models[d].update(enabled=False))
                   ).pack(side=tk.LEFT, padx=1)
-        tk.Button(r1, text="次試行の初期値を適用", command=lambda: self.apply_next_init(self.bulk_selected())
+        tk.Button(r1, text="x を First の T10・T90 に戻す", command=lambda: self.bulk_reset_x()
                   ).pack(side=tk.LEFT, padx=1)
         for k, name in enumerate(DofBlock.PRESET_NAMES):
             tk.Button(r1, text=f"P{k + 1} {name}を適用",
@@ -3032,6 +3583,13 @@ class FFSettingApp:
         for d in sel:
             fn(d)
 
+    def bulk_reset_x(self):
+        sel = self.bulk_selected()
+        if not sel:
+            messagebox.showinfo(TITLE_BULK, "自由度を選択してください")
+            return
+        self.reset_x_to_first(sel)
+
     def bulk_apply_values(self):
         sel = self.bulk_selected()
         if not sel:
@@ -3058,11 +3616,12 @@ class FFSettingApp:
         for d in sel:
             p = {k: vals[k] for k in ('T', 'ylo', 'yhi') if k in vals}
             ext = {k: vals[k] for k in self.BULK_COLS if k in vals}
+            if p:
+                self.set_dof_params(d, **p)
             if ext:
                 if not self.models[d].enabled:
                     self.enable_ff(d)
-                p.update(ext)
-            self.set_dof_params(d, **p)
+                self.user_set(d, **ext)
 
     def on_bulk_entry(self, d, key):
         e = self.bulk_rows[d]['entries'][key]
@@ -3076,7 +3635,7 @@ class FFSettingApp:
         if key in self.BULK_COLS:
             if not m.enabled:
                 self.enable_ff(d)
-            m.update(**{key: v})
+            self.user_set(d, **{key: v})
         elif key == 'T':
             if not FF_T_RANGE[0] <= v <= FF_T_RANGE[1]:
                 e.config(bg='#ffc0c0')
