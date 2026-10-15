@@ -1910,6 +1910,32 @@ class PlotCanvas:
 # ==============================================================================
 # 1自由度のFF設定（GUIスレッドだけが触る）
 # ==============================================================================
+# ------------------------------
+# 数値の入力欄
+# ------------------------------
+def entry_editing(app, entry):
+    """入力欄が手入力の途中か（フォーカスがあり、プログラムが書いた値・確定した値と違う文字が入っている）
+
+    フォーカスがあるだけでは途中とみなさない。手入力を Enter で確定したあともフォーカスは入力欄に残り、
+    スライダー・▲▼ボタンはフォーカスを取らないので、フォーカスだけで判定すると数値の表示が更新されなくなる。
+    """
+    return app.focused() is entry and entry.get().strip() != getattr(entry, 'written', None)
+
+
+def write_entry(entry, text, state=None):
+    """プログラムから入力欄に書く（確定済みの値として覚える）"""
+    entry.config(state=tk.NORMAL)
+    entry.delete(0, tk.END)
+    entry.insert(0, text)
+    entry.config(bg='white', **({} if state is None else {'state': state}))
+    entry.written = text
+
+
+def mark_committed(entry):
+    """入力欄の今の文字を確定済みにする（次の表示の更新で、値を書き直してよい）"""
+    entry.written = entry.get().strip()
+
+
 class DofModel:
     def __init__(self, dof, T, ylo, yhi, saved=None, manual_x=False):
         self.dof = dof
@@ -2004,7 +2030,6 @@ class CoordControl:
         self.range_label.grid(row=row, column=5, sticky='w', padx=4)
         self.bar = tk.Canvas(parent, height=7, highlightthickness=0)
         self.bar.grid(row=row + 1, column=2, sticky='ew')
-        self.written = None
         self.intervals = []
         self.bar.bind("<Configure>", lambda e: self.draw_bar())
 
@@ -2026,12 +2051,10 @@ class CoordControl:
         if m.enabled and abs(float(self.scale.get()) - v) > self.res / 2:
             self.scale.set(v)
         text = f"{v:.4f}" if self.is_t else f"{v:.3f}"
-        if self.block.app.focused() is not self.entry or not m.enabled:
-            self.entry.config(state=tk.NORMAL)
-            self.entry.delete(0, tk.END)
-            self.entry.insert(0, text if m.enabled else "0")
-            self.entry.config(bg='white', state=state)
-            self.written = text
+        if not m.enabled:
+            write_entry(self.entry, "0", state)
+        elif not entry_editing(self.block.app, self.entry):
+            write_entry(self.entry, text, state)
 
     def user_touch(self, pressed):
         if pressed is not None:
@@ -2045,11 +2068,13 @@ class CoordControl:
         v = float(value)
         if abs(v - getattr(m, self.coord)) <= self.res / 2:
             return      # プログラムから set() したときの呼び出し
+        mark_committed(self.entry)      # 確定していない手入力があっても、スライダーの値で書き直す
         self.block.app.user_set(self.block.dof, **{self.coord: v})
 
     def nudge(self, sign):
         m = self.model()
         if m.enabled:
+            mark_committed(self.entry)
             self.block.app.user_set(self.block.dof, **{self.coord: round(getattr(m, self.coord) + sign * self.step, 6)})
 
     def on_entry(self, _event=None):
@@ -2057,7 +2082,7 @@ class CoordControl:
         if not m.enabled:
             return
         text = self.entry.get().strip()
-        if text == self.written:
+        if text == getattr(self.entry, 'written', None):
             return
         try:
             v = float(text)
@@ -2067,6 +2092,7 @@ class CoordControl:
             self.entry.config(bg='#ffc0c0')
             return
         self.entry.config(bg='white')
+        mark_committed(self.entry)
         self.block.app.user_set(self.block.dof, **{self.coord: v})
 
     def show_range(self, intervals, valid_now):
@@ -2231,6 +2257,7 @@ class DofBlock:
 
     def nudge_T(self, sign):
         m = self.model
+        mark_committed(self.T_entry)
         self.app.set_dof_params(self.dof, T=min(max(round(m.T + sign * T_STEP, 6), FF_T_RANGE[0]), FF_T_RANGE[1]))
 
     def on_param_entry(self, _event=None):
@@ -2253,6 +2280,8 @@ class DofBlock:
         if bad:
             self.status.config(text="入力範囲: " + "、".join(bad), fg='#a00000')
             return
+        for e in (self.T_entry, self.ylo_entry, self.yhi_entry):
+            mark_committed(e)
         if (T, ylo, yhi) != (m.T, m.ylo, m.yhi):
             self.app.set_dof_params(self.dof, T=T, ylo=ylo, yhi=yhi)
 
@@ -2264,12 +2293,9 @@ class DofBlock:
         self.refresh_job = None
         m = self.model
         self.enabled_var.set(m.enabled)
-        focus = self.app.focused()
         for e, v in ((self.T_entry, m.T), (self.ylo_entry, m.ylo), (self.yhi_entry, m.yhi)):
-            if focus is not e:
-                e.delete(0, tk.END)
-                e.insert(0, f"{v:g}")
-                e.config(bg='white')
+            if not entry_editing(self.app, e):
+                write_entry(e, f"{v:g}")
         chk = m.check()
         for c in self.coords.values():
             c.set_limits()
@@ -3633,6 +3659,7 @@ class FFSettingApp:
         e.config(bg='white')
         m = self.models[d]
         if key in self.BULK_COLS:
+            mark_committed(e)
             if not m.enabled:
                 self.enable_ff(d)
             self.user_set(d, **{key: v})
@@ -3640,12 +3667,14 @@ class FFSettingApp:
             if not FF_T_RANGE[0] <= v <= FF_T_RANGE[1]:
                 e.config(bg='#ffc0c0')
                 return
+            mark_committed(e)
             self.set_dof_params(d, T=v)
         else:
             ylo, yhi = (v, m.yhi) if key == 'ylo' else (m.ylo, v)
             if not (-PWM_LIMIT <= ylo < 0 < yhi <= PWM_LIMIT):
                 e.config(bg='#ffc0c0')
                 return
+            mark_committed(e)
             self.set_dof_params(d, ylo=ylo, yhi=yhi)
 
     def schedule_bulk_row(self, d):
@@ -3657,14 +3686,9 @@ class FFSettingApp:
         m = self.models[d]
         row = self.bulk_rows[d]
         row['enabled'].set(m.enabled)
-        focus = self.focused()
         for key, e in row['entries'].items():
-            if focus is e:
-                continue
-            v = getattr(m, key)
-            e.config(state=tk.NORMAL, bg='white')
-            e.delete(0, tk.END)
-            e.insert(0, f"{v:.6g}")
+            if not entry_editing(self, e):
+                write_entry(e, f"{getattr(m, key):.6g}")
         chk = m.check()
         if not m.enabled:
             row['judge'].config(text="FFなし", fg='#404040')
