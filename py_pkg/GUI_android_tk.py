@@ -9,10 +9,13 @@ POT目標値GUI（/board_android_float/sub へ26自由度の目標値を送る�
     プリセット5   … メイン画面の「現在の目標値をプリセット5に登録」で登録
 ・全自由度の実測POTと目標値を常時受信して保持するので、表示DOFを切り替えてもグラフが途切れない。
 ・グラフは表示DOFを複数選択でき、選択したDOFごとに実測POTと目標値を表示する。
+  グラフをクリックすると、そのDOFを目標値スライダのDOFにする（切り替えるだけで目標値は送信しない）。
   グラフの大きさ・並びは表示領域（モニター・ウィンドウの大きさ、上下の境界の位置）に合わせて自動で変わり、
   収まらないときは縦スクロールで見られる。上（グラフ）と下（操作部）の境界はドラッグで動かせる。
   「グラフ停止」で表示を止めて見られる（受信・記録は止まらない。停止中も表示DOF・表示時間幅は変えられる）。
 ・操作部は 左 = Random Target / 中央 = 目標値の入力 / 右 = 記録 の3列（ウィンドウが狭いときは左右を中央の下へ回す）。
+・連続ランダム送信: Random Target の「間隔 [s]」「回数」を指定して開始すると、Send Random Target と同じ目標値
+  （チェックしたDOFを RANDOM_RANGE の範囲でランダムに）を、開始時に1回目、以後その間隔ごとに指定回数まで送る。途中で停止できる。
 ・他プログラムが /board_android_float/sub に送った目標値もGUIの表示・内部状態に反映する。
 ・記録: 「記録開始」で待機状態になり、どれか1つの自由度でも目標値が直前と変わった時点を 0 秒として、
   記録時間（記録中も変更可）のあいだ全自由度の 実測POT・目標値・z3・PWM を記録する。
@@ -20,7 +23,13 @@ POT目標値GUI（/board_android_float/sub へ26自由度の目標値を送る�
     <保存先>/data_YYYYMMDD_HHMMSS/DOF/DOF<n>/time-pot.png       … 実測POTと目標値
                                             /time-z3.png        … 外乱推定値 z3
                                             /time-PWM.png       … PWM
+    <保存先>/data_YYYYMMDD_HHMMSS/data_YYYYMMDD_HHMMSS_ADRCparam.csv … 記録開始時・終了時の全自由度のADRCパラメータ
+                                                                     （Teensy から受信した現在設定値。形式は adrc_param_common.write_param_sheet）
   グラフは保存したCSVを読み直して作る（別プロセスで作るのでGUIは止まらない）。
+・ADRCパラメータ（kp, kd, input_coef, lambda_0）: 起動時に GUI_android_tk_ADRCparamChg.py で保存したパラメータ
+  （adrc_param_common.PARAM_FILE）を読み込む。送信は「ADRCパラメータを送信」ボタンを押したときだけ（制御対象の自由度のみ）。
+  送信したかどうかと、Teensy が返す現在設定値で確かめた設定状態をボードごとに表示する。
+  <対応Arduinoプログラム> ADRC_ROS2_tk_FF_ADRCparamChange-board1〜5（パラメータのトピックが無いファームでは「未受信」のまま）
 """
 import csv
 import json
@@ -48,6 +57,11 @@ from tkinter import font as tkfont
 import time
 
 import random
+
+try:
+    from . import adrc_param_common as adrc
+except ImportError:     # スクリプトとして直接実行したとき
+    import adrc_param_common as adrc
 
 # ------------------------------
 # 日本語表示用フォント
@@ -145,6 +159,13 @@ RANDOM_RANGE = [
 
 RANDOM_ENABLE = [True]*26
 
+# 連続ランダム送信（指定した間隔ごとに、指定した回数だけ Send Random Target と同じ目標値を送る）
+RANDOM_SERIES_INTERVAL_DEFAULT = 5.0    # 間隔の初期値 [s]
+RANDOM_SERIES_COUNT_DEFAULT = 10        # 回数の初期値
+RANDOM_SERIES_INTERVAL_MIN = 0.1        # 間隔の範囲 [s]
+RANDOM_SERIES_INTERVAL_MAX = 3600.0
+RANDOM_SERIES_COUNT_MAX = 100000        # 回数の上限
+
 # ------------------------------
 # 自由度(DOF)とボードの対応・トピック
 # ------------------------------
@@ -170,7 +191,8 @@ SENSOR_QOS_DEPTH = 100
 # JSON: {"version": 1,
 #        "initial_pose": [26個], "presets": [[26個] または null（未登録）, ×5],
 #        "graph_dofs": [グラフを表示するDOF番号, ...],
-#        "record_dir": 記録の保存先フォルダ（null なら起動したフォルダ）, "record_duration": 記録時間 [s]}
+#        "record_dir": 記録の保存先フォルダ（null なら起動したフォルダ）, "record_duration": 記録時間 [s],
+#        "random_interval": 連続ランダム送信の間隔 [s], "random_count": 連続ランダム送信の回数}
 SETTINGS_FILE = os.path.expanduser('~/.armrobot_gui_android_tk.json')
 NUM_PRESETS = 5
 # 「現在の目標値をプリセットに登録」ボタンの登録先（プリセット5）。これ以外はタブで編集する
@@ -224,6 +246,8 @@ def default_settings():
         'graph_dofs': [0],
         'record_dir': None,
         'record_duration': RECORD_DURATION_DEFAULT,
+        'random_interval': RANDOM_SERIES_INTERVAL_DEFAULT,
+        'random_count': RANDOM_SERIES_COUNT_DEFAULT,
     }
 
 
@@ -286,6 +310,19 @@ def load_settings(path=None):
     elif duration is not None:
         bad.append("record_duration")
 
+    interval = data.get('random_interval')
+    if (isinstance(interval, (int, float)) and not isinstance(interval, bool)
+            and RANDOM_SERIES_INTERVAL_MIN <= interval <= RANDOM_SERIES_INTERVAL_MAX):
+        settings['random_interval'] = float(interval)
+    elif interval is not None:
+        bad.append("random_interval")
+
+    count = data.get('random_count')
+    if isinstance(count, int) and not isinstance(count, bool) and 1 <= count <= RANDOM_SERIES_COUNT_MAX:
+        settings['random_count'] = count
+    elif count is not None:
+        bad.append("random_count")
+
     if bad:
         return settings, (f"{path} の次の項目が不正なため既定値にしました:\n  " + ", ".join(bad)
                           + "\n（初期姿勢・プリセットは26個の数値のリストである必要があります）")
@@ -310,6 +347,8 @@ def save_settings(settings, path=None):
         'graph_dofs': [int(d) for d in settings['graph_dofs']],
         'record_dir': settings['record_dir'],
         'record_duration': float(settings['record_duration']),
+        'random_interval': float(settings['random_interval']),
+        'random_count': int(settings['random_count']),
     }
     tmp = path + '.tmp'
     with open(tmp, 'w') as f:
@@ -370,13 +409,25 @@ class TimeRing:
 # 記録
 # ------------------------------
 def record_header(k, kind, offset, count):
-    """記録CSVのうち、ボード k の1トピック分の列名"""
+    """記録CSVのうち、ボード k の1トピック分の列名（z3 などは Time{k}_{kind}, {kind}_{d}）"""
     dofs = range(offset, offset + count)
     if kind == 'pot':
         return [f"Time{k}"] + [f"POT{d}" for d in dofs] + [f"POTdesired{d}" for d in dofs]
     if kind == 'pwm':
         return [f"Time{k}_PWM"] + [f"PWM{d}" for d in dofs]
-    return [f"Time{k}_z3"] + [f"z3_{d}" for d in dofs]
+    return [f"Time{k}_{kind}"] + [f"{kind}_{d}" for d in dofs]
+
+
+def record_blocks(kind_groups=(RECORD_KINDS,)):
+    """記録CSVの列の並び [(k, board, offset, count, kind), ...]
+
+    kind_groups の順に、グループ内はボード順・種類順に並べる。既定（RECORD_KINDS だけ）は従来の並び。
+    種類を足すときはグループを後ろに足せば、従来の列の名前・位置は変わらない。
+    """
+    return [(k, board, offset, count, kind)
+            for kinds in kind_groups
+            for k, (board, offset, count) in enumerate(BOARD_LAYOUT, start=1)
+            for kind in kinds]
 
 
 def make_record_folder(base_dir, when):
@@ -404,12 +455,18 @@ class RecordSession:
 
     受信コールバック（ROSスレッド）が add() で渡したデータを、書き出しスレッドがトピックごとの一時CSVへ書く。
     記録時間が長くてもメモリに溜めないので、GUIの応答性もメモリ使用量も変わらない。
+    blocks: 記録する列の並び（record_blocks()）。param_snapshot: 記録開始時・終了時に呼び、
+    ADRCパラメータ表（adrc.write_param_sheet）を <フォルダ名>_ADRCparam.csv に書く（None なら書かない）。
     """
     ARMED, RECORDING, FINISHING, DONE, CANCELLED = range(5)
 
-    def __init__(self, base_dir, duration):
+    def __init__(self, base_dir, duration, blocks=None, param_snapshot=None):
         self.base_dir = base_dir
         self.duration = float(duration)     # 記録時間 [s]。記録中もGUIから変更される
+        self.blocks = blocks or record_blocks()
+        self.param_snapshot = param_snapshot
+        self.param_start = None             # 記録開始時・終了時のADRCパラメータ（param_snapshot() の戻り値）
+        self.param_end = None
         self.state = self.ARMED
         self.t0 = None                      # 記録開始の時刻（time.monotonic()）
         self.folder = None
@@ -420,12 +477,22 @@ class RecordSession:
         self.thread = threading.Thread(target=self._writer, daemon=True)
         self.thread.start()
 
+    def _snapshot_params(self):
+        if self.param_snapshot is None:
+            return None
+        try:
+            return self.param_snapshot()
+        except Exception:
+            traceback.print_exc()
+            return None
+
     def trigger(self, t):
         """記録を開始する（目標値が変わったメッセージの受信時刻 t を 0 秒とする）"""
         with self.lock:
             if self.state != self.ARMED:
                 return
             self.t0 = t
+            self.param_start = self._snapshot_params()
             self.queue.put(('start', datetime.now()))
             self.state = self.RECORDING
 
@@ -445,6 +512,7 @@ class RecordSession:
             if self.state == self.ARMED:
                 self.state = self.CANCELLED
             elif self.state == self.RECORDING:
+                self.param_end = self._snapshot_params()
                 self.state = self.FINISHING
             else:
                 return
@@ -465,13 +533,16 @@ class RecordSession:
                     self.folder = make_record_folder(self.base_dir, item[1])
                     parts = os.path.join(self.folder, RECORD_PARTS_DIR)
                     os.makedirs(parts)
-                    for k, (board, offset, count) in enumerate(BOARD_LAYOUT, start=1):
-                        for kind in RECORD_KINDS:
-                            f = open(os.path.join(parts, f"{board}_{kind}.csv"), 'w', newline='')
-                            files.append(f)
-                            writers[(kind, board)] = csv.writer(f)
-                            writers[(kind, board)].writerow(record_header(k, kind, offset, count))
+                    for k, board, offset, count, kind in self.blocks:
+                        f = open(os.path.join(parts, f"{board}_{kind}.csv"), 'w', newline='')
+                        files.append(f)
+                        writers[(kind, board)] = csv.writer(f)
+                        writers[(kind, board)].writerow(record_header(k, kind, offset, count))
                 else:   # 'end'
+                    if self.folder is not None and self.param_start is not None:
+                        adrc.write_param_sheet(
+                            os.path.join(self.folder, os.path.basename(self.folder) + adrc.PARAM_SHEET_SUFFIX),
+                            self.param_start, self.param_end)
                     break
         except Exception:
             self.error = traceback.format_exc()
@@ -483,28 +554,27 @@ class RecordSession:
                     self.state = self.DONE
 
 
-def combine_record_parts(folder):
+def combine_record_parts(folder, blocks=None):
     """トピックごとの一時CSVを、write_limitdata_ADRC_android_csv.py と同じ形の1つのCSVにまとめる"""
     parts = os.path.join(folder, RECORD_PARTS_DIR)
-    blocks = []
-    for k, (board, offset, count) in enumerate(BOARD_LAYOUT, start=1):
-        for kind in RECORD_KINDS:
-            header = record_header(k, kind, offset, count)
-            path = os.path.join(parts, f"{board}_{kind}.csv")
-            rows = []
-            if os.path.exists(path):
-                with open(path, newline='') as f:
-                    rows = list(csv.reader(f))[1:]     # ヘッダ除外
-            blocks.append((header, rows))
+    columns = []
+    for k, board, offset, count, kind in (blocks or record_blocks()):
+        header = record_header(k, kind, offset, count)
+        path = os.path.join(parts, f"{board}_{kind}.csv")
+        rows = []
+        if os.path.exists(path):
+            with open(path, newline='') as f:
+                rows = list(csv.reader(f))[1:]     # ヘッダ除外
+        columns.append((header, rows))
 
-    max_rows = max((len(rows) for _, rows in blocks), default=0)
+    max_rows = max((len(rows) for _, rows in columns), default=0)
     out = os.path.join(folder, os.path.basename(folder) + '.csv')
     with open(out, 'w', newline='') as f:
         writer = csv.writer(f)
-        writer.writerow([name for header, _ in blocks for name in header])
+        writer.writerow([name for header, _ in columns for name in header])
         for i in range(max_rows):
             row = []
-            for header, rows in blocks:
+            for header, rows in columns:
                 row.extend(rows[i] if i < len(rows) else [""] * len(header))
             writer.writerow(row)
     return out
@@ -522,14 +592,19 @@ def read_record_csv(path):
     return {name: np.array(c, dtype=float) for name, c in zip(header, cols)}
 
 
-def make_record_graphs(csv_path, folder, progress=None):
-    """記録CSVから DOF/DOF<n>/time-pot.png, time-z3.png, time-PWM.png を作る"""
+def make_record_graphs(csv_path, folder, progress=None, extra_graphs=None):
+    """記録CSVから DOF/DOF<n>/time-pot.png, time-z3.png, time-PWM.png を作る
+
+    extra_graphs(k, board, d) -> [グラフの定義, ...] を渡すと、そのグラフも作る（定義の形は下の graphs と同じ。
+    系列に5番目の要素として時刻列を書くと、その系列だけ別の時刻列を使う）
+    """
     # pyplot は使わない（GUIのバックエンドに触れず、別プロセスでも安全に描ける）
     from matplotlib.figure import Figure
     from matplotlib.backends.backend_agg import FigureCanvasAgg
 
     data = read_record_csv(csv_path)
-    total = 3 * sum(count for _, _, count in BOARD_LAYOUT)
+    per_dof = 3 + (len(extra_graphs(1, BOARD_LAYOUT[0][0], 0)) if extra_graphs is not None else 0)
+    total = per_dof * sum(count for _, _, count in BOARD_LAYOUT)
     made = 0
     for k, (board, offset, count) in enumerate(BOARD_LAYOUT, start=1):
         for d in range(offset, offset + count):
@@ -543,13 +618,15 @@ def make_record_graphs(csv_path, folder, progress=None):
                 ('time-z3', f"Time{k}_z3", [(f"z3_{d}", "z3", "green", "-")], "z3", TOPIC_Z3.format(board)),
                 ('time-PWM', f"Time{k}_PWM", [(f"PWM{d}", "PWM", "purple", "-")], "PWM", TOPIC_PWM.format(board)),
             ]
+            if extra_graphs is not None:
+                graphs += extra_graphs(k, board, d)
             for name, tcol, series, ylabel, topic in graphs:
                 fig = Figure(figsize=(8, 4.5), dpi=100)
                 FigureCanvasAgg(fig)
                 ax = fig.add_subplot(1, 1, 1)
-                t = data[tcol]
                 plotted = False
-                for col, label, color, style in series:
+                for col, label, color, style, *own_tcol in series:
+                    t = data[own_tcol[0] if own_tcol else tcol]
                     v = data[col]
                     ok = np.isfinite(t) & np.isfinite(v)
                     if ok.any():
@@ -683,9 +760,12 @@ def initial_monitor(root, monitors):
 # ROS2 Node
 # ------------------------------
 class PotGuiNode(Node):
-    def __init__(self, initial_desired=INITIAL_DESIRED):
-        super().__init__('pot_gui_node')
+    def __init__(self, initial_desired=INITIAL_DESIRED, node_name='pot_gui_node'):
+        super().__init__(node_name)
         self.publisher = self.create_publisher(Float32MultiArray, TOPIC_TARGET, 10)
+
+        # ADRCパラメータの送信と、Teensy が返す現在設定値の受信
+        self.adrc = adrc.AdrcParamLink(self)
 
         self.desired = [float(v) for v in initial_desired]
         self.real_raw = [0.0]*26
@@ -926,6 +1006,11 @@ class TimePlot:
 # Tkinter GUI
 # ------------------------------
 class PotGuiTk:
+    # 設定ファイル・記録する列・記録の後処理（GUI_android_tk_ADRCparamChg.py が差し替える）
+    SETTINGS_PATH = SETTINGS_FILE
+    RECORD_BLOCKS = None        # None なら record_blocks()（従来の列）
+    POSTPROCESS = staticmethod(postprocess_record)
+
     def __init__(self, node: PotGuiNode, settings, settings_warning=None):
         self.node = node
         self.current_dof = 0
@@ -963,6 +1048,9 @@ class PotGuiTk:
         self.paused_at = None
         self.paused_history = None
 
+        # ADRCパラメータ（保存ファイルの読み込み。送信はボタンを押したときだけ）
+        self.init_adrc_state()
+
         self.root = tk.Tk()
 
         # ウィジェットを作る前にフォントを決める（日本語の豆腐化対策）
@@ -989,6 +1077,7 @@ class PotGuiTk:
 
         self.build_pot_tab(self.tab_pot)
         self.build_pose_tab(self.tab_pose)
+        self.build_extra_tabs()
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
@@ -1001,6 +1090,7 @@ class PotGuiTk:
         self.update_plots()
         self.poll_targets()
         self.poll_record()
+        self.poll_adrc()
 
         if settings_warning:
             self.root.after(300, lambda: messagebox.showwarning("Settings file", settings_warning))
@@ -1066,12 +1156,17 @@ class PotGuiTk:
         self.pause_label.grid(row=1, column=2, padx=(12, 0), sticky="w")
         legend = tk.Canvas(opt, width=330, height=18, highlightthickness=0)
         legend.grid(row=1, column=0, columnspan=2, sticky="w")
-        legend.create_line(2, 9, 24, 9, fill="red", width=2)
-        legend.create_text(28, 9, text="実測POT", anchor="w", font=(UI_FONT, 9))
-        legend.create_line(92, 9, 114, 9, fill="blue", width=2, dash=(4, 2))
-        legend.create_text(118, 9, text="目標値（ボード）", anchor="w", font=(UI_FONT, 9))
-        legend.create_rectangle(226, 3, 238, 15, outline="#ff8c00", width=2)
-        legend.create_text(242, 9, text="スライダのDOF", anchor="w", font=(UI_FONT, 9))
+        # 文字の幅に合わせて左から順に置き、Canvas の幅もそれに合わせる（文字が切れないように）
+        x = 2
+        for mark, text in ((lambda x: legend.create_line(x, 9, x + 22, 9, fill="red", width=2), "実測POT"),
+                           (lambda x: legend.create_line(x, 9, x + 22, 9, fill="blue", width=2, dash=(4, 2)),
+                            "目標値（ボード）"),
+                           (lambda x: legend.create_rectangle(x + 5, 3, x + 17, 15, outline="#ff8c00", width=2),
+                            "スライダのDOF（グラフをクリックで切替）")):
+            mark(x)
+            item = legend.create_text(x + 26, 9, text=text, anchor="w", font=(UI_FONT, 9))
+            x = legend.bbox(item)[2] + 12
+        legend.config(width=x)
 
         # ウィンドウが狭いときは「表示時間幅・凡例」を2段目に回す
         wrapped = [False]
@@ -1101,10 +1196,14 @@ class PotGuiTk:
 
         left = tk.LabelFrame(self.ctrl_panels, text="Random Target")
         middle = tk.LabelFrame(self.ctrl_panels, text="目標値の入力")
-        right = tk.LabelFrame(self.ctrl_panels, text="記録（全DOFの 実測POT・目標値・z3・PWM）")
+        # 右の列: 記録 + ADRCパラメータの送信
+        right = tk.Frame(self.ctrl_panels)
+        record = tk.LabelFrame(right, text="記録（全DOFの 実測POT・目標値・z3・PWM・ADRCパラメータ）")
+        record.pack(fill=tk.BOTH, expand=True)
         self.build_random_area(left)
         self.build_target_area(middle)
-        self.build_record_area(right)
+        self.build_record_area(record)
+        self.build_adrc_send_area(right)
 
         self.ctrl_columns = (left, middle, right)
         self.ctrl_layout_mode = None
@@ -1152,6 +1251,32 @@ class PotGuiTk:
                 self.random_enable_vars[i] = v
         self.random_button = tk.Button(parent, text="Send Random Target", command=self.send_random)
         self.random_button.pack(pady=4)
+
+        # 連続ランダム送信: 開始時に1回目、以後「間隔」ごとに「回数」まで送る
+        series = tk.Frame(parent)
+        series.pack(padx=4, pady=(0, 4))
+        tk.Label(series, text="間隔 [s]").grid(row=0, column=0, sticky="e")
+        self.random_interval_var = tk.StringVar()
+        self.random_interval_spin = tk.Spinbox(series, from_=RANDOM_SERIES_INTERVAL_MIN, to=RANDOM_SERIES_INTERVAL_MAX,
+                                               increment=0.5, width=7, textvariable=self.random_interval_var)
+        self.random_interval_spin.grid(row=0, column=1, sticky="w", padx=(4, 0))
+        tk.Label(series, text="回数").grid(row=0, column=2, sticky="e", padx=(10, 0))
+        self.random_count_var = tk.StringVar()
+        self.random_count_spin = tk.Spinbox(series, from_=1, to=RANDOM_SERIES_COUNT_MAX, increment=1, width=7,
+                                            textvariable=self.random_count_var)
+        self.random_count_spin.grid(row=0, column=3, sticky="w", padx=(4, 0))
+        # Spinbox は作成時に値を increment の桁に丸めてしまうので、作成後に設定する
+        self.random_interval_var.set(format_value(self.settings['random_interval']))
+        self.random_count_var.set(str(self.settings['random_count']))
+        for var in (self.random_interval_var, self.random_count_var):
+            var.trace_add("write", lambda *a: self.on_random_series_edit())
+
+        self.random_series = None       # 実行中の連続ランダム送信（停止中は None）
+        self.random_series_button = tk.Button(series, text="連続ランダム送信 開始", command=self.toggle_random_series)
+        self.random_series_button.grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        self.random_series_label = tk.Label(series, text="", font=(UI_FONT, 8), fg="#505050",
+                                            justify="left", anchor="w", wraplength=150)
+        self.random_series_label.grid(row=1, column=2, columnspan=2, sticky="w", padx=(10, 0), pady=(4, 0))
 
     def build_target_area(self, parent):
         top = tk.Frame(parent)
@@ -1277,7 +1402,7 @@ class PotGuiTk:
                       "列をすべて空欄にして保存すると未登録になります。\n"
                       f"プリセット{REGISTER_PRESET_INDEX+1} … 目標値タブの"
                       f"「現在の目標値をプリセット{REGISTER_PRESET_INDEX+1}に登録」で登録します（ここでは表示のみ）。\n"
-                      f"値は「範囲」内で入力してください。保存先: {SETTINGS_FILE}",
+                      f"値は「範囲」内で入力してください。保存先: {self.SETTINGS_PATH}",
                  font=(UI_FONT, 9), fg="#505050", justify="left").pack(anchor="w", padx=6)
 
         _, inner = self.make_scrollable(parent)
@@ -1498,9 +1623,9 @@ class PotGuiTk:
 
     def write_settings(self):
         try:
-            save_settings(self.settings)
+            save_settings(self.settings, self.SETTINGS_PATH)
         except OSError as e:
-            messagebox.showerror("Save error", f"{SETTINGS_FILE} に保存できません:\n{e}")
+            messagebox.showerror("Save error", f"{self.SETTINGS_PATH} に保存できません:\n{e}")
             return False
         return True
 
@@ -1532,6 +1657,12 @@ class PotGuiTk:
             e.insert(0, want)
         self.step_written[i] = want
         self.color_step_entry(i)
+
+    def select_dof(self, dof):
+        """目標値スライダのDOFを dof にする（グラフのクリック）。切り替えるだけで目標値は送信しない"""
+        if dof != self.current_dof:
+            self.dof_box.current(dof)
+            self.change_dof(None)
 
     def change_dof(self, event):
         # 時系列は全自由度ぶん常に保持しているので、切り替えてもグラフは途切れない
@@ -1646,7 +1777,7 @@ class PotGuiTk:
                                 f"{', '.join(map(str, clamped))}）", "#c06000")
 
 
-    def send_random(self):
+    def send_random(self, status_text="Random Target を送信しました"):
         changed=[]
         for i in range(26):
             if not self.random_enable_vars[i].get():
@@ -1657,7 +1788,89 @@ class PotGuiTk:
             changed.append(i)
         self.node.publish()
         # 従来どおり、ランダム対象外の欄に手入力した値はそのまま残す
-        self.after_send("Random Target を送信しました", overwrite=changed)
+        self.after_send(status_text, overwrite=changed)
+
+    # -------------------------
+    # 連続ランダム送信
+    # -------------------------
+    def read_random_series(self):
+        """連続ランダム送信の (間隔 [s], 回数)。不正な欄は None"""
+        try:
+            interval = float(self.random_interval_var.get())
+            if not RANDOM_SERIES_INTERVAL_MIN <= interval <= RANDOM_SERIES_INTERVAL_MAX:
+                interval = None
+        except ValueError:
+            interval = None
+        try:
+            count = float(self.random_count_var.get())
+            count = int(count) if count.is_integer() and 1 <= count <= RANDOM_SERIES_COUNT_MAX else None
+        except ValueError:
+            count = None
+        return interval, count
+
+    def on_random_series_edit(self):
+        interval, count = self.read_random_series()
+        self.random_interval_spin.config(bg=("white" if interval is not None else "#ffc0c0"))
+        self.random_count_spin.config(bg=("white" if count is not None else "#ffc0c0"))
+        if interval is not None and count is not None and (
+                interval != self.settings['random_interval'] or count != self.settings['random_count']):
+            self.settings['random_interval'] = interval
+            self.settings['random_count'] = count
+            self.save_prefs_later()
+
+    def toggle_random_series(self):
+        rs = self.random_series
+        if rs is not None:
+            self.stop_random_series(f"停止しました（{rs['sent']} / {rs['count']} 回送信）")
+            return
+        interval, count = self.read_random_series()
+        if interval is None or count is None:
+            messagebox.showerror("Random series",
+                                 f"間隔は {RANDOM_SERIES_INTERVAL_MIN:g}〜{RANDOM_SERIES_INTERVAL_MAX:g} 秒、"
+                                 f"回数は 1〜{RANDOM_SERIES_COUNT_MAX} の整数で入力してください")
+            return
+        if not any(v.get() for v in self.random_enable_vars):
+            messagebox.showerror("Random series", "Random DOF を1つ以上選んでください")
+            return
+        # 1回目はすぐに送る
+        self.random_series = {'interval': interval, 'count': count, 'sent': 0, 'next': time.monotonic(), 'job': None}
+        self.random_series_button.config(text="■ 停止", bg="#ffd27f", activebackground="#ffc04d")
+        self.random_interval_spin.config(state=tk.DISABLED)
+        self.random_count_spin.config(state=tk.DISABLED)
+        self.random_series_tick()
+
+    def random_series_tick(self):
+        rs = self.random_series
+        if rs is None:
+            return
+        rs['job'] = None
+        now = time.monotonic()
+        if now >= rs['next']:
+            rs['sent'] += 1
+            self.send_random(f"連続ランダム送信 {rs['sent']} / {rs['count']} 回目を送信しました")
+            if rs['sent'] >= rs['count']:
+                self.stop_random_series(f"完了（{rs['count']} 回送信）")
+                return
+            # 次の送信時刻（開始時刻からの間隔の倍数。GUIが一時的に止まって遅れたときは、まとめて送らず今から間隔をあける）
+            rs['next'] += rs['interval']
+            if rs['next'] < now:
+                rs['next'] = now + rs['interval']
+        remaining = rs['next'] - now
+        self.random_series_label.config(text=f"{rs['sent']} / {rs['count']} 回送信\n次まで {max(0.0, remaining):.1f} s")
+        rs['job'] = self.root.after(max(1, int(min(remaining, 0.1) * 1000)), self.random_series_tick)
+
+    def stop_random_series(self, text):
+        rs = self.random_series
+        if rs is None:
+            return
+        if rs['job'] is not None:
+            self.root.after_cancel(rs['job'])
+        self.random_series = None
+        default_bg = self.root.cget("bg")
+        self.random_series_button.config(text="連続ランダム送信 開始", bg=default_bg, activebackground=default_bg)
+        self.random_interval_spin.config(state=tk.NORMAL)
+        self.random_count_spin.config(state=tk.NORMAL)
+        self.random_series_label.config(text=text)
 
     # -------------------------
     # 他プログラムが変更した目標値・ボードが使っている目標値を画面に反映する
@@ -1796,7 +2009,9 @@ class PotGuiTk:
         for dof in selected:
             if dof not in self.plots:
                 canvas = tk.Canvas(self.graph_inner, width=PLOT_MIN_W, height=PLOT_MIN_H, bg="#eeeeee",
-                                   highlightthickness=PLOT_BORDER)
+                                   highlightthickness=PLOT_BORDER, cursor="hand2")
+                # クリックでこのDOFを目標値スライダのDOFにする
+                canvas.bind("<Button-1>", lambda e, d=dof: self.select_dof(d))
                 self.plots[dof] = TimePlot(canvas, dof)
         self.highlight_slider_plot()
         self.schedule_layout()
@@ -1911,7 +2126,8 @@ class PotGuiTk:
             self.settings['record_dir'] = base_dir
             self.save_prefs_later()
 
-        self.node.session = RecordSession(base_dir, duration)
+        self.node.session = RecordSession(base_dir, duration, blocks=self.RECORD_BLOCKS,
+                                          param_snapshot=self.adrc_record_rows)
         self.show_record_state('armed', "目標値がどれか1つの自由度でも変わった時点から記録します")
 
     def poll_record(self):
@@ -1944,7 +2160,7 @@ class PotGuiTk:
         """CSVへのまとめとグラフ作成を別プロセスで行う（GUIと受信を止めないため）"""
         ctx = multiprocessing.get_context('spawn')
         progress = ctx.Queue()
-        proc = ctx.Process(target=postprocess_record, args=(folder, progress), name="record_postprocess")
+        proc = ctx.Process(target=self.POSTPROCESS, args=(folder, progress), name="record_postprocess")
         proc.start()
         self.post = {'proc': proc, 'queue': progress, 'folder': folder, 'dead_polls': 0}
         self.show_record_state('saving', f"CSVを作成しています…   {folder}")
@@ -1996,6 +2212,230 @@ class PotGuiTk:
         post['proc'].join()
         self.post = None
 
+    # -------------------------
+    # ADRCパラメータ（GUI_android_tk_ADRCparamChg.py で保存した値を、ボタンを押したときに送る）
+    # -------------------------
+    # ボードの状態の表示: コード -> (表示, 背景色)。送信後は上から順に優先して表示する
+    ADRC_BOARD_STYLE = [
+        ('rejected', "拒否", "#ff9090"),
+        ('waiting', "応答待ち", "#ffc060"),
+        ('timeout', "応答なし", "#ff9090"),
+        ('no_status', "未受信", "#ff9090"),
+        ('differ', "不一致", "#ff9090"),
+    ]
+    # それ以外にボードの状態として表示する文（ラベルの幅をいちばん長い文に合わせるのに使う）
+    ADRC_BOARD_TEXTS = ("保存値なし", "対象なし", "未受信", "未送信(一致)", "未送信(不一致)", "設定完了")
+
+    def init_adrc_state(self):
+        self.adrc_loaded, self.adrc_load_error = adrc.load_param_file()
+        self.adrc_loaded_at = time.strftime('%H:%M:%S')     # 読み込んだ時刻
+        self.adrc_sent_at = None                            # 送信ボタンで送った時刻（None = 未送信）
+        self.adrc_unsent_text = "起動後 未送信"
+
+    def build_adrc_send_area(self, parent):
+        # 保存ファイル（GUI_android_tk_ADRCparamChg.py で保存した値）の情報は「ADRCパラメータ」タブに出す
+        box = tk.LabelFrame(parent, text="ADRCパラメータの送信")
+        box.pack(fill=tk.X, pady=(4, 0))
+
+        # 1行目: ボタンと送信の状態。状態の文が入りきらない幅では、切らずに折り返す
+        row1 = tk.Frame(box)
+        row1.pack(fill=tk.X, padx=4, pady=(4, 2))
+        buttons = tk.Frame(row1)
+        buttons.pack(side=tk.LEFT, anchor="n")
+        self.adrc_send_button = tk.Button(buttons, text="ADRCパラメータを送信", command=self.send_adrc_params)
+        self.adrc_send_button.pack(side=tk.LEFT)
+        tk.Button(buttons, text="再読込", command=self.reload_adrc_params).pack(side=tk.LEFT, padx=(4, 0))
+        self.adrc_send_state = tk.Label(row1, text="", fg="white", font=(UI_FONT, 10, "bold"), padx=6,
+                                        justify="left", anchor="w", wraplength=150)
+        self.adrc_send_state.pack(side=tk.LEFT, anchor="n", padx=(8, 0))
+        row1.bind("<Configure>", lambda e: self.adrc_send_state.config(
+            wraplength=max(80, e.width - buttons.winfo_reqwidth() - 8 - 2 * 6 - 4)))
+
+        # ボードごとの設定状態（Teensy が返す現在設定値で確かめた結果）
+        #   ラベルの幅は表示し得るいちばん長い文に合わせ、並びきらない幅では折り返して複数行にする
+        #   （ラベルの並びの要求幅で列を広げないよう、この枠は幅を要求しない）
+        self.adrc_board_row = tk.Frame(box, width=1, height=1)
+        self.adrc_board_row.pack(fill=tk.X, padx=4, pady=(0, 4))
+        self.adrc_board_row.grid_propagate(False)
+        f = tkfont.Font(root=self.root, font=(UI_FONT, 8))
+        texts = self.ADRC_BOARD_TEXTS + tuple(text for _, text, _ in self.ADRC_BOARD_STYLE)
+        longest = max(f.measure(f"{board} {text}") for board, _, _ in BOARD_LAYOUT for text in texts)
+        chars = math.ceil(longest / max(1, f.measure("0"))) + 2
+        self.adrc_board_labels = {}
+        for board, _, _ in BOARD_LAYOUT:
+            lab = tk.Label(self.adrc_board_row, text=board, font=(UI_FONT, 8), width=chars, relief=tk.GROOVE)
+            self.adrc_board_labels[board] = lab
+        self.adrc_board_cols = None
+        self.layout_adrc_board_labels(3 * (lab.winfo_reqwidth() + 2))
+        self.adrc_board_row.bind("<Configure>", lambda e: self.layout_adrc_board_labels(e.width))
+
+    def layout_adrc_board_labels(self, width):
+        """ボードの状態のラベルを、幅 width に入るだけ横に並べて折り返す"""
+        labels = list(self.adrc_board_labels.values())
+        cell_w = labels[0].winfo_reqwidth() + 2
+        cols = max(1, min(len(labels), width // cell_w))
+        if cols == self.adrc_board_cols:
+            return
+        self.adrc_board_cols = cols
+        for i, lab in enumerate(labels):
+            lab.grid(row=i // cols, column=i % cols, padx=1, pady=1, sticky="w")
+        rows = math.ceil(len(labels) / cols)
+        self.adrc_board_row.config(height=rows * (labels[0].winfo_reqheight() + 2))
+
+    def build_extra_tabs(self):
+        """ADRCパラメータの一覧タブ（読み込んだ値と Teensy の現在設定値。読み取り専用）"""
+        self.tab_adrc = tk.Frame(self.notebook)
+        self.notebook.add(self.tab_adrc, text="ADRCパラメータ")
+        self.adrc_tab_info = tk.Label(self.tab_adrc, text="", font=(UI_FONT, 9), anchor="w", justify="left")
+        self.adrc_tab_info.pack(fill=tk.X, padx=6, pady=(6, 0))
+        tk.Label(self.tab_adrc,
+                 text="保存値 … 起動時（再読込時）に読み込んだ値。「ADRCパラメータを送信」で制御対象の自由度だけ送ります。\n"
+                      "Teensy … Teensy から受信した現在設定値（送信した値ではありません）。"
+                      "値の変更・保存・制御対象の選択は GUI_android_tk_ADRCparamChg.py で行います。",
+                 font=(UI_FONT, 9), fg="#505050", justify="left").pack(anchor="w", padx=6, pady=(2, 0))
+        self.adrc_table = adrc.ParamTable(self.tab_adrc,
+                                          [("保存値", self.adrc_loaded_value), ("Teensy", self.adrc_current_value)],
+                                          font=(UI_FONT, 9, "bold"))
+
+    def adrc_loaded_value(self, dof, key):
+        return None if self.adrc_loaded is None else self.adrc_loaded['values'][key][dof]
+
+    def adrc_current_value(self, dof, key):
+        cur = self.node.adrc.current(dof)
+        return None if cur is None else cur[key]
+
+    def adrc_states(self, now):
+        """全自由度の (コード, 表示文)。保存値が無ければ None"""
+        ps = self.adrc_loaded
+        if ps is None:
+            return None
+        return {dof: adrc.dof_state(self.node.adrc, dof, adrc.dof_values(ps, dof), ps['targets'][dof], now)
+                for dof in range(26)}
+
+    def adrc_board_summary(self, board, states):
+        """ボードの状態 (表示, 背景色, 設定完了か)"""
+        if states is None:
+            return "保存値なし", "#d0d0d0", False
+        codes = [states[d][0] for d in adrc.board_dofs(board) if states[d][0] != 'not_target']
+        if not codes:
+            return "対象なし", "#d0d0d0", True
+        if self.adrc_sent_at is None:
+            if 'no_status' in codes:
+                return "未受信", "#d0d0d0", False
+            if all(c in ('match', 'applied') for c in codes):
+                return "未送信(一致)", "#d8e8f8", False
+            return "未送信(不一致)", "#fff3b0", False
+        for code, text, color in self.ADRC_BOARD_STYLE:
+            if code in codes:
+                return text, color, False
+        return "設定完了", "#80d080", True
+
+    def poll_adrc(self):
+        self.update_adrc_view()
+        self.root.after(300, self.poll_adrc)
+
+    def update_adrc_view(self):
+        states = self.adrc_states(time.monotonic())
+        summaries = {board: self.adrc_board_summary(board, states) for board, _, _ in BOARD_LAYOUT}
+        for board, (text, color, _) in summaries.items():
+            want = f"{board} {text}"
+            lab = self.adrc_board_labels[board]
+            if lab.cget("text") != want:
+                lab.config(text=want, bg=color)
+
+        ps = self.adrc_loaded
+        if ps is None:
+            state, color = "保存値なし（「ADRCパラメータ」タブ参照）", "#909090"
+        elif self.adrc_sent_at is None:
+            state, color = self.adrc_unsent_text, "#d00000"
+        elif all(done for _, _, done in summaries.values()):
+            state, color = f"送信済み {self.adrc_sent_at}・設定完了", "#208020"
+        elif any(text == "応答待ち" for text, _, _ in summaries.values()):
+            state, color = f"送信済み {self.adrc_sent_at}・確認中", "#e08000"
+        else:
+            state, color = f"送信済み {self.adrc_sent_at}・未完了あり", "#d00000"
+        if self.adrc_send_state.cget("text") != state:
+            self.adrc_send_state.config(text=state, bg=color)
+        self.adrc_send_button.config(state=(tk.NORMAL if ps is not None else tk.DISABLED))
+
+        if ps is None:
+            detail = self.adrc_load_error or ""
+        else:
+            n = sum(ps['targets'])
+            others = [d for d in range(26) if not ps['targets'][d]]
+            detail = (f"{adrc.PARAM_FILE}（保存 {ps.get('saved_at') or '-'}、読込 {self.adrc_loaded_at}）\n"
+                      f"制御対象 {n} 自由度" + (f"（対象外: DOF {', '.join(map(str, others))}）" if others else ""))
+        if self.adrc_tab_info.cget("text") != detail:
+            self.adrc_tab_info.config(text=detail)
+
+        self.adrc_table.refresh(
+            lambda d: ps is not None and ps['targets'][d],
+            lambda d: states[d] if states is not None else ('no_status', "保存値なし"),
+            lambda b: summaries[b][0])
+
+    def send_adrc_params(self):
+        """保存値を制御対象の自由度だけ送る（ボードごとに1メッセージ。対象外の自由度は「変更しない」）"""
+        ps = self.adrc_loaded
+        if ps is None:
+            return
+        link = self.node.adrc
+        now = time.monotonic()
+        changes, unknown = [], []
+        for board, offset, count in BOARD_LAYOUT:
+            dofs = [d for d in range(offset, offset + count) if ps['targets'][d]]
+            if dofs and link.board_status(board, now) is None:
+                unknown.append(board)
+            for dof in dofs:
+                cur = link.current(dof, now)
+                if cur is None:
+                    continue
+                for key in adrc.PARAM_KEYS:
+                    new = ps['values'][key][dof]
+                    if not adrc.same_value(new, cur[key]):
+                        changes.append(f"DOF {dof} {key}: {adrc.fmt_param(cur[key])} → {adrc.fmt_param(new)}")
+
+        text = (f"制御対象の {sum(ps['targets'])} 自由度のADRCパラメータを Teensy へ送信します。\n"
+                f"（保存 {ps.get('saved_at') or '-'}）\n\n")
+        if changes:
+            more = f"\n…ほか {len(changes) - 15} 件" if len(changes) > 15 else ""
+            text += f"Teensy の現在設定値から変わる値: {len(changes)} 件\n" + "\n".join(changes[:15]) + more
+        else:
+            text += "現在設定値を受信できたボードでは、変わる値はありません。"
+        if unknown:
+            text += f"\n\n現在設定値を受信していないボード: {', '.join(unknown)}（送信はします）"
+        if not messagebox.askokcancel("Send ADRC parameters", text):
+            return
+
+        for board, offset, count in BOARD_LAYOUT:
+            local_values = {d - offset: adrc.dof_values(ps, d)
+                            for d in range(offset, offset + count) if ps['targets'][d]}
+            if local_values:
+                link.send(board, local_values)
+        self.adrc_sent_at = time.strftime('%H:%M:%S')
+        self.update_adrc_view()
+
+    def reload_adrc_params(self):
+        ps, err = adrc.load_param_file()
+        if ps is None:
+            keep = "\n\n前に読み込んだ値をそのまま使います。" if self.adrc_loaded is not None else ""
+            messagebox.showerror("ADRC parameters", err + keep)
+            if self.adrc_loaded is None:
+                self.adrc_load_error = err
+            return
+        changed = not adrc.param_sets_equal(ps, self.adrc_loaded)
+        self.adrc_loaded, self.adrc_load_error = ps, None
+        self.adrc_loaded_at = time.strftime('%H:%M:%S')
+        if changed and self.adrc_sent_at is not None:
+            # 送った値と違う内容になったので、送信していない状態に戻す
+            self.adrc_sent_at = None
+            self.adrc_unsent_text = "再読込後 未送信"
+        self.update_adrc_view()
+
+    def adrc_record_rows(self):
+        """記録用: 全自由度の Teensy の現在設定値（記録の受信スレッドから呼ばれる）"""
+        ps = self.adrc_loaded
+        return self.node.adrc.snapshot(None if ps is None else ps['targets'])
+
     def save_prefs_later(self, delay_ms=1000):
         """グラフ表示DOF・記録の設定を設定ファイルへ保存する（続けて変更されたらまとめて1回）"""
         if self.prefs_job is not None:
@@ -2005,9 +2445,9 @@ class PotGuiTk:
     def save_prefs(self):
         self.prefs_job = None
         try:
-            save_settings(self.settings)
+            save_settings(self.settings, self.SETTINGS_PATH)
         except OSError as e:
-            print(f"{SETTINGS_FILE} に保存できません: {e}", file=sys.stderr)
+            print(f"{self.SETTINGS_PATH} に保存できません: {e}", file=sys.stderr)
 
     def on_close(self):
         if self.pose_tab_dirty():
@@ -2048,6 +2488,8 @@ def check_ranges():
         print("警告: POT_RANGE / RANDOM_RANGE は26自由度ぶん必要です", file=sys.stderr)
     if bad:
         print(f"警告: RANDOM_RANGE が POT_RANGE の外に出ている自由度があります: DOF {bad}", file=sys.stderr)
+    if BOARD_LAYOUT != adrc.BOARD_LAYOUT:
+        print("警告: BOARD_LAYOUT が adrc_param_common.py の BOARD_LAYOUT と違います", file=sys.stderr)
 
 
 def spin_ros(node):
