@@ -63,6 +63,7 @@ setup(
             'optimize_TuningEL_ff_ROS2=py_pkg.optimize_TuningEL_ff_ROS2:main',
             'optimize_EL_ff_ROS2_2=py_pkg.optimize_EL_ff_ROS2_2:main',
             'optimize_TuningEL_ff_ROS2_2=py_pkg.optimize_TuningEL_ff_ROS2_2:main',
+            'optimize_optuna_ff_ROS2=py_pkg.optimize_optuna_ff_ROS2:main',
             'test_code=py_pkg.test_code:main',
             'test_code2=py_pkg.test_code2:main',
             'test_code3=py_pkg.test_code3:main',
