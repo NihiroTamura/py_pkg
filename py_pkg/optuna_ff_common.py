@@ -7,7 +7,8 @@ EL2 との出力の一致は test/test_optuna_ff_port.py で確かめる。
 
 ■ 時間軸（100 Hz 配信。制御周期は使わない）
   実機は rclc タイマで 10 ms ごとに tk・PWM・z3・z1・derivatives・z2 を続けて配信する（.ino:47, 794-833）。
-  受信した /board{k}_tk/pub に配信番号 j を振り（受信時刻の位相から周期を求め、時刻から番号を振る。欠損は番号が飛ぶ）、
+  受信した /board{k}_tk/pub に受信順で配信番号 j を振り（局所の受信間隔の中央値の 1.5 倍を超える間隔で、後の受信が
+  追いつかなかった分だけ欠損として番号を飛ばす。assign_ticks）、
   目標値のエコーが新しい値になった配信を j0 として t_j = (j − j0)·0.010 [s] とする。
   配信値は直近に終わった制御周回の値（0〜11 ms 古い）。PWM・z1・z2・z3 は POT よりさらに1周回古い。
 ■ FF（案4。全候補で「端点0・(0,T) の極値ちょうど2個・|FF| ≤ A_max」を保証する写像）
@@ -22,11 +23,13 @@ EL2 との出力の一致は test/test_optuna_ff_port.py で確かめる。
 """
 import csv
 import hashlib
+import itertools
 import json
 import math
 import os
 import threading
 import time
+import warnings
 from collections import deque
 from dataclasses import dataclass, field
 
@@ -1110,23 +1113,135 @@ def noise_floor(spec_list, ys_by_dof, valids_by_dof):
 # ==============================================================================
 # 100 Hz の時間軸（計画書 §5.1）
 # ==============================================================================
-def assign_ticks(t, u_hint=TICK_DT):
-    """受信時刻 t（PC の時計、昇順）に配信番号 j を振る（位相法。2026-10-23 にユーザーが選んだ）。
+TICK_GAP_FACTOR = 1.5   # 受信間隔が局所の中央値のこの倍を超えたところだけを欠損の候補にする（修正案1の 1.8 から変更。assign_ticks）
+TICK_WIN = 5            # 候補の前後で「遅れのない到着」を見る受信数。これより近い候補は1つのクラスタにまとめて判定する
+TICK_HALF = 50          # 局所の受信間隔の中央値を取る範囲（前後それぞれの間隔数）
+TICK_COMPRESSED = 0.7   # 局所の中央値のこの倍より短い間隔は「遅れを取り戻している途中」（実機では通常 0.25% 未満）
+TICK_EARLY = 0.3        # 欠損の位置を決めるとき、この配信数より早い到着を強く罰する（遅れは正なので早着はほぼ起きない）
+TICK_ENUM_MAX = 20000   # 欠損の置き方の組み合わせがこれより多いクラスタは、丸めで位置を決める
 
-    1. 周期 u（PC の時計で測った 10 ms）を、位相のそろい具合 R(u) = |mean exp(2πi (t − t_0)/u)| が最大になる値として求める
-       （受信間隔の中央値 u0 の ±3% を 1201 点で探し、有界 Brent 法で詰める）。欠損があっても残りの位相は変わらないので、
-       欠損の数え方に左右されない。PC の時計の速さが数%違っても、u がその分だけ変わるだけで数え方は変わらない。
-    2. 典型的な到着の位相 a0（位相の円周平均）から j_n = round((t_n − t_0 − a0)/u)。
-    3. 受信順は配信順なので、後ろから j_n = min(j_n, j_{n+1} − 1) とする（一時的に遅れてまとまって届いたメッセージは、
-       次の時間どおりのメッセージから逆算される）。
-    遅れてまとめて届いた直後に欠損があると、どの配信が欠けたかは受信時刻だけでは区別できず、±1〜2 配信ずれることがある
-    （計画書の「段差を数える方式」は、まとまった到着が重なると番号がずれたままになるため使わない）。
-    戻り値 (j（最初を 0）, u, 欠損数)。
+
+def local_intervals(d, half=TICK_HALF):
+    """各受信間隔 d_n の前後 half 個の中央値（0.5〜1.5 倍の外を除いてもう一度中央値）。受信間隔の変化に追従する"""
+    d = np.asarray(d, dtype=float)
+    if len(d) == 0:
+        return np.empty(0)
+    pad = np.concatenate([np.full(half, np.nan), d, np.full(half, np.nan)])
+    W = np.lib.stride_tricks.sliding_window_view(pad, 2 * half + 1)
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', RuntimeWarning)
+        med = np.nanmedian(W, axis=1)
+        W2 = np.where((W > 0.5 * med[:, None]) & (W < 1.5 * med[:, None]), W, np.nan)
+        med2 = np.nanmedian(W2, axis=1)
+    return np.where(np.isfinite(med2), med2, med)
+
+
+def _place_drops(est, m):
+    """クラスタ（受信 s..e、L = e − s）の中で m 個の欠損を置き、受信 s+1..e−1 の s からの番号の差を返す。
+
+    est[k] = (t_{s+k} − 遅れのない s の到着)/u は「番号の差 + 遅れ」。遅れは正なので、早い到着（est が番号の差より
+    TICK_EARLY 以上小さい）を強く罰し、遅れは小さく罰する費用が最小になる置き方を全通り調べて選ぶ。
+    """
+    L = len(est) - 1
+    base = np.arange(1, L)
+    if L <= 1 or m == 0:
+        return base
+
+    def cost(jk):
+        lam = est[1:L] - jk
+        return float(np.sum(np.where(lam >= -TICK_EARLY, np.abs(lam), 10.0 * -lam)))
+
+    if math.comb(L + m - 1, m) > TICK_ENUM_MAX:
+        out = np.empty(L - 1, dtype=int)
+        p = 0
+        for k in range(1, L):
+            p = max(p + 1, min(int(round(est[k] - TICK_EARLY)), m + k))
+            out[k - 1] = p
+        return out
+    best, best_cost = base, None
+    for pos in itertools.combinations_with_replacement(range(L), m):    # 間隔 p（受信 s+p → s+p+1）に欠損を置く
+        jk = base + np.searchsorted(np.asarray(pos), base, side='left')
+        cst = cost(jk)
+        if best_cost is None or cst < best_cost:
+            best, best_cost = jk, cst
+    return best
+
+
+def assign_ticks(t, u_hint=TICK_DT):
+    """受信時刻 t（PC の時計、昇順）に配信番号 j を振る（受信順に数える方式。2026-10-27 の修正案1）。
+
+    1. 受信順に番号を振る。受信間隔 d_n が局所の中央値 U_n（前後 TICK_HALF 間隔。受信間隔の変化に追従する）の
+       TICK_GAP_FACTOR 倍を超えるところだけを欠損の候補にする。
+    2. 一時的な遅れでも間隔は大きくなるが、遅れた後はまとまって届いて追いつく。そこで候補の前後 TICK_WIN 個の受信から
+       「遅れのない到着」（遅れは正なので、u で外挿した到着の最小値）T_s・T_e を求め、追いつかなかった分
+       m = round((T_e − T_s)/u − (e − s)) を欠損数とする（0 以上、間隔から見た数 Σ(round(d/u) − 1) 以下）。
+       後ろの窓は、追いつきの途中の受信（詰まった間隔 < TICK_COMPRESSED·U が TICK_WIN 個以内に続く間）を越えた先まで伸ばす
+       （PC が長く止まった後のまとまった到着や、数受信かけてゆっくり追いつく場合も、時間どおりに戻った受信で判定する。
+       受信間隔が変わっただけなら詰まった間隔は出ないので伸ばさない）。窓の中に続く候補は1つのクラスタにまとめて判定する。
+    3. クラスタの中のどの間隔で欠けたかは _place_drops で決める。遅れてまとまって届いた直後の欠損は、受信時刻だけでは
+       位置が決まらず、クラスタの中で ±1〜2 配信ずれることがある。ずれはクラスタの外へ持ち越さない。
+    受信間隔の変化（PC 側の受信の遅れの変化）は欠損と数えない。以前の位相法は区間全体で1つの周期を仮定したため、
+    受信間隔が途中で変わると存在しない欠損を数えた（2026-10-27 の実機検証）。位相法の数は count_drops_phase で検算として残す。
+    限界：PC 側の受信が数十受信にわたって少しずつ遅れ続け、窓の外でまとめて取り戻す場合は、遅れを欠損と数えることがある
+    （同じプロセスで動かした偽ボードで見た。実機の記録 455 本にはない）。評価区間に入れば欠損として測り直しになる。
+    閾値を修正案1の 1.8 倍から 1.5 倍にした理由：遅れて届いた受信の直後に欠損があると、間隔は 2 倍より短くなる。
+    実機の受信間隔は局所中央値の 1.1〜1.3 倍が 1.8% あり、1.8 倍では欠損の約 1% を見落とす。候補を増やしても欠損数は 2. の
+    追いつきで決まるので、実機の記録 455 本で欠損ありと数えるのは 1.5 倍でも 0 本のまま。
+    戻り値 (j（最初を 0）, u（局所中央値の中央値。PC の時計で測った 10 ms）, 欠損数)。
     """
     t = np.asarray(t, dtype=float)
     n = len(t)
     if n < 3:
         return np.arange(n), u_hint, 0
+    d = np.diff(t)
+    U = local_intervals(d)
+    U = np.where(np.isfinite(U) & (U > 0), U, u_hint)
+    clusters = []                                      # [候補の間隔の番号の並び, まとまった到着の最後の受信]
+    for g in np.flatnonzero(d > TICK_GAP_FACTOR * U):
+        g = int(g)
+        if clusters and g <= clusters[-1][1] + TICK_WIN - 1:
+            clusters[-1][0].append(g)
+        else:
+            clusters.append([[g], 0])
+        k = g + 1                                      # 追いつきの途中の受信を飛ばす：次の TICK_WIN 個の間隔に詰まった間隔
+        while True:                                    # （局所中央値の TICK_COMPRESSED 倍未満）がある間は先へ進む
+            w = np.arange(k, min(n - 1, k + TICK_WIN))
+            q = w[d[w] < TICK_COMPRESSED * U[w]]
+            if len(q) == 0:
+                break
+            k = int(q[-1]) + 1
+        clusters[-1][1] = k
+    j = np.arange(n)
+    add = 0
+    done = 0
+    for cl, be in clusters:
+        s, e = cl[0], cl[-1] + 1                       # 候補の間隔は受信 s → s+1, …, e−1 → e
+        u = float(U[s])
+        j[done:s + 1] = np.arange(done, s + 1) + add
+        kb = np.arange(max(0, s - TICK_WIN + 1), s + 1)
+        ka = np.arange(e, min(n, be + TICK_WIN))       # まとまった到着の後の TICK_WIN 個まで（長く止まった後も追いつきを見る）
+        Ts = float(np.min(t[kb] + (s - kb) * u))
+        Te = float(np.min(t[ka] - (ka - e) * u))
+        m_hi = int(sum(max(0, int(round(d[g] / u)) - 1) for g in cl))
+        m = min(max(int(round((Te - Ts) / u - (e - s))), 0), m_hi)
+        j[s + 1:e] = s + add + _place_drops((t[s:e + 1] - Ts) / u, m)
+        add += m
+        done = e
+    j[done:] = np.arange(done, n) + add
+    return j, float(np.median(U)), int(add)
+
+
+def count_drops_phase(t, u_hint=TICK_DT):
+    """検算用：位相法（2026-10-23〜27 に使っていた方式）で数えた欠損数と周期 u。
+
+    周期 u を、位相のそろい具合 R(u) = |mean exp(2πi (t − t_0)/u)| が最大になる値として求め（受信間隔の中央値の ±3% を
+    1201 点で探し、有界 Brent 法で詰める）、j_n = round((t_n − t_0 − a0)/u) を後ろから単調にする。
+    区間全体で1つの周期を仮定するので、受信間隔が途中で変わると存在しない欠損を数える。戻り値 (欠損数, u)。
+    """
+    t = np.asarray(t, dtype=float)
+    n = len(t)
+    if n < 3:
+        return 0, u_hint
     x = t - t[0]
     d = np.diff(x)
     good = d[(d > 0.3 * u_hint) & (d < 1.8 * u_hint)]
@@ -1146,8 +1261,7 @@ def assign_ticks(t, u_hint=TICK_DT):
     j = np.round((x - a0) / u).astype(int)
     for k in range(n - 2, -1, -1):
         j[k] = min(j[k], j[k + 1] - 1)
-    j = j - j[0]
-    return j, u, int(j[-1] - (n - 1))
+    return int(j[-1] - j[0] - (n - 1)), u
 
 
 def align_ticks(t_kind, t_ref, j_ref, u_hint=TICK_DT):
@@ -1286,9 +1400,11 @@ def extract_series(raw, initial, target, dofs, t_send, T, history_s=HISTORY_S):
                                z2=grid.get('z2', empty)[:, local], z3=grid.get('z3', empty)[:, local],
                                der=grid.get('der', empty)[:, local], Pi=float(initial[d]), Pf=float(target[d]),
                                P0=P0, H=H, N_e=N_e, echo_delay=delay)
-        n_gap = int(np.sum(np.diff(t_tk) > 1.5 * u))
+        dt_tk = np.diff(t_tk)
+        n_gap = int(np.sum(dt_tk > TICK_GAP_FACTOR * local_intervals(dt_tk)))     # 欠損の候補にした大きな受信間隔
+        n_drop_phase, _u = count_drops_phase(t_tk)                                 # 検算（受信間隔が変わると多めに数える）
         info[board] = {'j0': j0, 'u_pc': u, 'n_drop': n_drop, 'n_msgs': len(t_tk), 'echo_delay': delay, 'n_gap': n_gap,
-                       'suspect': bool(n_drop > 0 and n_gap == 0)}   # 大きな間隔がないのに欠損を数えた（受信の遅れが変化）
+                       'n_drop_phase': n_drop_phase}
     return out, info
 
 
@@ -1903,6 +2019,8 @@ def measure_once(link, initial, target, dofs, ff_rows, T, wait_s, safety, stop_e
         finally:
             exc.raw = raw
             exc.t_send = t_send
+            exc.params = params                       # 中断した回の npz にも、試行開始時・終了時の ADRC パラメータを残す
+            exc.params_after = link.adrc_params()
         raise
     safe_return(link, initial, dofs, safety, log)
     rec = TrialRecord(raw=raw, initial=list(initial), target=list(target), ff=np.asarray(ff_rows, dtype=float),
@@ -1912,11 +2030,13 @@ def measure_once(link, initial, target, dofs, ff_rows, T, wait_s, safety, stop_e
         series, info = extract_series(raw, initial, target, dofs, t_send, T)
     except TrialIssue as exc:
         exc.raw, exc.t_send, exc.rec = raw, t_send, rec
+        exc.params, exc.params_after = rec.params, rec.params_after
         raise
     bad = {d: s.missing() for d, s in series.items() if s.missing() > safety.missing_tol}
     if bad:
         exc = TrialIssue('comm', f"評価区間で配信が欠けています（許容 {safety.missing_tol}）: {bad}")
         exc.raw, exc.t_send, exc.rec = raw, t_send, rec
+        exc.params, exc.params_after = rec.params, rec.params_after
         raise exc
     return Measurement(rec=rec, series=series, info=info, t_send=t_send, ff_tables=tables, rest_ok=rest_ok, attempts=[])
 
@@ -1925,7 +2045,8 @@ def measure_with_retries(link, initial, target, dofs, ff_rows, T, wait_s, safety
                          on_attempt=None):
     """measure_once を、測り直すべき問題（TrialIssue('comm')）のときだけ上限まで繰り返す（§7.3b）。
 
-    on_attempt(a, raw, t_send, reason) は失敗した回の生データを保存するために呼ぶ。上限を超えたら CommFail。
+    on_attempt(a, raw, t_send, reason, params, params_after) は失敗した回の生データを保存するために呼ぶ
+    （params・params_after は試行開始時・終了時の ADRC パラメータ。読む前に失敗したときは None）。上限を超えたら CommFail。
     """
     attempts = []
     for a in range(safety.remeasure_max + 1):
@@ -1938,7 +2059,8 @@ def measure_with_retries(link, initial, target, dofs, ff_rows, T, wait_s, safety
                 raise
             attempts.append(exc.reason)
             if on_attempt is not None:
-                on_attempt(a, getattr(exc, 'raw', None), getattr(exc, 't_send', None), exc.reason)
+                on_attempt(a, getattr(exc, 'raw', None), getattr(exc, 't_send', None), exc.reason,
+                           getattr(exc, 'params', None), getattr(exc, 'params_after', None))
             log(f"  測り直します（{a + 1}/{safety.remeasure_max}）: {exc.reason}")
             if a >= safety.remeasure_max:
                 err = CommFail(f"測り直しが上限 {safety.remeasure_max} 回を超えました: {attempts}")
@@ -2139,12 +2261,19 @@ def ff_times_for_csv(rec, info):
 
 
 def save_trial_npz_ext(path, rec, extra):
-    """移植した save_trial_npz の内容に、配信番号・送った float32 の FF などを x_ で始まる名前で足す（load_trial_npz で読める）"""
+    """移植した save_trial_npz の内容に、配信番号・送った float32 の FF などを x_ で始まる名前で足す（load_trial_npz で読める）。
+
+    ADRC パラメータは試行開始時を param_{DOF}（移植元と同じ名前）、試行の終わり（初期姿勢へ戻した後）を x_param_after_{DOF}
+    に [kp, kd, ic, λ] で保存する。2つを比べれば、試行中に他のプログラムがパラメータを変えたかがわかる。
+    """
     data = {'initial': np.array(rec.initial, dtype=float), 'target': np.array(rec.target, dtype=float), 'ff': rec.ff,
             'T': rec.T, 'L': rec.L, 'started_at': rec.started_at, 'aborted': rec.aborted, 't_target': rec.t_target}
     for d, p in (rec.params or {}).items():
         if p is not None:
             data[f'param_{d}'] = np.array(p.as_list())
+    for d, p in (rec.params_after or {}).items():
+        if p is not None:
+            data[f'x_param_after_{d}'] = np.array(p.as_list())
     for board, kinds in (rec.raw or {}).items():
         for kind, (t, V) in kinds.items():
             data[f'{board}_{kind}_t'] = t
@@ -2157,12 +2286,18 @@ def save_trial_npz_ext(path, rec, extra):
     os.replace(tmp, path)
 
 
-def save_raw_attempt(path, raw, initial, target, ff_rows, T, t_send, note):
-    """測り直した回・中断した回の生データ（TrialRecord がない場合）"""
-    rec = TrialRecord(raw=raw or {}, initial=list(initial), target=list(target), ff=np.asarray(ff_rows, dtype=float),
-                      T=float(T), L=TICK_DT, params={}, params_after={}, t_target=float(t_send or 0.0),
-                      started_at=time.strftime('%Y-%m-%d %H:%M:%S'), aborted=True, note=note)
-    save_trial_npz_ext(path, rec, {'note': note})
+def save_raw_attempt(path, raw, initial, target, ff_rows, T, t_send, note, params=None, params_after=None):
+    """測り直した回・中断した回の生データ（TrialRecord がない場合）。
+
+    完了した試行の npz と同じく、送った FF（float32 に丸めた値）を x_ff_sent_rows に、試行開始時・終了時の ADRC パラメータを
+    param_{DOF}・x_param_after_{DOF} に入れる（ADRC パラメータを読む前に失敗した回は入らない）。
+    """
+    ff = np.asarray(ff_rows, dtype=float)
+    rec = TrialRecord(raw=raw or {}, initial=list(initial), target=list(target), ff=ff,
+                      T=float(T), L=TICK_DT, params=params or {}, params_after=params_after or {},
+                      t_target=float(t_send or 0.0), started_at=time.strftime('%Y-%m-%d %H:%M:%S'), aborted=True,
+                      note=note)
+    save_trial_npz_ext(path, rec, {'note': note, 'ff_sent_rows': ff.astype(np.float32).astype(float)})
 
 
 def write_json_atomic(path, data):

@@ -208,6 +208,111 @@ def test_assign_ticks_burst_without_drop():
     assert np.array_equal(j - j[0], jt - jt[0]) and n_drop == 0
 
 
+def _rate_change(n, seed, drop_rate, u_a, u_b, n_change=250):
+    """受信間隔が途中で u_a → u_b に変わる（2026-10-27 の実機で見た PC 側の受信の変化。例 9.575 → 9.88 ms）"""
+    rng = np.random.default_rng(seed)
+    j = np.arange(n)
+    lat = rng.exponential(0.0008, n) + 0.0003
+    t = np.concatenate([[0.0], np.cumsum(np.where(j < n_change, u_a, u_b)[1:])]) + lat
+    keep = rng.uniform(size=n) > drop_rate
+    keep[0] = True
+    keep[-2] = False
+    return np.maximum.accumulate(t)[keep], j[keep]
+
+
+@pytest.mark.parametrize('u_a,u_b', [(0.009575, 0.00988), (0.0101, 0.00947), (0.0094, 0.0101)])
+@pytest.mark.parametrize('seed', range(5))
+@pytest.mark.parametrize('drop_rate', [0.0, 0.03])
+def test_assign_ticks_rate_change(u_a, u_b, seed, drop_rate):
+    """受信間隔が途中で変わっても欠損と数えない（位相法は区間全体で1つの周期を仮定したので、ここで存在しない欠損を数えた）"""
+    t, jt = _rate_change(400, seed, drop_rate, u_a, u_b)
+    j, _u, n_drop = c.assign_ticks(t)
+    assert np.array_equal(j - j[0], jt - jt[0])
+    assert n_drop == jt[-1] - jt[0] - (len(jt) - 1)
+
+
+def test_count_drops_phase_overcounts_on_rate_change():
+    """検算用の位相法は、欠損だけなら正しく数えるが、受信間隔が途中で変わると多めに数える（新方式に替えた理由）"""
+    t, jt = _arrivals(400, seed=0, burst=False)
+    assert c.count_drops_phase(t)[0] == jt[-1] - jt[0] - (len(jt) - 1)
+    t, jt = _rate_change(400, 0, 0.0, 0.009575, 0.00988)        # 欠損は端の1個だけ
+    n_true = jt[-1] - jt[0] - (len(jt) - 1)
+    assert c.count_drops_phase(t)[0] > n_true and c.assign_ticks(t)[2] == n_true
+
+
+def test_assign_ticks_drop_right_after_delay():
+    """遅れてまとまって届いた直後の欠損：大きな間隔（3.5 配信）は遅れ、その後の 2 配信の間隔が欠損"""
+    n = 40
+    lat = np.full(n, 0.0003)
+    lat[10:13] += [0.025, 0.015, 0.005]
+    t = np.maximum.accumulate(np.arange(n) * c.TICK_DT + lat)
+    keep = np.ones(n, dtype=bool)
+    keep[15] = False
+    j, _u, n_drop = c.assign_ticks(t[keep])
+    assert np.array_equal(j, np.arange(n)[keep]) and n_drop == 1
+
+
+def test_assign_ticks_long_stall_then_burst():
+    """PC が 200 ms 止まって、その間の配信がまとめて届く（欠損なし）。間隔は 21 配信分だが、追いつくので欠損 0"""
+    n = 120
+    lat = np.full(n, 0.0003)
+    lat[50:70] += 0.200 - np.arange(20) * c.TICK_DT
+    t = np.maximum.accumulate(np.arange(n) * c.TICK_DT + lat)
+    j, _u, n_drop = c.assign_ticks(t)
+    assert np.array_equal(j, np.arange(n)) and n_drop == 0
+    keep = np.ones(n, dtype=bool)
+    keep[30:50] = False                                   # 本当に 20 配信欠けた場合
+    j, _u, n_drop = c.assign_ticks(t[keep])
+    assert n_drop == 20 and j[-1] == n - 1
+
+
+def _slow_catchup(n, seed, drop_rate):
+    """大きな遅れの後、6 受信ほどかけて少しずつ追いつく（偽ボードの通しテストで見た形。遅れ 25→27→20→12→6→1 ms）"""
+    rng = np.random.default_rng(seed)
+    j = np.arange(n)
+    lat = rng.exponential(0.0008, n) + 0.0003
+    for b in rng.choice(np.arange(20, n - 30), 4, replace=False):
+        lat[b:b + 6] += np.array([0.025, 0.027, 0.020, 0.012, 0.006, 0.001]) * rng.uniform(0.6, 1.4)
+    t = np.maximum.accumulate(j * c.TICK_DT + lat)
+    keep = rng.uniform(size=n) > drop_rate
+    keep[0] = True
+    return t[keep], j[keep]
+
+
+@pytest.mark.parametrize('seed', range(10))
+def test_assign_ticks_slow_catchup(seed):
+    """ゆっくり追いつく遅れは欠損と数えない（後ろの窓を追いつきの途中の受信の先まで伸ばす）"""
+    t, jt = _slow_catchup(400, seed, 0.0)
+    j, _u, n_drop = c.assign_ticks(t)
+    assert np.array_equal(j, jt) and n_drop == 0
+
+
+def test_local_intervals_matches_loop():
+    rng = np.random.default_rng(3)
+    d = 0.0095 + rng.normal(0, 0.0004, 300)
+    d[[20, 21, 150]] = [0.03, 0.0, 0.019]
+    ref = []
+    for i in range(len(d)):
+        w = d[max(0, i - 50):i + 51]
+        med = np.median(w)
+        w = w[(w > 0.5 * med) & (w < 1.5 * med)]
+        ref.append(np.median(w))
+    assert np.allclose(c.local_intervals(d), ref, rtol=0, atol=0)
+
+
+_REAL_DIR = os.path.expanduser('~/ArmRobot/optimize_data/verify_optuna_20261027/optimize_20261027_1451/trials')
+
+
+@pytest.mark.skipif(not os.path.isdir(_REAL_DIR), reason='2026-10-27 の実機の記録がない')
+@pytest.mark.parametrize('name', ['trial_069_a0.npz', 'trial_069_a1.npz', 'trial_069_a2.npz', 'trial_069_a3.npz',
+                                  'trial_014_a0.npz', 'trial_045_a0.npz'])
+def test_assign_ticks_real_remeasured(name):
+    """2026-10-27 の実機（D=1000）で位相法が欠損を数えて測り直し、comm で止まった記録。新方式では全ボード欠損 0"""
+    z = np.load(os.path.join(_REAL_DIR, name))
+    for b in ('board1', 'board2', 'board3', 'board4', 'board5'):
+        assert c.assign_ticks(z[f'{b}_pot_t'])[2] == 0
+
+
 def _fake_raw(j0_true, n, initial, target, dofs, t_send, seed=0):
     """board1 の /tk・PWM を合成する（POT は目標へ一次遅れ、エコーは j0 から新しい目標値）"""
     rng = np.random.default_rng(seed)
@@ -223,6 +328,31 @@ def _fake_raw(j0_true, n, initial, target, dofs, t_send, seed=0):
         W[:, d] = rng.normal(0, 1, n)
     t = t_all + rng.exponential(0.0005, n)
     return {'board1': {'pot': (t, V), 'pwm': (t + 0.0002, W)}}
+
+
+def test_save_raw_attempt_keeps_params_and_sent_ff(tmp_path):
+    """測り直した回・中断した回の npz にも、送った FF（float32）と試行開始時・終了時の ADRC パラメータが入る"""
+    rng = np.random.default_rng(0)
+    raw = {'board1': {'pot': (np.arange(5) * 0.01, rng.integers(0, 1000, (5, 12)).astype(float))}}
+    ff = np.zeros((c.N_FF, 5))
+    ff[0] = [1234.5678901, -2345.6789012, 3456.7890123, -456.78901234, 56.789012345]
+    before = {0: c.AdrcParams(1000.0, 144.0, 50000.0, 700.0), 1: None}
+    after = {0: c.AdrcParams(1000.0, 144.0, 50000.0, 650.0)}
+    path = str(tmp_path / 'trial_001_a0.npz')
+    c.save_raw_attempt(path, raw, [300.0] * c.N_DOF, [310.0] * c.N_DOF, ff, 1.0, 0.5, '測り直し', before, after)
+    with np.load(path) as z:
+        assert np.array_equal(z['param_0'], [1000.0, 144.0, 50000.0, 700.0]) and 'param_1' not in z.files
+        assert np.array_equal(z['x_param_after_0'], [1000.0, 144.0, 50000.0, 650.0])
+        assert np.array_equal(z['x_ff_sent_rows'], ff.astype(np.float32).astype(float))
+        assert str(z['x_note']) == '測り直し'
+    rec = c.load_trial_npz(path)
+    assert rec.params[0].lam == 700.0 and rec.params[1] is None and rec.aborted
+    # ADRC パラメータを読む前に失敗した回（params が None）でも保存できる
+    path2 = str(tmp_path / 'trial_002_stop.npz')
+    c.save_raw_attempt(path2, raw, [300.0] * c.N_DOF, [310.0] * c.N_DOF, ff, 1.0, 0.5, '停止', None, None)
+    with np.load(path2) as z:
+        assert not any(k.startswith('param_') or k.startswith('x_param_after_') for k in z.files)
+        assert 'x_ff_sent_rows' in z.files
 
 
 def test_extract_series_j0_and_window():

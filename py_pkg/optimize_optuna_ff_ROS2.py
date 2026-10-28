@@ -931,10 +931,11 @@ class OptimizationRun:
                 m = c.measure_with_retries(
                     self.link, cfg['initial'], cfg['target'], self.dofs, ff0, T, cfg['wait'], self.safety, self.stop,
                     log, rest_ref=None,
-                    on_attempt=lambda a, raw, ts, why, r=r: self._save_attempt(f'ref_{r:02d}_a{a}.npz', raw, ff0, ts, why))
+                    on_attempt=lambda a, raw, ts, why, prm, prm_after, r=r: self._save_attempt(
+                        f'ref_{r:02d}_a{a}.npz', raw, ff0, ts, why, prm, prm_after))
             except (c.UnsafeAbort, c.SensorFault) as exc:
                 self._save_attempt(f'ref_{r:02d}_abort.npz', getattr(exc, 'raw', None), ff0, getattr(exc, 't_send', 0),
-                                   str(exc))
+                                   str(exc), *self._exc_params(exc))
                 log(f"基準試行（FF=0）で中断しました: {exc}。目標軌道を作れないので study を作らずに止めます")
                 self.status = ('stopped', f'基準試行で中断: {exc}')
                 return
@@ -944,12 +945,12 @@ class OptimizationRun:
                 return
             except c.TrialIssue as exc:
                 self._save_attempt(f'ref_{r:02d}_eval.npz', getattr(exc, 'raw', None), ff0, getattr(exc, 't_send', 0),
-                                   exc.reason)
+                                   exc.reason, *self._exc_params(exc))
                 log(f"基準試行を解析できません: {exc.reason}")
                 self.status = ('error', f'基準試行の解析: {exc.reason}')
                 return
             c.save_trial_npz_ext(self.tpath(f'ref_{r:02d}.npz'), m.rec, self._npz_extra(m, ff0))
-            self._warn_ticks(m)
+            self._log_ticks(m)
             refs.append(m)
             for d, s in m.series.items():
                 log(f"  DOF {d}: P0 = {s.P0:.1f}, 欠損 {s.missing()}, エコーまで {s.echo_delay * 1000:.0f} ms")
@@ -1266,11 +1267,11 @@ class OptimizationRun:
                 self.status = ('stopped', res.get('reason', kind))
                 break
 
-    def _warn_ticks(self, m):
+    def _log_ticks(self, m):
         for b, inf in m.info.items():
-            if inf.get('suspect'):
-                self.log(f"  {b}: 警告: 大きな受信間隔がないのに欠損を {inf['n_drop']} 個と数えました（PC 側の受信の遅れが"
-                         f"途中で変わった可能性。評価区間に欠損があれば測り直しになります）")
+            if inf['n_drop'] > 0:
+                self.log(f"  {b}: 配信の欠損 {inf['n_drop']} 個（大きな受信間隔 {inf['n_gap']} か所のうち、後の受信が"
+                         f"追いつかなかった分）")
 
     def _npz_extra(self, m, ff_rows):
         ex = {'ff_sent_rows': np.asarray(ff_rows, dtype=np.float32).astype(float), 'time_axis': '100Hz'}
@@ -1279,15 +1280,21 @@ class OptimizationRun:
             ex[f'{b}_n_drop'] = inf['n_drop']
             ex[f'{b}_u_pc'] = inf['u_pc']
             ex[f'{b}_n_gap'] = inf['n_gap']
+            ex[f'{b}_n_drop_phase'] = inf['n_drop_phase']
         ex['remeasure'] = json.dumps(m.attempts, ensure_ascii=False)
         return ex
 
-    def _save_attempt(self, name, raw, ff_rows, t_send, note):
+    @staticmethod
+    def _exc_params(exc):
+        """中断の例外に付いている、試行開始時・終了時の ADRC パラメータ（measure_once が付ける）"""
+        return getattr(exc, 'params', None), getattr(exc, 'params_after', None)
+
+    def _save_attempt(self, name, raw, ff_rows, t_send, note, params=None, params_after=None):
         if raw is None:
             return None
         try:
             c.save_raw_attempt(self.tpath(name), raw, self.cfg['initial'], self.cfg['target'], ff_rows, self.cfg['T'],
-                               t_send, note)
+                               t_send, note, params, params_after)
             return name
         except Exception as exc:
             self.log(f"  生データの保存に失敗しました（{name}）: {exc}")
@@ -1377,8 +1384,8 @@ class OptimizationRun:
         st.stage(trial, 'measuring')
         files = []
 
-        def on_attempt(a, raw, ts, why):
-            nm = self._save_attempt(f'trial_{n:03d}_a{a}.npz', raw, sent, ts, why)
+        def on_attempt(a, raw, ts, why, prm, prm_after):
+            nm = self._save_attempt(f'trial_{n:03d}_a{a}.npz', raw, sent, ts, why, prm, prm_after)
             if nm:
                 files.append(nm)
             st.stage(trial, f'remeasure_{a + 1}')
@@ -1388,17 +1395,17 @@ class OptimizationRun:
                                        self.safety, self.stop, log, rest_ref, on_attempt)
         except c.StopRequested as exc:
             nm = self._save_attempt(f'trial_{n:03d}_stop.npz', getattr(exc, 'raw', None), sent,
-                                    getattr(exc, 't_send', 0), '停止')
+                                    getattr(exc, 't_send', 0), '停止', *self._exc_params(exc))
             files += [nm] if nm else []
             return self._fail(trial, 'stopped', '停止ボタン', row, attrs, files)
         except c.UnsafeAbort as exc:
             nm = self._save_attempt(f'trial_{n:03d}_unsafe.npz', getattr(exc, 'raw', None), sent,
-                                    getattr(exc, 't_send', 0), str(exc))
+                                    getattr(exc, 't_send', 0), str(exc), *self._exc_params(exc))
             files += [nm] if nm else []
             return self._fail(trial, 'unsafe', str(exc), row, attrs, files)
         except c.SensorFault as exc:
             nm = self._save_attempt(f'trial_{n:03d}_sensor.npz', getattr(exc, 'raw', None), sent,
-                                    getattr(exc, 't_send', 0), str(exc))
+                                    getattr(exc, 't_send', 0), str(exc), *self._exc_params(exc))
             files += [nm] if nm else []
             return self._fail(trial, 'sensor', str(exc), row, attrs, files)
         except c.CommFail as exc:
@@ -1406,11 +1413,11 @@ class OptimizationRun:
                               files, {'remeasure': len(getattr(exc, 'attempts', []))})
         except c.TrialIssue as exc:
             nm = self._save_attempt(f'trial_{n:03d}_eval.npz', getattr(exc, 'raw', None), sent,
-                                    getattr(exc, 't_send', 0), exc.reason)
+                                    getattr(exc, 't_send', 0), exc.reason, *self._exc_params(exc))
             files += [nm] if nm else []
             return self._fail(trial, 'eval', exc.reason, row, attrs, files)
         st.stage(trial, 'evaluating')
-        self._warn_ticks(m)
+        self._log_ticks(m)
         J, J_i = c.evaluate(m.series, self.targets)
         name = f'trial_{n:03d}.npz'
         extra = self._npz_extra(m, sent)
