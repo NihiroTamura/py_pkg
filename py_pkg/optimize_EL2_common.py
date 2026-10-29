@@ -103,7 +103,8 @@ POT_MA_N = 18               # POT の移動平均の点数（LPF_KOSUU。シス�
 LOOP_DT_ASSUMED = 0.011     # 制御の周回間隔 [s]（仮定値。実機から正確には測れない）
 PUBLISH_DT = 0.010          # ROS2 の配信周期 [s]（周回番号の復元で欠落を数えるときの目安にだけ使う）
 PWM_LIMIT = 255.0           # 弁へ出る入力の上限（128 ± u/2 を [0,255] でクリップ → 実効 ±255）
-EVAL_FACTOR = 1.5           # 測定・評価区間 = EVAL_FACTOR × T
+EVAL_FACTOR = 1.5           # 測定・評価区間 = max(EVAL_FACTOR × T, EVAL_MIN_TIME)
+EVAL_MIN_TIME = 5.0         # 測定・評価区間の最短 [s]（1.5T が 5 秒未満なら 5 秒評価する）
 
 # ==============================================================================
 # 既定の設定（GUIの初期値）
@@ -122,9 +123,14 @@ STEP_WARN = 10.0            # |ΔP| がこれ未満なら同定が不安定に�
 # ==============================================================================
 # 区間の長さ（round() を使わない）
 # ==============================================================================
+def eval_time(T):
+    """測定・評価区間の長さ t_f = max(1.5T, 5 s) [s]"""
+    return max(EVAL_FACTOR * float(T), EVAL_MIN_TIME)
+
+
 def eval_steps(T, L):
-    """評価区間の最終ステップ N = max{k : k·L ≤ 1.5T}。測定・評価は k = 0..N の N+1 点"""
-    return int(np.floor(EVAL_FACTOR * float(T) / float(L) + 1e-9))
+    """評価区間の最終ステップ N = max{k : k·L ≤ t_f}、t_f = max(1.5T, 5 s)。測定・評価は k = 0..N の N+1 点"""
+    return int(np.floor(eval_time(T) / float(L) + 1e-9))
 
 
 def ff_steps(T, L):
@@ -591,7 +597,10 @@ def retract(T, p, rel=1e-6):
 # ==============================================================================
 @dataclass
 class Weights:
-    """J = e_Nᵀ Sf e_N + Σ_{k=0}^{N−1} (e_kᵀ Q e_k + R u_k²)·L（e = [位置, 速度, 加速度] の誤差, u = FF）"""
+    """J = e_Nᵀ Sf e_N + Σ_{k=0}^{N−1} e_kᵀ Q e_k·L + Σ_{k=0}^{N_ff−1} R u_k²·L
+
+    e = [位置, 速度, 加速度] の誤差（評価区間 t_f = max(1.5T, 5 s) 全体）、u = FF（0 ≤ t < T だけ。T 以降は誤差の項だけ）
+    """
     Q: list = field(default_factory=lambda: list(DEFAULT_WEIGHTS['Q']))
     Sf: list = field(default_factory=lambda: list(DEFAULT_WEIGHTS['Sf']))
     R: float = DEFAULT_WEIGHTS['R']
@@ -628,8 +637,8 @@ class ELSolver:
     """ADRCを含む閉ループ s' = A s + B u + c に対して、5次関数FF（極値座標）を勾配法で最適化する。
 
     ● 評価関数とハミルトニアン（e_k = S s_k − x_tgt,k）
-        J   = e_Nᵀ Sf e_N + Σ_{k=0}^{N−1} (e_kᵀ Q e_k + R u_k²) L
-        H_k = (e_kᵀ Q e_k + R u_k²) L + λ_{k+1}ᵀ (A s_k + B u_k + c)
+        J   = e_Nᵀ Sf e_N + Σ_{k=0}^{N−1} e_kᵀ Q e_k L + Σ_{k=0}^{N_ff−1} R u_k² L   （N: t_f = max(1.5T, 5 s), N_ff: t < T）
+        H_k = (e_kᵀ Q e_k + R u_k²) L + λ_{k+1}ᵀ (A s_k + B u_k + c)   （k ≥ N_ff は u_k = 0 なので誤差の項だけ）
     ● 終端条件・共役方程式・勾配
         λ_N = 2 Sᵀ Sf e_N
         λ_k = ∂H_k/∂s_k = 2L Sᵀ Q e_k + Aᵀ λ_{k+1}          （k = N−1..1。s_0 は固定なので λ_0 は使わない）
@@ -1958,7 +1967,7 @@ def wait_rest(link, initial, dofs, stop_event, log, window=0.5, band=3.0, offset
 
 
 def run_trial(link, initial, target, ff_rows, T, L, wait_s, stop_event, log, opt_dofs, margin_iter=15):
-    """1試行: FF=0 → 初期姿勢 → 待機 → FF送信 → 目標値 → 1.5T 測定 → FF=0 → 初期姿勢。
+    """1試行: FF=0 → 初期姿勢 → 待機 → FF送信 → 目標値 → max(1.5T, 5 s) 測定 → FF=0 → 初期姿勢。
 
     待機は「初期姿勢を送ってから max(wait_s, T + 0.5) 秒」。初期姿勢への移動でもFFのタイマは t=0 から動くので、
     次のFFを送ったときに戻りのタイマで掛かり始めないよう T より長く待つ。停止要求が来たら FF=0 → 初期姿勢で抜ける。
@@ -1987,7 +1996,7 @@ def run_trial(link, initial, target, ff_rows, T, L, wait_s, stop_event, log, opt
         time.sleep(0.05)
         link.send_targets(target)
         t0 = time.monotonic()
-        log(f"  目標値を送信しました。{EVAL_FACTOR:g}T = {EVAL_FACTOR * T:.2f} 秒（{N + 1} 周回）測定します")
+        log(f"  目標値を送信しました。max({EVAL_FACTOR:g}T, {EVAL_MIN_TIME:g} s) = {eval_time(T):.2f} 秒（{N + 1} 周回）測定します")
         timeout = need * L * 1.3 + 3.0
         while True:
             _sleep_checked(0.05, stop_event)

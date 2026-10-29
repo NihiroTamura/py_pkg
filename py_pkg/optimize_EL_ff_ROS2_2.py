@@ -3,13 +3,14 @@
 ADRCに加えるFF入力を、内部ADRCシミュレーションを組み込んだ離散時間オイラー・ラグランジュ法で求めるプログラム（GUI）
 
 <処理の流れ>
-  Step 1  ADRCのみ（全自由度 FF=0）で目標値を送り、1.5T のあいだ POT・PWM・z1・z2・z3・derivatives を記録する。
+  Step 1  ADRCのみ（全自由度 FF=0）で目標値を送り、max(1.5T, 5 s) のあいだ POT・PWM・z1・z2・z3・derivatives を記録する。
           測定後は FF=0 → 初期姿勢へ戻し、GUIで設定した時間だけ待つ。
   Step 2  実測 POT（y = P − Pf）に ζ=1 の3次遅れ系（目標軌道）を当てはめ、累積誤差 J_i を計算する。
   Step 3  実測（z = P − P0、入力は実際の PWM）にシステムモデル（3次遅れ系）を同定する。
           開ループ同定 → POT・u_ADRC・z3 の3チャネル閉ループ同定。ファーム複製・再現精度・周回間隔の感度も記録する。
   Step 4  システムモデル＋実機ADRC の閉ループで、目標軌道との誤差 e と FF の大きさの評価関数を最小にする
-          5次関数FF（極値 (t1,y1),(t2,y2) を変数、極値ちょうど2個）を勾配法（随伴方程式）で求めて送り、1.5T 測定する。
+          5次関数FF（極値 (t1,y1),(t2,y2) を変数、極値ちょうど2個）を勾配法（随伴方程式）で求めて送り、max(1.5T, 5 s) 測定する。
+          評価関数は 0 ≤ t < T で誤差と FF、T ≤ t ≤ t_f では誤差だけを評価する。
           J ≤ 閾値なら終了。超えたら Step 3 から繰り返す（同定・目標軌道は直前の試行の実測でやり直す）。
 <計算の定義> optimize_EL2_common.py（3プログラム共通）を参照。
 <対応Arduino プログラム> ADRC_ROS2_tk_FF_ADRCparamChange-board1〜5（変更しない）
@@ -75,7 +76,7 @@ class OptimizationRun:
             ('実行', '状態', self.status, ''),
             ('実行', 'プログラム', 'optimize_EL_ff_ROS2_2.py', '計算は optimize_EL2_common.py'),
             ('時間', 'T', cfg['T'], '動作完了時間 [s]（FF は 0 ≤ t < T）'),
-            ('時間', '測定・評価区間', c.EVAL_FACTOR * cfg['T'], f'{c.EVAL_FACTOR}T [s]'),
+            ('時間', '測定・評価区間', c.eval_time(cfg['T']), f'max({c.EVAL_FACTOR}T, {c.EVAL_MIN_TIME} s) [s]。FF の項は t < T だけ'),
             ('時間', '制御の周回間隔 L', cfg['L'], '仮定値 [s]。ESO・ADRC は1周に1回'),
             ('時間', 'ESO の dt', c.ESO_DT, 'ファームの式の中の係数 [s]'),
             ('時間', 'derivatives の h', c.DIFF_H, 'ファームの式の中の係数 [s]'),
@@ -150,7 +151,7 @@ class OptimizationRun:
             c.write_pointer(self.folder, self.session)
             log(f"=== 開始: 保存先 {self.folder}")
             log(f"最適化対象 DOF {cfg['opt_dofs']}  T = {cfg['T']} s, 周回間隔 L = {cfg['L']} s（仮定値）, "
-                f"評価区間 {c.EVAL_FACTOR}T = {c.EVAL_FACTOR * cfg['T']:.3f} s（N = {c.eval_steps(cfg['T'], cfg['L'])}）")
+                f"評価区間 max({c.EVAL_FACTOR}T, {c.EVAL_MIN_TIME:g} s) = {c.eval_time(cfg['T']):.3f} s（N = {c.eval_steps(cfg['T'], cfg['L'])}）")
             params = self.link.adrc_params()
             c.write_kv_csv(self.path('conditions.csv'), self.conditions_rows(params))
             ff = np.zeros((c.N_FF, 5))
@@ -347,7 +348,7 @@ class App:
         nb.add(tab, text="基本")
         s = self.settings
         self.basic = g.Fields(tab, "動作・終了条件・保存")
-        self.basic.add('T', "動作完了時間 T [s]", s.get('T', 1.5), note=f"測定・評価は {c.EVAL_FACTOR}T")
+        self.basic.add('T', "動作完了時間 T [s]", s.get('T', 1.5), note=f"測定・評価は max({c.EVAL_FACTOR}T, {c.EVAL_MIN_TIME:g} s)")
         self.basic.add('wait', "初期姿勢に戻った後の待機時間 [s]", s.get('wait', 5.0), note="実際は max(待機時間, T+0.5)")
         self.basic.add('max_loops', "最大ループ数（FFありの試行）", s.get('max_loops', 10))
         self.basic.add('J_thr', "累積誤差 J の終了閾値", s.get('J_thr', 1e-4),
