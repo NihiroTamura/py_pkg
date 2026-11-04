@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """
-Optuna で5次関数FF（a t⁵ + b t⁴ + c t³ + d t² + e t, 0 ≤ t < T）を実機試行により探索するプログラム（GUI）
+Optuna で5次関数FF（a t⁵ + b t⁴ + c t³ + d t² + e t, 0 ≤ t < T_FF）を実機試行により探索するプログラム（GUI）
 
+<時間>（2026-11-04 に T と T_FF を分け、評価時間の固定値 E を GUI で変えられるようにした。それまでは T_FF = T, E = 5 秒）
+  動作完了時間 T    … 目標軌道（T までに目標値の ±ε に入る）と評価区間 max(1.5T, E) に使う。
+  FF 入力時間 T_FF  … FF を与える時間（写像・係数・送信前の検証・ファームへ送る T）。T_FF ≤ max(1.5T, E)。
 <処理の流れ>（計画書 第4版, 2026-10-23）
-  1. 基準試行：FF=0（ADRC のみ）で目標値を送り、評価区間 max(1.5T, 5 秒) のあいだ記録する（回数は GUI で指定、既定 2）。
+  1. 基準試行：FF=0（ADRC のみ）で目標値を送り、評価区間 max(1.5T, E) のあいだ記録する（回数は GUI で指定、既定 2）。
      終わるたびに FF を2段で止め（T=0 → 係数0）、静止を待ってから初期姿勢へ戻し、待機時間だけ待つ。
   2. 目標軌道：基準試行に ζ=1 の3次遅れ系を「T までに |y| ≤ ε|ΔP| に入り以後も維持」の拘束付きで当てはめ、固定する。
-  3. Optuna：u = (u1,u2,u3,A)（自由度ごと）を選ぶ → 写像で FF を作る → float32 でファームの計算を再現して検証 →
-     近傍棄却 → 実機で max(1.5T, 5 秒) 測定 → J = mean_i mean((POT − 目標軌道)/ΔP)² を tell（log10 J）。
+  3. Optuna：u = (u1,u2,u3,A)（自由度ごと）を選ぶ → 写像で FF（0 ≤ t < T_FF）を作る → float32 でファームの計算を再現して
+     検証 → 近傍棄却 → 実機で max(1.5T, E) 測定 → J = mean_i mean((POT − 目標軌道)/ΔP)² を tell（log10 J）。
      J ≤ 閾値なら同じ FF で確認試行をし、2回の平均も閾値以下なら終了する。
      評価に失敗した試行は TrialState.FAIL（原因・データ・ログを残す）。
 <時間軸> 100 Hz 配信の番号 × 10 ms（制御周期は使わない）。<計算・通信・保存> optuna_ff_common.py
@@ -651,7 +654,7 @@ def plot_g4(ax, L, d, p, n):
         ax.plot(p['t'], p['pwm'], color='#1f77b4', lw=1.0, label='PWM')
         ax.plot(p['t'], p['adrc'], color='#2ca02c', lw=1.0, label=TXT[L]['adrc'])
         ax.axvline(0.0, color='#aaa', lw=0.6)
-        ax.axvline(p['T'], color='#aaa', lw=0.6, ls='--')
+        ax.axvline(p.get('T_ff', p['T']), color='#aaa', lw=0.6, ls='--')          # FF が終わる時刻 T_FF
         ax.legend(fontsize=7, loc='best')
     ax.set_xlabel(TXT[L]['t'], fontsize=8)
     ax.set_ylabel(TXT[L]['pwm'], fontsize=8)
@@ -668,7 +671,9 @@ def plot_g5(ax, L, d, p, n):
         for tt, yy, nm in ((t1, y1, '1'), (t2, y2, '2')):
             ax.annotate(f"({tt:.3f} s, {yy:+.1f})", (tt, yy), fontsize=7, textcoords='offset points', xytext=(4, 4))
         ax.axhline(0.0, color='#aaa', lw=0.6)
-        ax.set_xlim(-0.02 * p['T'], p.get('t_eval', 1.5 * p['T']))
+        T_ff = p.get('T_ff', p['T'])
+        ax.axvline(T_ff, color='#aaa', lw=0.6, ls='--')                           # FF が終わる時刻 T_FF
+        ax.set_xlim(-0.02 * T_ff, p.get('t_eval', 1.5 * p['T']))
         ax.legend(fontsize=7, loc='best')
     ax.set_xlabel(TXT[L]['t'], fontsize=8)
     ax.set_ylabel('FF [PWM]', fontsize=8)
@@ -773,6 +778,21 @@ class Offload:
 # ==============================================================================
 # 最適化の手順（ワーカースレッド）
 # ==============================================================================
+def cfg_T_ff(cfg):
+    """FF 入力時間 T_FF [s]。T_FF を分ける前（2026-11-04 より前）の config.json にはないので、そのときは T（同じ値だった）"""
+    return float(cfg.get('T_ff', cfg['T']))
+
+
+def cfg_eval_min(cfg):
+    """評価時間の固定値 E [s]（評価区間 = max(1.5T, E)）。分ける前の config.json にはないので、そのときは 5 秒"""
+    return float(cfg.get('eval_min', c.EVAL_MIN_S))
+
+
+def cfg_eval_time(cfg):
+    """評価区間の長さ max(1.5T, E) [s]（T は動作完了時間）"""
+    return c.eval_time(cfg['T'], cfg_eval_min(cfg))
+
+
 class OptimizationRun:
     def __init__(self, link, cfg, log, stop_event, events, lang='ja', resume_folder=None, offload=None):
         self.offload = offload                          # 別プロセスでの描画・計算（None ならこのスレッドで行う）
@@ -810,14 +830,19 @@ class OptimizationRun:
 
     @staticmethod
     def cond_dict(cfg, params, target_hash):
-        return {'map_version': c.MAP_VERSION, 'm': cfg['m'], 'sep': cfg['sep'], 'r_margin': 1.01,
-                'r_range': [c.R_MIN, c.R_MAX], 'shrink': 1e-4, 'A_max': cfg['A_max'], 'A_min': c.A_MIN,
-                'A_sign': 'signed A (|A| < 1 -> +-1)', 'rho': cfg['rho'], 'tabu_on': cfg['tabu_on'],
-                'dofs': cfg['dofs'], 'T': cfg['T'], 'time_axis': '100 Hz publish (0.010 s)', 'eps': cfg['eps'],
-                'eval_time': c.eval_time(cfg['T']), 'eval_rule': 'max(1.5T, 5 s)',
-                'xi_cap': c.XI_CAP, 'wn_max': c.WN_MAX, 'initial': cfg['initial'], 'target': cfg['target'],
-                'adrc': {str(d): (params[d].as_list() if params.get(d) is not None else None) for d in cfg['dofs']},
-                'target_hash': target_hash}
+        """条件 hash の項目。T_FF は T と違うときだけ入れ、評価時間の固定値は eval_rule の文字列に入れる
+        （T_FF = T・固定値 5 秒なら、分ける前と同じ hash になり、それまでの study を再開できる）"""
+        d = {'map_version': c.MAP_VERSION, 'm': cfg['m'], 'sep': cfg['sep'], 'r_margin': 1.01,
+             'r_range': [c.R_MIN, c.R_MAX], 'shrink': 1e-4, 'A_max': cfg['A_max'], 'A_min': c.A_MIN,
+             'A_sign': 'signed A (|A| < 1 -> +-1)', 'rho': cfg['rho'], 'tabu_on': cfg['tabu_on'],
+             'dofs': cfg['dofs'], 'T': cfg['T'], 'time_axis': '100 Hz publish (0.010 s)', 'eps': cfg['eps'],
+             'eval_time': cfg_eval_time(cfg), 'eval_rule': f'max(1.5T, {cfg_eval_min(cfg):g} s)',
+             'xi_cap': c.XI_CAP, 'wn_max': c.WN_MAX, 'initial': cfg['initial'], 'target': cfg['target'],
+             'adrc': {str(d): (params[d].as_list() if params.get(d) is not None else None) for d in cfg['dofs']},
+             'target_hash': target_hash}
+        if cfg_T_ff(cfg) != float(cfg['T']):
+            d['T_ff'] = cfg_T_ff(cfg)
+        return d
 
     @staticmethod
     def check_resume(folder, link):
@@ -910,9 +935,10 @@ class OptimizationRun:
         self.safety = c.SafetyConfig(**cfg['safety'])
         self._open_folder(c.make_run_folder(cfg['base'], 'optimize'))
         c.write_json_atomic(os.path.join(self.folder, 'config.json'), cfg)
-        T = cfg['T']
+        T, T_ff, E = cfg['T'], cfg_T_ff(cfg), cfg_eval_min(cfg)
         log(f"=== 開始: 保存先 {self.folder}")
-        log(f"最適化対象 DOF {self.dofs}  T = {T} s, 評価区間 max(1.5T, 5 s) = {c.eval_time(T):.3f} s（{c.n_eval(T) + 1} 配信, 100 Hz）, "
+        log(f"最適化対象 DOF {self.dofs}  動作完了時間 T = {T} s, FF 入力時間 T_FF = {T_ff} s, "
+            f"評価区間 max(1.5T, {E:g} s) = {c.eval_time(T, E):.3f} s（{c.n_eval(T, E) + 1} 配信, 100 Hz）, "
             f"Sampler {cfg['sampler']}（seed {cfg['seed']}）, 最大試行数 {cfg['max_trials']}, "
             f"閾値 J ≤ {cfg['J_thr']:.3g}（RMS {cfg['rms_thr']:g}%）")
         log("FF の可行域の表を用意しています（初回だけ十数秒かかります）…")
@@ -932,7 +958,8 @@ class OptimizationRun:
                     self.link, cfg['initial'], cfg['target'], self.dofs, ff0, T, cfg['wait'], self.safety, self.stop,
                     log, rest_ref=None,
                     on_attempt=lambda a, raw, ts, why, prm, prm_after, r=r: self._save_attempt(
-                        f'ref_{r:02d}_a{a}.npz', raw, ff0, ts, why, prm, prm_after))
+                        f'ref_{r:02d}_a{a}.npz', raw, ff0, ts, why, prm, prm_after),
+                    T_ff=T_ff, eval_min=E)
             except (c.UnsafeAbort, c.SensorFault) as exc:
                 self._save_attempt(f'ref_{r:02d}_abort.npz', getattr(exc, 'raw', None), ff0, getattr(exc, 't_send', 0),
                                    str(exc), *self._exc_params(exc))
@@ -1062,7 +1089,8 @@ class OptimizationRun:
                                   'fail_class': t.user_attrs.get('fail_class')})
         try:
             rec = c.load_trial_npz(self.tpath('ref_00.npz'))
-            ser, _info = c.extract_series(rec.raw, cfg['initial'], cfg['target'], self.dofs, rec.t_target, cfg['T'])
+            ser, _info = c.extract_series(rec.raw, cfg['initial'], cfg['target'], self.dofs, rec.t_target, cfg['T'],
+                                          eval_min=cfg_eval_min(cfg))
             self.ref_pot = ser
         except Exception:
             self.ref_pot = {}
@@ -1134,12 +1162,16 @@ class OptimizationRun:
         return {'u1': u1, 'u2': u2, 'u3': u3, 'A': A}
 
     def _past_candidates(self, ref):
-        """(c) 過去の npz を add_trial する（往復誤差が許容内・retract 不要・対象の全 DOF がそろう試行だけ。J は計算し直す）"""
+        """(c) 過去の npz を add_trial する（往復誤差が許容内・retract 不要・対象の全 DOF がそろう試行だけ。J は計算し直す）。
+
+        実機の応答は FF（係数と FF 入力時間 T_FF）・初期姿勢・目標値で決まり、動作完了時間 T は目標軌道と評価区間にしか
+        使わないので、T_FF・初期姿勢・目標値が同じ記録を使う（T_FF のない記録は T_FF = T）。J は今の目標軌道・評価区間で計算し直す。
+        """
         out = []
         if not self.cfg.get('use_past'):
             return out
         cfg = self.cfg
-        T = cfg['T']
+        T, T_ff, E = cfg['T'], cfg_T_ff(cfg), cfg_eval_min(cfg)
         for path in cfg.get('past_npz', []):
             name = os.path.basename(path)
             try:
@@ -1147,24 +1179,24 @@ class OptimizationRun:
             except Exception as exc:
                 self.log(f"  過去の試行 {name} を読めません: {exc}")
                 continue
-            if abs(rec.T - T) > 1e-9 or not np.allclose(rec.initial, cfg['initial']) or \
+            if abs(rec.T_ff - T_ff) > 1e-9 or not np.allclose(rec.initial, cfg['initial']) or \
                     not np.allclose(rec.target, cfg['target']):
-                self.log(f"  過去の試行 {name}: T・初期姿勢・目標値が違うので使いません")
+                self.log(f"  過去の試行 {name}: FF 入力時間 T_FF・初期姿勢・目標値が違うので使いません")
                 continue
             u, ext, ok = {}, {}, True
             for d in self.dofs:
                 co = np.asarray(rec.ff[c.FF_INDEX[d]], dtype=float)
-                if c.extrema_ok(co, T) is None:
+                if c.extrema_ok(co, T_ff) is None:
                     ok = False
                     break
-                t1, y1, t2, y2 = c.extrema_of(co, T)
-                ud, why = self.ffmap.inverse(t1, y1, t2, y2, T)
+                t1, y1, t2, y2 = c.extrema_of(co, T_ff)
+                ud, why = self.ffmap.inverse(t1, y1, t2, y2, T_ff)
                 if ud is None:
                     ok = False
                     break
-                back = self.ffmap.design(ud['u1'], ud['u2'], ud['u3'], ud['A'], T)['coeffs']
-                tt = np.arange(0, int(T * 1000)) / 1000.0
-                if np.max(np.abs(c.ff_eval(back, T, tt) - c.ff_eval(co, T, tt))) > 0.01:   # 往復誤差の許容（計画書 §6.5）
+                back = self.ffmap.design(ud['u1'], ud['u2'], ud['u3'], ud['A'], T_ff)['coeffs']
+                tt = np.arange(0, int(T_ff * 1000)) / 1000.0
+                if np.max(np.abs(c.ff_eval(back, T_ff, tt) - c.ff_eval(co, T_ff, tt))) > 0.01:   # 往復誤差の許容（計画書 §6.5）
                     ok = False
                     break
                 u[d], ext[d] = ud, (t1, y1, t2, y2)
@@ -1172,14 +1204,15 @@ class OptimizationRun:
                 self.log(f"  過去の試行 {name}: FF が写像で表せない（往復誤差・可行域）ので使いません")
                 continue
             try:
-                ser, _info = c.extract_series(rec.raw, cfg['initial'], cfg['target'], self.dofs, rec.t_target, T)
+                ser, _info = c.extract_series(rec.raw, cfg['initial'], cfg['target'], self.dofs, rec.t_target, T,
+                                              eval_min=E)
                 J, J_i = c.evaluate(ser, self.targets)
             except Exception as exc:
                 self.log(f"  過去の試行 {name}: 解析できません（{exc}）")
                 continue
             short = {d: s_.missing() for d, s_ in ser.items() if s_.missing() > self.safety.missing_tol}
             if short:
-                self.log(f"  過去の試行 {name}: 評価区間 {c.eval_time(T):.2f} 秒の配信がそろっていない（欠け {short}。"
+                self.log(f"  過去の試行 {name}: 評価区間 {c.eval_time(T, E):.2f} 秒の配信がそろっていない（欠け {short}。"
                          f"評価区間が短かったころの記録など）ので使いません")
                 continue
             if not np.isfinite(J):
@@ -1294,14 +1327,15 @@ class OptimizationRun:
             return None
         try:
             c.save_raw_attempt(self.tpath(name), raw, self.cfg['initial'], self.cfg['target'], ff_rows, self.cfg['T'],
-                               t_send, note, params, params_after)
+                               t_send, note, params, params_after, T_ff=cfg_T_ff(self.cfg),
+                               eval_min=cfg_eval_min(self.cfg))
             return name
         except Exception as exc:
             self.log(f"  生データの保存に失敗しました（{name}）: {exc}")
             return None
 
     def _design(self, u):
-        T = self.cfg['T']
+        T = cfg_T_ff(self.cfg)                      # FF の写像・係数・送信前の検証は FF 入力時間で行う
         designs, checks = {}, {}
         ff_rows = np.zeros((c.N_FF, 5))
         for d in self.dofs:
@@ -1313,7 +1347,7 @@ class OptimizationRun:
         return designs, checks, sent
 
     def _flat(self, u, designs, checks, sent):
-        T = self.cfg['T']
+        T = cfg_T_ff(self.cfg)                      # 送った FF の T（FF 入力時間）
         row, design_a, sent_a, ext_sent = {}, {}, {}, {}
         for d in self.dofs:
             p = f'd{d}_'
@@ -1358,7 +1392,7 @@ class OptimizationRun:
     def _one_trial(self, trial, rest_ref):
         cfg, log, st = self.cfg, self.log, self.study
         n = trial.number
-        T = cfg['T']
+        T, T_ff, E = cfg['T'], cfg_T_ff(cfg), cfg_eval_min(cfg)
         u = st.u_of(trial.params)
         src = trial.user_attrs.get('source', 'sampler')
         retry_of = trial.user_attrs.get('retry_of')
@@ -1380,7 +1414,7 @@ class OptimizationRun:
         for d in self.dofs:
             ds = designs[d]
             log(f"  DOF {d}: 極値 ({ds['t1']:.3f} s, {ds['y1']:+.1f}) / ({ds['t2']:.3f} s, {ds['y2']:+.1f}), "
-                f"r = {ds['r']:.3g}, max|FF| = {checks[d]['max_abs']:.1f}, T 直前の段差 {checks[d]['step_at_T']:.2f}")
+                f"r = {ds['r']:.3g}, max|FF| = {checks[d]['max_abs']:.1f}, T_FF 直前の段差 {checks[d]['step_at_T']:.2f}")
         st.stage(trial, 'measuring')
         files = []
 
@@ -1392,7 +1426,7 @@ class OptimizationRun:
 
         try:
             m = c.measure_with_retries(self.link, cfg['initial'], cfg['target'], self.dofs, sent, T, cfg['wait'],
-                                       self.safety, self.stop, log, rest_ref, on_attempt)
+                                       self.safety, self.stop, log, rest_ref, on_attempt, T_ff=T_ff, eval_min=E)
         except c.StopRequested as exc:
             nm = self._save_attempt(f'trial_{n:03d}_stop.npz', getattr(exc, 'raw', None), sent,
                                     getattr(exc, 't_send', 0), '停止', *self._exc_params(exc))
@@ -1472,7 +1506,8 @@ class OptimizationRun:
         fail = None
         try:
             m = c.measure_with_retries(self.link, cfg['initial'], cfg['target'], self.dofs, sent, cfg['T'], cfg['wait'],
-                                       self.safety, self.stop, log, rest_ref)
+                                       self.safety, self.stop, log, rest_ref, T_ff=cfg_T_ff(cfg),
+                                       eval_min=cfg_eval_min(cfg))
             J2, J_i2 = c.evaluate(m.series, self.targets)
             if not np.isfinite(J2):
                 fail = ('eval', 'J を計算できません', None)
@@ -1513,22 +1548,23 @@ class OptimizationRun:
 
     # ---------------- グラフ ----------------
     def _payload(self, n, m, sent, designs):
-        T = self.cfg['T']
-        t_ms = np.arange(0, int(math.ceil(1000.0 * c.eval_time(T))) + 1)
-        out = {'n': n, 'T': T, 'dofs': {}}
-        t_eval = c.eval_time(T)
+        T, T_ff = self.cfg['T'], cfg_T_ff(self.cfg)
+        t_eval = cfg_eval_time(self.cfg)
+        t_ms = np.arange(0, int(math.ceil(1000.0 * t_eval)) + 1)
+        out = {'n': n, 'T': T, 'T_ff': T_ff, 'dofs': {}}
         for d, s in m.series.items():
             co = sent[c.FF_INDEX[d]]
-            ffv = c.ff_eval(co, T, s.t - c.TICK_DT)
+            ffv = c.ff_eval(co, T_ff, s.t - c.TICK_DT)
             ref = self.ref_pot.get(d)
             best = self.best_pot.get(d)
-            ex = c.extrema_of(co, float(np.float32(T)))
+            ex = c.extrema_of(co, float(np.float32(T_ff)))
             out['dofs'][d] = {
-                'T': T, 't_eval': t_eval, 't': s.t, 'pot': s.pot, 't_win': s.t[s.win()], 'target': self.targets[d].seq(),
+                'T': T, 'T_ff': T_ff, 't_eval': t_eval, 't': s.t, 'pot': s.pot, 't_win': s.t[s.win()],
+                'target': self.targets[d].seq(),
                 'ref': ref.pot if ref is not None and len(ref.pot) == len(s.pot) else None,
                 'best': best.pot if best is not None and len(best.pot) == len(s.pot) else None,
                 'pwm': s.pwm, 'adrc': s.pwm - ffv, 'ff_t': t_ms / 1000.0,
-                'ff': c.firmware_ff(co, T, t_ms).astype(float), 'ext': ex}
+                'ff': c.firmware_ff(co, T_ff, t_ms).astype(float), 'ext': ex}
         return out
 
     def _check_render(self, wait=0.0):
@@ -1576,13 +1612,15 @@ class OptimizationRun:
             ('実行', 'プログラム', 'optimize_optuna_ff_ROS2.py', '計算は optuna_ff_common.py'),
             ('実行', 'ライブラリ', f"python {sys.version.split()[0]}, numpy {np.__version__}, scipy {scipy.__version__}, "
                                f"optuna {optuna.__version__}, cmaes {cm}, matplotlib {matplotlib.__version__}", ''),
-            ('時間', 'T', cfg['T'], '動作完了時間 [s]（FF は 0 ≤ t < T）'),
-            ('時間', '評価区間', c.eval_time(cfg['T']), 'max(1.5T, 5 s) [s]'),
+            ('時間', 'T', cfg['T'], '動作完了時間 [s]（目標軌道は T までに目標値の ±ε に入る。評価区間にも使う）'),
+            ('時間', 'T_FF', cfg_T_ff(cfg), 'FF 入力時間 [s]（FF は 0 ≤ t < T_FF。ファームへ送る T）'),
+            ('時間', '評価時間の固定値 E', cfg_eval_min(cfg), '[s]'),
+            ('時間', '評価区間', cfg_eval_time(cfg), f'max(1.5T, {cfg_eval_min(cfg):g} s) [s]'),
             ('時間', '時間軸', '100 Hz 配信（0.010 s）', '配信番号 × 10 ms。制御周期は使わない'),
-            ('時間', '評価区間の配信数 N_e+1', c.n_eval(cfg['T']) + 1, 'j − j0 = 0..N_e'),
-            ('時間', '待機時間', cfg['wait'], '[s]（実際は max(待機時間, T+0.5)）'),
+            ('時間', '評価区間の配信数 N_e+1', c.n_eval(cfg['T'], cfg_eval_min(cfg)) + 1, 'j − j0 = 0..N_e'),
+            ('時間', '待機時間', cfg['wait'], '[s]（実際は max(待機時間, T_FF+0.5)）'),
             ('写像', '版', c.MAP_VERSION, '案4（s1, s2 は正確な境界、r は閉形式、符号付き A）'),
-            ('写像', '位置の余裕 m / 最小間隔 sep', f"{cfg['m']} / {cfg['sep']}", 's = t/T'),
+            ('写像', '位置の余裕 m / 最小間隔 sep', f"{cfg['m']} / {cfg['sep']}", 's = t/T_FF'),
             ('写像', 'r の余裕 / 範囲', f"1.01 / [{c.R_MIN:g}, {c.R_MAX:g}]", 'r = −y2/y1'),
             ('写像', 'A_max / |A| の下限', f"{cfg['A_max']} / {c.A_MIN}", '[PWM]'),
             ('目標軌道', 'ε', cfg['eps'], '完了: t ≥ T で |y| ≤ ε|ΔP|'),
@@ -1643,10 +1681,11 @@ class OptimizationRun:
                     with np.load(path, allow_pickle=False) as z:
                         sent = z['x_ff_sent_rows'].copy() if 'x_ff_sent_rows' in z.files else rec.ff
                     series, info = c.extract_series(rec.raw, self.cfg['initial'], self.cfg['target'], self.dofs,
-                                                    rec.t_target, self.cfg['T'])
-                c.write_results_csv(self.path('results.csv'), self.cfg['initial'], self.cfg['target'], self.cfg['T'], sent)
+                                                    rec.t_target, self.cfg['T'], eval_min=cfg_eval_min(self.cfg))
+                T_ff = cfg_T_ff(self.cfg)                       # 結果 CSV の T_n 列・FF の列は FF 入力時間
+                c.write_results_csv(self.path('results.csv'), self.cfg['initial'], self.cfg['target'], T_ff, sent)
                 c.write_trial_timeseries(self.path('best_trial.csv'), rec, c.ff_times_for_csv(rec, info))
-                c.write_grid_csv(self.path('best_trial_grid.csv'), series, self.targets, sent, self.cfg['T'])
+                c.write_grid_csv(self.path('best_trial_grid.csv'), series, self.targets, sent, T_ff)
                 log(f"保存: best は試行 {b.number}（J = {b.user_attrs['J']:.4g}）")
             else:
                 log("COMPLETE の試行がないので、結果 CSV は書きません")
@@ -1785,9 +1824,14 @@ class App:
         tab = ttk.Frame(self.nb)
         self.nb.add(tab, text="基本")
         self.basic = Fields(tab, "動作・終了条件・保存")
-        self.basic.add('T', "動作完了時間 T [s]", s.get('T', 1.5), note="測定・評価は max(1.5T, 5 秒)（100 Hz 配信の時間軸）")
+        self.basic.add('T', "動作完了時間 T [s]", s.get('T', 1.5),
+                       note="目標軌道が目標値の ±ε に入る時間。評価区間 max(1.5T, 評価時間の固定値) にも使う")
+        self.basic.add('T_ff', "FF 入力時間 T_FF [s]", s.get('T_ff', s.get('T', 1.5)),
+                       note="FF を与える時間（0 ≤ t < T_FF）。評価区間以下にする")
+        self.basic.add('eval_min', "評価時間の固定値 [s]", s.get('eval_min', c.EVAL_MIN_S),
+                       note=f"評価区間 = max(1.5T, この値)（100 Hz 配信の時間軸）。既定 {c.EVAL_MIN_S:g} 秒")
         self.basic.add('dofs', "最適化対象 DOF（カンマ区切り。空欄なら |ΔP| ≠ 0 の全自由度）", s.get('dofs', ''), width=20)
-        self.basic.add('wait', "初期姿勢に戻った後の待機時間 [s]", s.get('wait', 5.0), note="実際は max(待機時間, T+0.5)")
+        self.basic.add('wait', "初期姿勢に戻った後の待機時間 [s]", s.get('wait', 5.0), note="実際は max(待機時間, T_FF+0.5)")
         self.basic.add('n_ref', "基準試行（FF=0）の回数", s.get('n_ref', 2), note="2回以上で試行間のばらつきを推定する")
         self.basic.add('max_trials', "最大試行数（COMPLETE の数）", s.get('max_trials', 40))
         self.basic.add('rms_thr', "終了閾値 RMS [% of ΔP]", s.get('rms_thr', 1.0), note="J_thr = (RMS/100)²（1% → 1e−4）")
@@ -1820,7 +1864,7 @@ class App:
         self.seed_files = FileList(tab_s, "初期候補（(a)(b) 結果 CSV。最後の行の極値を enqueue する）",
                                    s.get('seed_csv', []), [('CSV', '*.csv')])
         self.use_past_var = tk.BooleanVar(value=s.get('use_past', False))
-        ttk.Checkbutton(tab_s, text="(c) 過去の試行（npz）を学習データに入れる（T・初期姿勢・目標値が同じで、FF を写像で表せるものだけ）",
+        ttk.Checkbutton(tab_s, text="(c) 過去の試行（npz）を学習データに入れる（T_FF・初期姿勢・目標値が同じで、FF を写像で表せるものだけ）",
                         variable=self.use_past_var).pack(anchor='w', padx=8)
         self.past_files = FileList(tab_s, "過去の試行（npz）", s.get('past_npz', []), [('npz', '*.npz')])
 
@@ -1929,7 +1973,12 @@ class App:
     # ---------------- 設定 ----------------
     def collect(self):
         b, sr, sa = self.basic, self.search, self.safe
-        T = parse_float(b.get('T'), 'T', lo=0.05, hi=10.0)
+        T = parse_float(b.get('T'), '動作完了時間 T', lo=0.05, hi=10.0)
+        T_ff = parse_float(b.get('T_ff'), 'FF 入力時間 T_FF', lo=0.05, hi=10.0)
+        E = parse_float(b.get('eval_min'), '評価時間の固定値', lo=0.0, hi=60.0)
+        if T_ff > c.eval_time(T, E) + 1e-9:
+            raise ValueError(f"FF 入力時間 T_FF = {T_ff:g} s が評価区間 max(1.5T, {E:g} s) = {c.eval_time(T, E):g} s より"
+                             f"長いです（評価区間の後の FF は測定の終わりに止めるので、最後まで与えられません）")
         initial, target = self.table.get()
         moving = self.table.opt_dofs()
         txt = b.get('dofs').replace('、', ',').strip()
@@ -1970,7 +2019,8 @@ class App:
                     raise ValueError(f"DOF {d} の{nm} {v:g} が関節の可動範囲 [{lo:g}, {hi:g}] の外です")
         A_max = parse_float(b.get('A_max'), 'A_max', lo=1.0, hi=255.0)
         return {
-            'T': T, 'dofs': dofs, 'wait': parse_float(b.get('wait'), '待機時間', lo=0.0, hi=600.0),
+            'T': T, 'T_ff': T_ff, 'eval_min': E, 'dofs': dofs,
+            'wait': parse_float(b.get('wait'), '待機時間', lo=0.0, hi=600.0),
             'n_ref': int(parse_float(b.get('n_ref'), '基準試行の回数', lo=1, hi=10)),
             'max_trials': int(parse_float(b.get('max_trials'), '最大試行数', lo=1, hi=100000)),
             'rms_thr': rms, 'J_thr': (rms / 100.0) ** 2,
@@ -2032,7 +2082,8 @@ class App:
         """今の欄の内容（入力した文字列のまま。検査はしない）"""
         b, sr, sa = self.basic, self.search, self.safe
         return {
-            'T': b.get('T'), 'dofs': b.get('dofs'), 'wait': b.get('wait'), 'n_ref': b.get('n_ref'),
+            'T': b.get('T'), 'T_ff': b.get('T_ff'), 'eval_min': b.get('eval_min'), 'dofs': b.get('dofs'),
+            'wait': b.get('wait'), 'n_ref': b.get('n_ref'),
             'max_trials': b.get('max_trials'), 'rms_thr': b.get('rms_thr'), 'eps': b.get('eps'), 'A_max': b.get('A_max'),
             'base': b.get('base'),
             'sampler': self.sampler_var.get(), 'seed': sr.get('seed'), 'm': sr.get('m'), 'sep': sr.get('sep'),
@@ -2070,6 +2121,8 @@ class App:
         """再開する study の設定を欄に表示する（再開中は変更できない）"""
         for k in ('T', 'wait', 'n_ref', 'max_trials', 'rms_thr', 'A_max', 'base'):
             self.basic.set(k, cfg[k])
+        self.basic.set('T_ff', cfg_T_ff(cfg))            # 分ける前の study は T_FF = T、固定値 5 秒
+        self.basic.set('eval_min', cfg_eval_min(cfg))
         self.basic.set('eps', cfg['eps'] * 100.0)
         self.basic.set('dofs', ', '.join(str(d) for d in cfg['dofs']))
         self.sampler_var.set(cfg['sampler'])
@@ -2158,7 +2211,9 @@ class App:
             return
         moves = "\n".join(f"  DOF {d}: {cfg['initial'][d]:g} → {cfg['target'][d]:g}" for d in cfg['dofs'])
         if not messagebox.askokcancel("Start", f"ロボットが動きます。\n\n最適化対象:\n{moves}\n\n"
-                                               f"T = {cfg['T']} s, 基準試行 {cfg['n_ref']} 回, 最大試行数 {cfg['max_trials']}, "
+                                               f"T = {cfg['T']} s, T_FF = {cfg['T_ff']} s, "
+                                               f"評価区間 {cfg_eval_time(cfg):g} s, "
+                                               f"基準試行 {cfg['n_ref']} 回, 最大試行数 {cfg['max_trials']}, "
                                                f"A_max = {cfg['A_max']:g} PWM, Sampler {cfg['sampler']}\n\n開始しますか？"):
             return
         self.save_settings(cfg)

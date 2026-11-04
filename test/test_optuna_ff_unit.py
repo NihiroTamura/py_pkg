@@ -463,3 +463,87 @@ def test_eval_time_at_least_5s():
     assert c.eval_time(0.3) == 5.0 and c.n_eval(0.3) == 500
     assert c.eval_time(10.0 / 3.0) == pytest.approx(5.0) and c.n_eval(10.0 / 3.0) == 500
     assert c.eval_time(4.0) == 6.0 and c.n_eval(4.0) == 600
+
+
+def test_eval_time_fixed_value_from_gui():
+    """評価区間 = max(1.5T, 固定値)。固定値は GUI で変えられ、既定は従来どおり 5 秒"""
+    assert c.eval_time(1.0) == c.eval_time(1.0, c.EVAL_MIN_S) == 5.0
+    assert c.eval_time(1.0, 3.0) == 3.0 and c.n_eval(1.0, 3.0) == 300
+    assert c.eval_time(1.0, 8.0) == 8.0 and c.n_eval(1.0, 8.0) == 800
+    assert c.eval_time(4.0, 3.0) == 6.0 and c.n_eval(4.0, 3.0) == 600      # 1.5T の方が長ければ 1.5T
+    assert c.eval_time(1.0, 0.0) == 1.5 and c.n_eval(1.0, 0.0) == 150
+
+
+@pytest.mark.parametrize('E', [2.0, 5.0, 7.5])
+def test_extract_series_window_follows_eval_min(E):
+    """切り出す評価区間の配信数が max(1.5T, 固定値) に従う（T は動作完了時間）"""
+    initial = [300.0] * c.N_DOF
+    target = list(initial)
+    target[3] = 400.0
+    T, j0_true = 1.0, 150
+    t_send = j0_true * c.TICK_DT - 0.004
+    raw = _fake_raw(j0_true, 150 + c.n_eval(T, E) + 40, initial, target, [3], t_send=t_send)
+    series, _info = c.extract_series(raw, initial, target, [3], t_send, T, eval_min=E)
+    s = series[3]
+    assert s.N_e == c.n_eval(T, E) == int(round(max(1.5 * T, E) / c.TICK_DT))
+    assert len(s.pot[s.win()]) == s.N_e + 1 and s.missing() == 0
+
+
+def _rec(T, T_ff=None, eval_min=c.EVAL_MIN_S, ff=None, raw=None):
+    return c.TrialRecord(raw=raw or {}, initial=[300.0] * c.N_DOF, target=[310.0] * c.N_DOF,
+                         ff=np.zeros((c.N_FF, 5)) if ff is None else ff, T=T, L=c.TICK_DT, params={}, params_after={},
+                         t_target=0.0, started_at='2026-11-04 00:00:00', T_ff=T_ff, eval_min=eval_min)
+
+
+def test_npz_keeps_T_ff_and_eval_min(tmp_path):
+    """npz に動作完了時間 T・FF 入力時間 T_FF・評価時間の固定値を別々に残し、読み戻せる。分ける前の記録は T_FF = T、5 秒"""
+    assert _rec(0.6).T_ff == 0.6                                    # T_FF を与えなければ T と同じ
+    p = str(tmp_path / 'trial_000.npz')
+    c.save_trial_npz_ext(p, _rec(0.6, 0.9, 2.0), {})
+    r = c.load_trial_npz(p)
+    assert (r.T, r.T_ff, r.eval_min) == (0.6, 0.9, 2.0)
+    p_old = str(tmp_path / 'old.npz')
+    c.save_trial_npz(p_old, _rec(0.6, 0.9, 2.0))                   # 移植元と同じ形式（x_T_ff・x_eval_min がない）
+    r = c.load_trial_npz(p_old)
+    assert (r.T, r.T_ff, r.eval_min) == (0.6, 0.6, c.EVAL_MIN_S)
+    p_a = str(tmp_path / 'trial_001_a0.npz')
+    c.save_raw_attempt(p_a, {}, [300.0] * c.N_DOF, [310.0] * c.N_DOF, np.zeros((c.N_FF, 5)), 0.6, 0.5, '測り直し',
+                       T_ff=0.9, eval_min=2.0)
+    r = c.load_trial_npz(p_a)
+    assert (r.T, r.T_ff, r.eval_min) == (0.6, 0.9, 2.0)
+
+
+def test_timeseries_ff_uses_T_ff(tmp_path, ffmap):
+    """best_trial.csv の FF{d} 列は FF 入力時間 T_FF で切れる（動作完了時間 T では切れない）"""
+    import csv
+    T, T_ff = 0.6, 0.9
+    ff = np.zeros((c.N_FF, 5))
+    ff[c.FF_INDEX[3]] = ffmap.design(0.5, 0.5, 0.5, 100.0, T_ff)['coeffs']
+    n = 151
+    t = np.arange(n) * c.TICK_DT
+    raw = {'board1': {'pot': (t, np.zeros((n, 12))), 'pwm': (t, np.zeros((n, 6)))}}
+    path = str(tmp_path / 'best_trial.csv')
+    c.write_trial_timeseries(path, _rec(T, T_ff, ff=ff, raw=raw), {'board1': t})
+    with open(path, newline='', encoding='utf-8-sig') as f:
+        rows = list(csv.DictReader(f))
+    ffv = np.array([float(r['FF3']) for r in rows[:n]])
+    assert np.max(np.abs(ffv[(t > T + 0.02) & (t < T_ff - 0.02)])) > 1.0      # T を過ぎても T_FF までは FF がある
+    assert np.all(ffv[t >= T_ff] == 0.0)
+    assert np.allclose(ffv, c.ff_eval(ff[c.FF_INDEX[3]], T_ff, t), atol=1e-4 * np.max(np.abs(ffv)))
+
+
+def test_cond_hash_unchanged_when_T_ff_equals_T():
+    """T_FF = T・評価時間の固定値 5 秒なら条件 hash は分ける前と同じ（それまでの study を再開できる）。違えば hash も変わる"""
+    import optimize_optuna_ff_ROS2 as app
+    old = {'m': 0.02, 'sep': 0.02, 'A_max': 255.0, 'rho': 0.05, 'tabu_on': True, 'dofs': [3], 'T': 1.5, 'eps': 0.02,
+           'initial': [300.0] * c.N_DOF, 'target': [310.0] * c.N_DOF}
+    params = {3: c.AdrcParams(1000.0, 144.0, 50000.0, 700.0)}
+
+    def h(cfg):
+        return c.condition_hash(app.OptimizationRun.cond_dict(cfg, params, 'th'))
+    assert app.cfg_T_ff(old) == 1.5 and app.cfg_eval_min(old) == c.EVAL_MIN_S and app.cfg_eval_time(old) == 5.0
+    new = dict(old, T_ff=1.5, eval_min=5.0)
+    assert h(new) == h(old)
+    assert h(dict(new, T_ff=0.9)) != h(old)
+    assert h(dict(new, eval_min=3.0)) != h(old)
+    assert app.OptimizationRun.cond_dict(dict(new, eval_min=3.0), params, 'th')['eval_rule'] == 'max(1.5T, 3 s)'

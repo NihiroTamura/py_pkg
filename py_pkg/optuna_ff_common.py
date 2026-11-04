@@ -11,10 +11,15 @@ EL2 との出力の一致は test/test_optuna_ff_port.py で確かめる。
   追いつかなかった分だけ欠損として番号を飛ばす。assign_ticks）、
   目標値のエコーが新しい値になった配信を j0 として t_j = (j − j0)·0.010 [s] とする。
   配信値は直近に終わった制御周回の値（0〜11 ms 古い）。PWM・z1・z2・z3 は POT よりさらに1周回古い。
-■ FF（案4。全候補で「端点0・(0,T) の極値ちょうど2個・|FF| ≤ A_max」を保証する写像）
+■ 2つの時間（2026-11-04 に分けた。それまでは同じ値）
+  動作完了時間 T  … 目標軌道（T までに目標値の ±ε に入る）と、評価区間 max(1.5T, 評価時間の固定値) に使う。
+  FF 入力時間 T_FF … FF を与える時間。写像・係数・送信前の検証・送信する [a,b,c,d,e,T]・ファームの再現に使う。
+  FF の関数（quintic_from_extrema・ff_eval・extrema_of・presend_check・firmware_ff・FFMap.design・send_ff など）の
+  引数 T には T_FF を渡す（移植した関数なので引数名は T のまま）。
+■ FF（案4。全候補で「端点0・(0,T_FF) の極値ちょうど2個・|FF| ≤ A_max」を保証する写像）
   u = (u1, u2, u3, A) → 極値の位置 s1, s2（可行域の表）・高さの比 r = −y2/y1（閉形式の区間）・符号付き振幅 A
-  → 極値 (s1·T, y1), (s2·T, y2) → f(t) = a t⁵ + b t⁴ + c t³ + d t² + e t（f(0) = f(T) = 0）
-  ファーム（.ino:1207-1246）は t = (millis() − t_start)/1000 [s] で、t ≥ T では 0。
+  → 極値 (s1·T_FF, y1), (s2·T_FF, y2) → f(t) = a t⁵ + b t⁴ + c t³ + d t² + e t（f(0) = f(T_FF) = 0）
+  ファーム（.ino:1207-1246）は t = (millis() − t_start)/1000 [s] で、t ≥ T_FF では 0。
 ■ 目標軌道（study の前に1回だけ作って固定する。数列も全試行で同一）
   ζ=1 の3次遅れ (T1 s+1)(s+ωn)² の自由応答 y0·φ(t) を、「T までに |y| ≤ ε|ΔP| に入り以後も維持」
   （φ は単調なので φ(T) ≤ ε|ΔP|/|y0| と同値）の拘束付きで基準試行（FF=0）に当てはめる。
@@ -470,17 +475,18 @@ RETRY_CLASSES = ('comm', 'eval', 'stopped', 'orphan')      # 同じ u を1回だ
 NO_ROBOT_CLASSES = ('presend', 'tabu')                      # 実機を動かさない失敗
 
 
-EVAL_MIN_S = 5.0            # 評価区間の最短 [s]（2026-10-23 ユーザー指示: 1.5T が5秒に満たなければ5秒評価する）
+EVAL_MIN_S = 5.0            # 評価時間の固定値の既定 [s]（2026-10-23 ユーザー指示: 1.5T が5秒に満たなければ5秒評価する。
+                            # 2026-11-04 から GUI で変えられる。引数 t_min）
 
 
-def eval_time(T):
-    """測定・評価区間の長さ [s] = max(1.5T, 5 s)。1.5T が5秒未満なら5秒、5秒を超えるなら 1.5T"""
-    return max(EVAL_FACTOR * float(T), EVAL_MIN_S)
+def eval_time(T, t_min=EVAL_MIN_S):
+    """測定・評価区間の長さ [s] = max(1.5T, t_min)。T は動作完了時間、t_min は評価時間の固定値（既定 5 s）"""
+    return max(EVAL_FACTOR * float(T), float(t_min))
 
 
-def n_eval(T):
-    """評価区間の最終の配信番号 N_e = ⌊max(1.5T, 5 s)/0.010⌋（j − j0 = 0..N_e の N_e+1 点）"""
-    return int(np.floor(eval_time(T) / TICK_DT + 1e-9))
+def n_eval(T, t_min=EVAL_MIN_S):
+    """評価区間の最終の配信番号 N_e = ⌊max(1.5T, t_min)/0.010⌋（j − j0 = 0..N_e の N_e+1 点）"""
+    return int(np.floor(eval_time(T, t_min) / TICK_DT + 1e-9))
 
 
 # ==============================================================================
@@ -843,7 +849,7 @@ def presend_check(coeffs, T, A_max, tol_amp=0.5, tol_end=0.5):
     reasons = []
     ext = extrema_ok(c32.astype(float), T64)
     if ext is None:
-        reasons.append('(0,T) の極値がちょうど2個（単純根）ではない')
+        reasons.append('(0,T_FF) の極値がちょうど2個（単純根）ではない')
     t_ms = np.arange(0, int(math.ceil(1000.0 * T64)) + 1)
     v = firmware_ff(c32, T32, t_ms)
     max_abs = float(np.max(np.abs(v))) if np.all(np.isfinite(v)) else float('inf')
@@ -851,7 +857,7 @@ def presend_check(coeffs, T, A_max, tol_amp=0.5, tol_end=0.5):
         reasons.append(f'max|FF| = {max_abs:.2f} > A_max + {tol_amp:g}')
     end = float(_poly_f32(c32, T32))
     if not abs(end) <= tol_end:
-        reasons.append(f'|f(T)| = {abs(end):.3f} > {tol_end:g}')
+        reasons.append(f'|f(T_FF)| = {abs(end):.3f} > {tol_end:g}')
     tail = (t_ms >= 1000.0 * T64 - 10.0) & (t_ms < 1000.0 * T64)
     step = float(np.max(np.abs(v[tail]))) if tail.any() else 0.0
     return {'ok': not reasons, 'reasons': reasons, 'max_abs': max_abs, 'end_value': end, 'step_at_T': step,
@@ -1328,14 +1334,16 @@ class DofSeries:
         return int(np.sum(~np.isfinite(self.pot[self.win()])))
 
 
-def extract_series(raw, initial, target, dofs, t_send, T, history_s=HISTORY_S):
+def extract_series(raw, initial, target, dofs, t_send, T, history_s=HISTORY_S, eval_min=EVAL_MIN_S):
     """受信データ {board: {kind: (t, V)}} を、配信の時間軸で自由度ごとに切り出す（計画書 §5.1）。
+
+    評価区間は j − j0 = 0..N_e、N_e = ⌊max(1.5T, eval_min)/0.010⌋（T は動作完了時間、eval_min は評価時間の固定値）。
 
     j0 はその自由度の目標値のエコー（[6+i]）が round(新しい目標値) になった最初の配信。同じボードの自由度は同じ j0。
     目標値を送ってから 1 s 以内（PC の時計）にエコーが変わらなければ TrialIssue('comm')。
     戻り値 ({dof: DofSeries}, {board: 情報})
     """
-    N_e = n_eval(T)
+    N_e = n_eval(T, eval_min)
     H = int(round(history_s / TICK_DT))
     out, info = {}, {}
     by_board = {}
@@ -1625,7 +1633,7 @@ class TrialRecord:
     initial: list                   # 26個
     target: list                    # 26個
     ff: np.ndarray                  # (24, 5) 送ったFF
-    T: float
+    T: float                        # 動作完了時間 [s]（目標軌道・評価区間）
     L: float
     params: dict                    # {DOF: AdrcParams or None}（試行の直前に実機から読んだ値）
     params_after: dict
@@ -1633,6 +1641,12 @@ class TrialRecord:
     started_at: str
     aborted: bool = False
     note: str = ''
+    T_ff: float = None              # 変更: FF 入力時間 [s]（送った FF の T）。None なら T（分ける前の記録は同じ値）
+    eval_min: float = EVAL_MIN_S    # 変更: 評価時間の固定値 [s]（評価区間 = max(1.5T, eval_min)）
+
+    def __post_init__(self):
+        if self.T_ff is None:
+            self.T_ff = self.T
 
 
 class StopRequested(Exception):
@@ -1951,10 +1965,15 @@ def _monitor(link, dofs, initial, target, safety, starts):
                     raise UnsafeAbort(f"DOF {d}: |P − Pf| = {abs(P - float(target[d])):.0f} > 偏差の上限 {lim:.0f}")
 
 
-def measure_once(link, initial, target, dofs, ff_rows, T, wait_s, safety, stop_event, log, rest_ref=None):
-    """1回の測定（§7.1）。成功すれば Measurement。測り直すべき問題は TrialIssue('comm') を投げる（e.raw に生データ）"""
+def measure_once(link, initial, target, dofs, ff_rows, T, wait_s, safety, stop_event, log, rest_ref=None, T_ff=None,
+                 eval_min=EVAL_MIN_S):
+    """1回の測定（§7.1）。成功すれば Measurement。測り直すべき問題は TrialIssue('comm') を投げる（e.raw に生データ）
+
+    T は動作完了時間（測定・評価区間 max(1.5T, eval_min)）、T_ff は FF 入力時間（送る FF の T。None なら T）。
+    """
+    T_ff = float(T) if T_ff is None else float(T_ff)
     boards = sorted({DOF_BOARD[d][1] for d in dofs})
-    N_e = n_eval(T)
+    N_e = n_eval(T, eval_min)
     need = N_e + 1 + MARGIN_TICKS
     started = time.strftime('%Y-%m-%d %H:%M:%S')
     cur = link.board_targets()
@@ -1962,7 +1981,7 @@ def measure_once(link, initial, target, dofs, ff_rows, T, wait_s, safety, stop_e
         safe_return(link, initial, dofs, safety, log)
     if link.stalled(boards) and not link.wait_recovery(boards, stop_event, log):
         raise CommFail(f"受信が回復しません: {link.stalled(boards)}")
-    wait = max(float(wait_s), float(T) + 0.5)
+    wait = max(float(wait_s), T_ff + 0.5)      # 初期姿勢へ戻したときに動き出したファームの FF のタイマが T_FF を過ぎるまで待つ
     remain = wait - (time.monotonic() - link.last_return)
     if remain > 0:
         log(f"  初期姿勢で待機 {remain:.1f} 秒")
@@ -1984,7 +2003,7 @@ def measure_once(link, initial, target, dofs, ff_rows, T, wait_s, safety, stop_e
     raw = None
     t_send = time.monotonic()
     try:
-        tables = link.send_ff(ff_rows, T)
+        tables = link.send_ff(ff_rows, T_ff)
         time.sleep(0.15)
         link.start_capture(HISTORY_S)
         time.sleep(0.05)
@@ -1993,7 +2012,8 @@ def measure_once(link, initial, target, dofs, ff_rows, T, wait_s, safety, stop_e
         moved = [d for d in dofs if int(round(float(target[d]))) != int(round(float(initial[d])))]
         if not link.wait_echo(moved, target, timeout=0.5):
             raise TrialIssue('comm', "目標値のエコーが 0.5 秒以内に変わりません")
-        log(f"  目標値を送信しました。評価区間 {eval_time(T):.2f} 秒（max(1.5T, 5 秒)、{N_e + 1} 配信）測定します")
+        log(f"  目標値を送信しました。評価区間 {eval_time(T, eval_min):.2f} 秒（max(1.5T, {float(eval_min):g} 秒)、"
+            f"{N_e + 1} 配信）測定します")
         timeout = need * TICK_DT * 1.3 + 3.0
         starts = {}
         while True:
@@ -2025,9 +2045,9 @@ def measure_once(link, initial, target, dofs, ff_rows, T, wait_s, safety, stop_e
     safe_return(link, initial, dofs, safety, log)
     rec = TrialRecord(raw=raw, initial=list(initial), target=list(target), ff=np.asarray(ff_rows, dtype=float),
                       T=float(T), L=TICK_DT, params=params, params_after=link.adrc_params(), t_target=t_send,
-                      started_at=started)
+                      started_at=started, T_ff=T_ff, eval_min=float(eval_min))
     try:
-        series, info = extract_series(raw, initial, target, dofs, t_send, T)
+        series, info = extract_series(raw, initial, target, dofs, t_send, T, eval_min=eval_min)
     except TrialIssue as exc:
         exc.raw, exc.t_send, exc.rec = raw, t_send, rec
         exc.params, exc.params_after = rec.params, rec.params_after
@@ -2042,7 +2062,7 @@ def measure_once(link, initial, target, dofs, ff_rows, T, wait_s, safety, stop_e
 
 
 def measure_with_retries(link, initial, target, dofs, ff_rows, T, wait_s, safety, stop_event, log, rest_ref=None,
-                         on_attempt=None):
+                         on_attempt=None, T_ff=None, eval_min=EVAL_MIN_S):
     """measure_once を、測り直すべき問題（TrialIssue('comm')）のときだけ上限まで繰り返す（§7.3b）。
 
     on_attempt(a, raw, t_send, reason, params, params_after) は失敗した回の生データを保存するために呼ぶ
@@ -2051,7 +2071,8 @@ def measure_with_retries(link, initial, target, dofs, ff_rows, T, wait_s, safety
     attempts = []
     for a in range(safety.remeasure_max + 1):
         try:
-            m = measure_once(link, initial, target, dofs, ff_rows, T, wait_s, safety, stop_event, log, rest_ref)
+            m = measure_once(link, initial, target, dofs, ff_rows, T, wait_s, safety, stop_event, log, rest_ref,
+                             T_ff=T_ff, eval_min=eval_min)
             m.attempts = attempts
             return m
         except TrialIssue as exc:
@@ -2091,7 +2112,8 @@ def results_header():
 
 
 def write_results_csv(path, initial, target, T, ff_rows, append=False):
-    """最良の試行で与えたFFの極値（既存と同じ形式）。極値のない自由度は (0.33T, 0, 0.66T, 0)"""
+    """最良の試行で与えたFFの極値（既存と同じ形式）。極値のない自由度は (0.33T, 0, 0.66T, 0)。
+    T には FF 入力時間 T_FF を渡す（T_n 列は GUI_android_tk がファームへ送る FF の T）"""
     row = []
     for n, d in enumerate(FF_DOF_MAP):
         t1, y1, t2, y2 = extrema_of(ff_rows[n], T)
@@ -2175,9 +2197,12 @@ def load_trial_npz(path, L=None):
                 kinds[kind] = (d[f'{board}_{kind}_t'], d[f'{board}_{kind}_v'])
         raw[board] = kinds
     params = {dof: (AdrcParams(*d[f'param_{dof}']) if f'param_{dof}' in d else None) for dof in range(N_DOF)}
+    # 変更: FF 入力時間・評価時間の固定値（save_trial_npz_ext が x_ で保存する。ない記録は T・5 s。分ける前と同じ）
     return TrialRecord(raw=raw, initial=list(d['initial']), target=list(d['target']), ff=d['ff'], T=float(d['T']),
                        L=float(d['L'] if L is None else L), params=params, params_after=params,
-                       t_target=float(d['t_target']), started_at=str(d['started_at']), aborted=bool(d['aborted']))
+                       t_target=float(d['t_target']), started_at=str(d['started_at']), aborted=bool(d['aborted']),
+                       T_ff=float(d['x_T_ff']) if 'x_T_ff' in d else None,
+                       eval_min=float(d['x_eval_min']) if 'x_eval_min' in d else EVAL_MIN_S)
 
 
 # 移植元: optimize_EL2_common.py:2161-2170 @f8fba60
@@ -2204,6 +2229,7 @@ def write_trial_timeseries(path, rec, ff_time_by_board):
     時刻は目標値を送った瞬間からの秒数（PCの時計。WSL2 では数%遅れることがある）。
     変更: FF{d} は周回番号ではなく配信の時刻で計算する。ff_time_by_board[board] は各 PWM メッセージの FF の時刻 [s]
     （配信番号 j に対して (j − j0)·0.010 − 0.010。PWM は POT より1周回古いので 10 ms 前の FF を引く近似）。
+    変更: FF の区間は rec.T_ff（FF 入力時間）。
     """
     fi = lambda v: '' if not np.isfinite(v) else str(int(round(v)))
     ff = lambda v: '' if not np.isfinite(v) else '%.7g' % v
@@ -2222,7 +2248,7 @@ def write_trial_timeseries(path, rec, ff_time_by_board):
         if tff is not None and len(t):
             for j, d in enumerate(dofs):
                 if d in FF_INDEX:
-                    FFv[:, j] = ff_eval(rec.ff[FF_INDEX[d]], rec.T, np.asarray(tff, dtype=float))
+                    FFv[:, j] = ff_eval(rec.ff[FF_INDEX[d]], rec.T_ff, np.asarray(tff, dtype=float))   # 変更: FF 入力時間
         header = _record_header(k, 'pwm', offset, count) + [f"FF{d}" for d in dofs] + [f"ADRC{d}" for d in dofs]
         blocks.append((header, [[f"{t[i] - t0:.6f}"] + [ff(x) for x in V[i]] + [ff(x) for x in FFv[i]]
                                 + [ff(x) for x in V[i] - FFv[i]] for i in range(len(t))]))
@@ -2265,9 +2291,11 @@ def save_trial_npz_ext(path, rec, extra):
 
     ADRC パラメータは試行開始時を param_{DOF}（移植元と同じ名前）、試行の終わり（初期姿勢へ戻した後）を x_param_after_{DOF}
     に [kp, kd, ic, λ] で保存する。2つを比べれば、試行中に他のプログラムがパラメータを変えたかがわかる。
+    T は動作完了時間、x_T_ff は FF 入力時間（送った FF の T）、x_eval_min は評価時間の固定値。
     """
     data = {'initial': np.array(rec.initial, dtype=float), 'target': np.array(rec.target, dtype=float), 'ff': rec.ff,
-            'T': rec.T, 'L': rec.L, 'started_at': rec.started_at, 'aborted': rec.aborted, 't_target': rec.t_target}
+            'T': rec.T, 'L': rec.L, 'started_at': rec.started_at, 'aborted': rec.aborted, 't_target': rec.t_target,
+            'x_T_ff': float(rec.T_ff), 'x_eval_min': float(rec.eval_min)}
     for d, p in (rec.params or {}).items():
         if p is not None:
             data[f'param_{d}'] = np.array(p.as_list())
@@ -2286,8 +2314,9 @@ def save_trial_npz_ext(path, rec, extra):
     os.replace(tmp, path)
 
 
-def save_raw_attempt(path, raw, initial, target, ff_rows, T, t_send, note, params=None, params_after=None):
-    """測り直した回・中断した回の生データ（TrialRecord がない場合）。
+def save_raw_attempt(path, raw, initial, target, ff_rows, T, t_send, note, params=None, params_after=None, T_ff=None,
+                     eval_min=EVAL_MIN_S):
+    """測り直した回・中断した回の生データ（TrialRecord がない場合）。T は動作完了時間、T_ff は FF 入力時間（None なら T）。
 
     完了した試行の npz と同じく、送った FF（float32 に丸めた値）を x_ff_sent_rows に、試行開始時・終了時の ADRC パラメータを
     param_{DOF}・x_param_after_{DOF} に入れる（ADRC パラメータを読む前に失敗した回は入らない）。
@@ -2296,7 +2325,7 @@ def save_raw_attempt(path, raw, initial, target, ff_rows, T, t_send, note, param
     rec = TrialRecord(raw=raw or {}, initial=list(initial), target=list(target), ff=ff,
                       T=float(T), L=TICK_DT, params=params or {}, params_after=params_after or {},
                       t_target=float(t_send or 0.0), started_at=time.strftime('%Y-%m-%d %H:%M:%S'), aborted=True,
-                      note=note)
+                      note=note, T_ff=None if T_ff is None else float(T_ff), eval_min=float(eval_min))
     save_trial_npz_ext(path, rec, {'note': note, 'ff_sent_rows': ff.astype(np.float32).astype(float)})
 
 
@@ -2359,7 +2388,8 @@ def trial_columns(dofs):
 
 
 def write_grid_csv(path, series, targets, ff_rows, T):
-    """配信の時間軸の解析用データ（j − j0、t と、自由度ごとの POT・Target・PWM・FF・ADRC・z1・z2・z3・derivatives・有効）"""
+    """配信の時間軸の解析用データ（j − j0、t と、自由度ごとの POT・Target・PWM・FF・ADRC・z1・z2・z3・derivatives・有効）。
+    T には FF 入力時間 T_FF を渡す（FF は 0 ≤ t < T_FF）"""
     dofs = sorted(series)
     if not dofs:
         return
