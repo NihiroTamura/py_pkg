@@ -24,7 +24,10 @@ Optuna で5次関数FF（a t⁵ + b t⁴ + c t³ + d t² + e t, 0 ≤ t < T_FF�
     *_best_trial_grid.csv   … best を配信の時間軸にそろえた解析用データ
     study.journal           … Optuna の履歴（再開に使う）      target.json … 目標軌道      config.json … 設定
     ffmap_table.npz         … FF の可行域の表        trials/      … 全測定の生データ（npz）と例外の traceback
-    DOF/DOF<d>/             … グラフの画像            run.log      … ログ      status.json … 状態
+    DOF/DOF<d>/             … グラフの画像（文字は英語。時刻の軸は 0 秒〜評価時間。g2 にはその自由度の FF=0 の基準試行も描く）
+    run.log … ログ      status.json … 状態
+<分析>  <保存先>/analysis_YYYYMMDD_HHMM/J_progress.png … J の推移（終了時に作る。文字は英語）
+                                       J_progress_ja.png … 同じ図の日本語版
 """
 import base64
 import json
@@ -557,17 +560,32 @@ def setup_mpl_japanese():
 
 
 TXT = {
-    'ja': {'t': '時刻 t [s]（目標値のエコーが変わった配信 = 0）', 'pot': 'POT [count]', 'pwm': '入力 [PWM]',
-           'trial': '試行番号', 'J': '累積誤差 J（対数）', 'ext_t': '極値の時刻 [s]', 'ext_y': '極値の値 [PWM]',
+    # GUI のグラフタブの文字（2026-11-06 ユーザー指示: 日本語でよいが、描き方は保存する画像と同じにする）
+    'ja': {'t': '時間 [s]', 'pot': 'POT [-]', 'pwm': 'PWM [-]',
+           'trial': '試行番号', 'J': '累積誤差 J（対数）', 'ext_t': '極値の時刻 [s]', 'ext_y': '極値の値 (PWM) [-]',
            'meas': '実測 POT', 'tgt': '目標軌道（固定）', 'ref': '基準試行（FF=0）', 'best': 'best',
-           'adrc': 'ADRC = PWM − FF', 'ff': 'FF（送った値、ファームの計算）', 'thr': '閾値', 'fail': '失敗',
-           'g1': 'POT と目標軌道', 'g2': '累積誤差の推移', 'g3': 'FF の極値の推移', 'g4': 'PWM と ADRC', 'g5': 'FF と極値'},
-    'en': {'t': 't [s] (echo change = 0)', 'pot': 'POT [count]', 'pwm': 'input [PWM]', 'trial': 'trial',
-           'J': 'J (log)', 'ext_t': 'extremum time [s]', 'ext_y': 'extremum value [PWM]', 'meas': 'measured POT',
-           'tgt': 'target (fixed)', 'ref': 'reference (FF=0)', 'best': 'best', 'adrc': 'ADRC = PWM - FF',
-           'ff': 'FF (sent, firmware calc.)', 'thr': 'threshold', 'fail': 'FAIL',
-           'g1': 'POT and target', 'g2': 'cost history', 'g3': 'FF extrema', 'g4': 'PWM and ADRC', 'g5': 'FF'},
+           'best_J': 'best [ J=mean(J_i) ]',
+           'adrc': 'ADRC = PWM − FF', 'ff': 'FF', 'thr': '閾値', 'fail': '失敗',
+           'g1': 'POT と目標軌道', 'g2': '累積誤差の推移', 'g3': 'FF の極値の推移', 'g4': 'PWM と ADRC', 'g5': 'FF と極値',
+           'ff_y': 'PWM [-]', 'ref_Ji': '基準試行（FF=0）の J_{}',
+           'p_each': '各試行の J', 'p_best': 'それまでの最小', 'p_past': '過去の試行（add_trial）',
+           'p_tpe': 'Sampler が学習を使い始めた試行（{}）', 'p_ref': '基準試行（FF=0）の J = {:.3f}',
+           'p_thr': '閾値 J = {:.4f}（RMS {:g}%）', 'p_fail': '失敗', 'p_x': '試行番号', 'p_y': 'J（対数）',
+           'p_title': 'J の推移（COMPLETE {}、n_startup = {}、T = {:g} s、T_FF = {:g} s）'},
+    # 保存する画像はこの英語の文字で描く（2026-11-04・11-06 ユーザー指示。軸ラベル・凡例は指定どおり）
+    'en': {'t': 'Time [s]', 'pot': 'POT [-]', 'pwm': 'PWM [-]', 'trial': 'trial',
+           'J': 'J (log)', 'ext_t': 'extremum time [s]', 'ext_y': 'extrema value (PWM) [-]', 'meas': 'measured POT',
+           'tgt': 'target (fixed)', 'ref': 'reference (FF=0)', 'best': 'best',
+           'best_J': 'best [ J=mean(J_i) ]', 'adrc': 'ADRC = PWM - FF',
+           'ff': 'FF', 'thr': 'threshold', 'fail': 'FAIL',
+           'g1': 'POT and target', 'g2': 'cost history', 'g3': 'FF extrema', 'g4': 'PWM and ADRC', 'g5': 'FF',
+           'ff_y': 'PWM [-]', 'ref_Ji': 'reference J_{} (FF=0)',
+           'p_each': 'J of each trial', 'p_best': 'best so far', 'p_past': 'past trial (add_trial)',
+           'p_tpe': 'sampler starts using the model (trial {})', 'p_ref': 'reference (FF=0) J = {:.3f}',
+           'p_thr': 'threshold J = {:.4f} (RMS {:g}%)', 'p_fail': 'FAIL', 'p_x': 'trial', 'p_y': 'J (log)',
+           'p_title': 'J history (COMPLETE {}, n_startup = {}, T = {:g} s, T_FF = {:g} s)'},
 }
+SAVE_LANG = 'en'        # 保存する画像（DOF/DOF<d>/*.png）の文字。GUI のグラフタブは日本語のまま
 FAIL_COLORS = {'presend': '#999999', 'tabu': '#bbbb00', 'unsafe': '#d62728', 'comm': '#9467bd', 'sensor': '#8c564b',
                'eval': '#e377c2', 'stopped': '#7f7f7f', 'orphan': '#17becf', 'error': '#000000'}
 
@@ -578,19 +596,38 @@ def _title(ax, L, key, d, n=None):
     ax.set_title(s, fontsize=9)
 
 
-def plot_g1(ax, L, d, p, n):
+def _t_eval(p):
+    return float(p.get('t_eval', 1.5 * p['T']))
+
+
+def _in_eval(p, t, *ys):
+    """保存する画像用：0 ≤ t ≤ 評価時間 の点だけを返す（y 軸の範囲も評価区間の値で決まるように）"""
+    t = np.asarray(t, dtype=float)
+    m = (t >= 0.0) & (t <= _t_eval(p) + 1e-9)
+    return [t[m]] + [None if y is None else np.asarray(y)[m] for y in ys]
+
+
+def plot_g1(ax, L, d, p, n, final=False):
+    """POT と目標軌道。final=True（保存する画像）なら横軸を 0 秒〜評価時間にする"""
     ax.clear()
     if p is None:
         _title(ax, L, 'g1', d, n)
         return
-    ax.plot(p['t'], p['pot'], color='#1f77b4', lw=1.2, label=TXT[L]['meas'])
-    ax.plot(p['t_win'], p['target'], color='#d62728', lw=1.2, ls='--', label=TXT[L]['tgt'])
-    if p.get('ref') is not None:
-        ax.plot(p['t'], p['ref'], color='#7f7f7f', lw=0.8, ls=':', label=TXT[L]['ref'])
-    if p.get('best') is not None:
-        ax.plot(p['t'], p['best'], color='#2ca02c', lw=0.8, alpha=0.8, label=TXT[L]['best'])
+    t, pot, ref, best = p['t'], p['pot'], p.get('ref'), p.get('best')
+    tw, tgt = p['t_win'], p['target']
+    if final:
+        t, pot, ref, best = _in_eval(p, t, pot, ref, best)
+        tw, tgt = _in_eval(p, tw, tgt)
+    ax.plot(t, pot, color='#1f77b4', lw=1.2, label=TXT[L]['meas'])
+    ax.plot(tw, tgt, color='#d62728', lw=1.2, ls='--', label=TXT[L]['tgt'])
+    if ref is not None:
+        ax.plot(t, ref, color='k', lw=0.9, ls='-.', label=TXT[L]['ref'])           # 基準試行は黒の一点鎖線（11-06 指示）
+    if best is not None:
+        ax.plot(t, best, color='#2ca02c', lw=0.8, alpha=0.8, label=TXT[L]['best'])
     ax.axvline(0.0, color='#aaa', lw=0.6)
     ax.axvline(p['T'], color='#aaa', lw=0.6, ls='--')
+    if final:
+        ax.set_xlim(0.0, _t_eval(p))
     ax.set_xlabel(TXT[L]['t'], fontsize=8)
     ax.set_ylabel(TXT[L]['pot'], fontsize=8)
     ax.legend(fontsize=7, loc='best')
@@ -598,20 +635,34 @@ def plot_g1(ax, L, d, p, n):
     _title(ax, L, 'g1', d, n)
 
 
-def plot_g2(ax, L, d, hist, J_thr):
+LEGEND_BELOW_PAD = 5.4  # 軸の下端から凡例の上端までの間隔（凡例の文字の高さ 7 pt の倍数。目盛りの数字と軸ラベルの下に来るように）
+
+
+def _legend_below(ax, handles=None, labels=None, ncol=3):
+    """凡例を x 軸（軸ラベル）の下に置く（2026-11-06 ユーザー指示。cost・FF の極値の推移のグラフ）"""
+    kw = dict(loc='upper center', bbox_to_anchor=(0.5, 0.0), bbox_transform=ax.transAxes, borderaxespad=LEGEND_BELOW_PAD,
+              fontsize=7, ncol=ncol)
+    return ax.legend(handles, labels, **kw) if handles is not None else ax.legend(**kw)
+
+
+def plot_g2(ax, L, d, hist, J_thr=None, ref=None):
+    """累積誤差の推移：その自由度の J_i・best（それまでの J の最小）・FF=0 の基準試行の J_i（2026-11-06 ユーザー指示。
+    J と閾値は描かない）。ref = {'J_i': [基準試行のこの自由度の J_i, ...]}。J_thr は使わない（呼び出し側との互換のため残す）"""
     ax.clear()
     done = [h for h in hist if h['state'] == 'COMPLETE' and h.get('J') is not None]
     if done:
         ns = [h['n'] for h in done]
-        ax.semilogy(ns, [h['J'] for h in done], 'o-', color='#1f77b4', ms=3, lw=1, label='J')
         ji = [h['J_i'].get(str(d), h['J_i'].get(d)) if h.get('J_i') else None for h in done]
         if any(v is not None for v in ji):
             ax.semilogy(ns, [v if v is not None else np.nan for v in ji], 's', color='#ff7f0e', ms=2,
                         label=f'J_{d}')
         best = np.minimum.accumulate([h['J'] for h in done])
-        ax.semilogy(ns, best, color='#2ca02c', lw=1, label=TXT[L]['best'])
-    if J_thr and J_thr > 0:
-        ax.axhline(J_thr, color='#d62728', ls='--', lw=0.8, label=TXT[L]['thr'])
+        ax.semilogy(ns, best, color='#2ca02c', lw=1, label=TXT[L]['best_J'])
+    ref = ref or {}
+    rji = [v for v in (ref.get('J_i') or []) if v is not None and np.isfinite(v)]
+    if rji:
+        ax.axhline(float(np.mean(rji)), color='k', ls='-.', lw=0.9,
+                   label=f"{TXT[L]['ref_Ji'].format(d)} = {np.mean(rji):.3g}")
     import matplotlib.transforms as mtrans
     tr = mtrans.blended_transform_factory(ax.transData, ax.transAxes)
     for h in hist:
@@ -620,8 +671,8 @@ def plot_g2(ax, L, d, hist, J_thr):
                     transform=tr, clip_on=False)
     ax.set_xlabel(TXT[L]['trial'], fontsize=8)
     ax.set_ylabel(TXT[L]['J'], fontsize=8)
-    if done or J_thr:
-        ax.legend(fontsize=7, loc='upper right')
+    if done or rji:
+        _legend_below(ax)
     ax.grid(alpha=0.3, which='both')
     _title(ax, L, 'g2', d)
 
@@ -640,7 +691,7 @@ def plot_g3(ax, ax2, L, d, hist):
         ax2.plot(ns, e[:, 3], 's--', color='#ff7f0e', ms=3, lw=0.8, label='y2')
         h1, l1 = ax.get_legend_handles_labels()
         h2, l2 = ax2.get_legend_handles_labels()
-        ax.legend(h1 + h2, l1 + l2, fontsize=7, loc='best')
+        _legend_below(ax, h1 + h2, l1 + l2, ncol=4)
     ax.set_xlabel(TXT[L]['trial'], fontsize=8)
     ax.set_ylabel(TXT[L]['ext_t'], fontsize=8)
     ax2.set_ylabel(TXT[L]['ext_y'], fontsize=8)
@@ -648,13 +699,19 @@ def plot_g3(ax, ax2, L, d, hist):
     _title(ax, L, 'g3', d)
 
 
-def plot_g4(ax, L, d, p, n):
+def plot_g4(ax, L, d, p, n, final=False):
+    """PWM と ADRC。final=True（保存する画像）なら横軸を 0 秒〜評価時間にする"""
     ax.clear()
     if p is not None:
-        ax.plot(p['t'], p['pwm'], color='#1f77b4', lw=1.0, label='PWM')
-        ax.plot(p['t'], p['adrc'], color='#2ca02c', lw=1.0, label=TXT[L]['adrc'])
+        t, pwm, adrc = p['t'], p['pwm'], p['adrc']
+        if final:
+            t, pwm, adrc = _in_eval(p, t, pwm, adrc)
+        ax.plot(t, pwm, color='#1f77b4', lw=1.0, label='PWM')
+        ax.plot(t, adrc, color='#2ca02c', lw=1.0, label=TXT[L]['adrc'])
         ax.axvline(0.0, color='#aaa', lw=0.6)
         ax.axvline(p.get('T_ff', p['T']), color='#aaa', lw=0.6, ls='--')          # FF が終わる時刻 T_FF
+        if final:
+            ax.set_xlim(0.0, _t_eval(p))
         ax.legend(fontsize=7, loc='best')
     ax.set_xlabel(TXT[L]['t'], fontsize=8)
     ax.set_ylabel(TXT[L]['pwm'], fontsize=8)
@@ -662,29 +719,123 @@ def plot_g4(ax, L, d, p, n):
     _title(ax, L, 'g4', d, n)
 
 
-def plot_g5(ax, L, d, p, n):
+def plot_g5(ax, L, d, p, n, final=False):
+    """送った FF と極値。final=True（保存する画像）なら横軸を 0 秒〜評価時間にする"""
     ax.clear()
     if p is not None:
-        ax.plot(p['ff_t'], p['ff'], color='#9467bd', lw=1.2, label=TXT[L]['ff'])
+        ft, fv = p['ff_t'], p['ff']
+        if final:
+            ft, fv = _in_eval(p, ft, fv)
+        ax.plot(ft, fv, color='#9467bd', lw=1.2, label=TXT[L]['ff'])
         t1, y1, t2, y2 = p['ext']
         ax.plot([t1, t2], [y1, y2], 'o', color='#d62728', ms=5)
-        for tt, yy, nm in ((t1, y1, '1'), (t2, y2, '2')):
-            ax.annotate(f"({tt:.3f} s, {yy:+.1f})", (tt, yy), fontsize=7, textcoords='offset points', xytext=(4, 4))
         ax.axhline(0.0, color='#aaa', lw=0.6)
         T_ff = p.get('T_ff', p['T'])
         ax.axvline(T_ff, color='#aaa', lw=0.6, ls='--')                           # FF が終わる時刻 T_FF
-        ax.set_xlim(-0.02 * T_ff, p.get('t_eval', 1.5 * p['T']))
-        ax.legend(fontsize=7, loc='best')
+        ax.set_xlim(0.0 if final else -0.02 * T_ff, _t_eval(p))
+        texts = _annotate_extrema(ax, (t1, y1, t2, y2), np.asarray(fv, dtype=float))
+        _legend_free(ax, np.column_stack([np.asarray(ft, dtype=float), np.asarray(fv, dtype=float)]), texts)
     ax.set_xlabel(TXT[L]['t'], fontsize=8)
-    ax.set_ylabel('FF [PWM]', fontsize=8)
+    ax.set_ylabel(TXT[L]['ff_y'], fontsize=8)
     ax.grid(alpha=0.3)
     _title(ax, L, 'g5', d, n)
 
 
-def save_png(path, draw, twin=False):
+ANNOT_FONTSIZE = 8      # 極値の値の文字の大きさ（軸ラベルと同じ。2026-11-06 ユーザー指示）
+
+
+def _annotate_extrema(ax, ext, fv, fontsize=ANNOT_FONTSIZE, gap_pt=6.0):
+    """FF の極値の値を、その極値の近くで FF の線に重ならない所に書く。
+    FF は (0, T_FF) に極値をちょうど2つ持ち、端では 0（写像で保証）なので、大きい方の極値は線全体の最大、小さい方は最小になる。
+    そこで最大の点の上・最小の点の下に書けば線とは重ならない。文字が軸の外に出ないよう、縦軸に文字の高さ分の余白を取る"""
+    t1, y1, t2, y2 = ext
+    if not (np.isfinite(y1) and np.isfinite(y2)) or (y1 == 0.0 and y2 == 0.0):
+        return []
+    vals = np.concatenate([np.asarray(fv, dtype=float)[np.isfinite(fv)], [0.0, y1, y2]])
+    lo, hi = float(vals.min()), float(vals.max())
+    span = max(hi - lo, 1e-9)
+    h_px = max(ax.get_window_extent().height, 50.0)
+    need = (fontsize * 1.4 + gap_pt) * ax.figure.dpi / 72.0 * 1.3          # 文字1行と間隔の高さ（tight_layout で縮む分の余裕）
+    f = min(need / h_px, 0.35)
+    pad = span * f / max(1.0 - 2.0 * f, 0.3)
+    ax.set_ylim(lo - pad, hi + pad)
+    x0, x1 = ax.get_xlim()
+    texts = []
+    for tt, yy in ((t1, y1), (t2, y2)):
+        top = yy >= max(y1, y2)                                              # 大きい方の極値は上に、小さい方は下に書く
+        frac = (tt - x0) / (x1 - x0) if x1 > x0 else 0.5
+        ha = 'left' if frac < 0.15 else ('right' if frac > 0.85 else 'center')
+        texts.append(ax.annotate(f"({tt:.3f} s, {yy:+.1f})", (tt, yy), fontsize=fontsize, textcoords='offset points',
+                                 xytext=(0, gap_pt if top else -gap_pt), ha=ha, va='bottom' if top else 'top'))
+    return texts
+
+
+def _legend_free(ax, line_xy, texts, fontsize=7):
+    """凡例を、線（line_xy の点）と文字（texts）に重ならない場所に置く。matplotlib 3.5 の loc='best' は文字を避けないため"""
+    try:
+        rend = ax.figure.canvas.get_renderer()
+    except Exception:
+        return ax.legend(fontsize=fontsize, loc='best')
+    pts = ax.transData.transform(line_xy) if len(line_xy) else np.zeros((0, 2))
+    boxes = [t.get_window_extent(rend) for t in texts]
+    for loc in ('upper right', 'lower right', 'upper left', 'lower left', 'center right', 'center left', 'upper center',
+                'lower center'):
+        leg = ax.legend(fontsize=fontsize, loc=loc)
+        bb = leg.get_window_extent(rend).expanded(1.1, 1.2)
+        on_line = np.any((pts[:, 0] >= bb.x0) & (pts[:, 0] <= bb.x1) & (pts[:, 1] >= bb.y0) & (pts[:, 1] <= bb.y1))
+        if not on_line and not any(bb.overlaps(b) for b in boxes):
+            return leg
+    return ax.legend(fontsize=fontsize, loc='best')
+
+
+def plot_progress(ax, hist, info, L=SAVE_LANG):
+    """J の推移（分析フォルダの J_progress.png は英語、GUI の J過程タブは日本語）。info: J_ref・J_thr・rms_thr・n_startup・T・T_ff。
+    過去の試行（add_trial）は別の印で描き、best（それまでの最小）には入れない（study の best と同じ）"""
+    X = TXT[L]
+    import matplotlib.transforms as mtrans
+    done = sorted((h for h in hist if h['state'] == 'COMPLETE' and h.get('J') is not None), key=lambda h: h['n'])
+    own = [h for h in done if h.get('source') != 'past']
+    past = [h for h in done if h.get('source') == 'past']
+    if own:
+        ns, J = [h['n'] for h in own], [h['J'] for h in own]
+        ax.semilogy(ns, J, 'o', ms=3, label=X['p_each'])
+        ax.semilogy(ns, np.minimum.accumulate(J), '-', label=X['p_best'])
+    if past:
+        ax.semilogy([h['n'] for h in past], [h['J'] for h in past], 's', color='#7f7f7f', ms=3, label=X['p_past'])
+    k = info.get('n_startup')
+    if k is not None and len(done) > int(k):
+        n_tpe = done[int(k)]['n']
+        ax.axvline(n_tpe, color='g', ls='-.', label=X['p_tpe'].format(n_tpe))
+    rj = [v for v in (info.get('J_ref') or []) if v is not None and np.isfinite(v)]
+    if rj:
+        ax.axhline(float(np.mean(rj)), color='k', ls='--', label=X['p_ref'].format(np.mean(rj)))
+    if info.get('J_thr'):
+        ax.axhline(info['J_thr'], color='r', ls=':', label=X['p_thr'].format(info['J_thr'], info.get('rms_thr') or 0))
+    fails = [h for h in hist if h['state'] == 'FAIL']
+    if fails:
+        tr = mtrans.blended_transform_factory(ax.transData, ax.transAxes)
+        for i, h in enumerate(fails):
+            ax.plot([h['n']], [0.03], marker='x', color=FAIL_COLORS.get(h.get('fail_class'), '#000'), ms=5, ls='none',
+                    transform=tr, clip_on=False, label=X['p_fail'] if i == 0 else None)
+    ax.set_xlabel(X['p_x'])
+    ax.set_ylabel(X['p_y'])
+    ax.set_title(X['p_title'].format(len(done), k, info.get('T', 0), info.get('T_ff', 0)))
+    if ax.get_legend_handles_labels()[0]:
+        ax.legend(fontsize=8)
+    ax.grid(True, which='both', alpha=0.3)
+
+
+def analysis_folder(folder):
+    """結果フォルダ <保存先>/optimize_YYYYMMDD_HHMM に対する分析フォルダ <保存先>/analysis_YYYYMMDD_HHMM"""
+    name = os.path.basename(os.path.normpath(folder))
+    tail = name.split('_', 1)[1] if '_' in name else name
+    return os.path.join(os.path.dirname(os.path.normpath(folder)), f'analysis_{tail}')
+
+
+def save_png(path, draw, twin=False, size=(7.0, 4.2)):
     from matplotlib.figure import Figure
     from matplotlib.backends.backend_agg import FigureCanvasAgg
-    fig = Figure(figsize=(7.0, 4.2), dpi=110)
+    fig = Figure(figsize=size, dpi=110)
     FigureCanvasAgg(fig)
     ax = fig.add_subplot(111)
     if twin:
@@ -692,8 +843,21 @@ def save_png(path, draw, twin=False):
     else:
         draw(ax)
     fig.tight_layout()
+    _fit_legends(fig)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     fig.savefig(path)
+
+
+def _fit_legends(fig, margin=0.01):
+    """軸の下に置いた凡例が画像からはみ出さないように、下の余白を広げる（tight_layout が軸の外の凡例を数えない場合のため）"""
+    rend = fig.canvas.get_renderer()
+    low = 1.0
+    for a in fig.axes:
+        leg = a.get_legend()
+        if leg is not None:
+            low = min(low, leg.get_window_extent(rend).transformed(fig.transFigure.inverted()).y0)
+    if low < margin:
+        fig.subplots_adjust(bottom=min(fig.subplotpars.bottom + (margin - low), 0.6))
 
 
 # ==============================================================================
@@ -711,64 +875,110 @@ def _render_init():
     _RENDER_LANG = setup_mpl_japanese()
 
 
-def render_preview(payload, hist, dofs, J_thr, width_px):
-    """GUI のグラフタブ用の画像（PNG のバイト列）。1 DOF 分の5つを横1段、複数の DOF は縦に積む"""
+PREVIEW_ROW_IN = 3.8        # GUI のグラフタブの1自由度分の高さ [inch]
+PREVIEW_GAP_IN = 1.35       # 段の間（軸の下の凡例と次の段の題名が入る高さ）[inch]
+
+
+def render_preview(payload, hist, dofs, J_thr, width_px, refs=None):
+    """GUI のグラフタブ用の画像（PNG のバイト列）。1 DOF 分の5つを横1段、複数の DOF は縦に積む。
+    描き方は保存する画像と同じ（横軸は 0 秒〜評価時間、cost は J_i・best・基準の J_i、凡例の位置など）で、文字は日本語
+    （2026-11-06 ユーザー指示）。refs = {DOF: {'J_i': [...]}}（なければ payload の ref_Ji を使う）"""
     import io
     from matplotlib.figure import Figure
     from matplotlib.backends.backend_agg import FigureCanvasAgg
     L = _RENDER_LANG
     n = max(1, len(dofs))
     dpi = 80
-    fig = Figure(figsize=(max(width_px, 600) / dpi, 3.0 * n), dpi=dpi)
+    H = PREVIEW_ROW_IN * n
+    fig = Figure(figsize=(max(width_px, 600) / dpi, H), dpi=dpi)
     FigureCanvasAgg(fig)
+    top_in, bottom_in = 0.35, 1.0
+    h_ax = (H - top_in - bottom_in - (n - 1) * PREVIEW_GAP_IN) / n
+    fig.subplots_adjust(left=0.04, right=0.97, bottom=bottom_in / H, top=1.0 - top_in / H, wspace=0.45,
+                        hspace=PREVIEW_GAP_IN / h_ax)                      # 描く前に位置を決める（文字の余白の計算に使う）
     for i, d in enumerate(dofs):
         axs = [fig.add_subplot(n, 5, 5 * i + k + 1) for k in range(5)]
         pd = payload['dofs'].get(d) if payload else None
         nn = payload['n'] if payload else None
-        plot_g1(axs[0], L, d, pd, nn)
-        plot_g2(axs[1], L, d, hist, J_thr)
+        ref = (refs or {}).get(d) or ({'J_i': pd.get('ref_Ji')} if pd and pd.get('ref_Ji') else None)
+        plot_g1(axs[0], L, d, pd, nn, final=True)
+        plot_g2(axs[1], L, d, hist, J_thr, ref)
         plot_g3(axs[2], axs[2].twinx(), L, d, hist)
-        plot_g4(axs[3], L, d, pd, nn)
-        plot_g5(axs[4], L, d, pd, nn)
-    fig.subplots_adjust(left=0.04, right=0.97, bottom=0.12 / n + 0.02, top=1.0 - 0.08 / n, wspace=0.45, hspace=0.55)
+        plot_g4(axs[3], L, d, pd, nn, final=True)
+        plot_g5(axs[4], L, d, pd, nn, final=True)
+    buf = io.BytesIO()
+    fig.savefig(buf, format='png')
+    return buf.getvalue()
+
+
+def render_progress(hist, info, width_px):
+    """GUI の J過程タブ用の画像（PNG のバイト列。分析フォルダの J_progress.png と同じ図で、文字は日本語）"""
+    import io
+    from matplotlib.figure import Figure
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    dpi = 80
+    fig = Figure(figsize=(max(width_px, 600) / dpi, 5.6), dpi=dpi)
+    FigureCanvasAgg(fig)
+    ax = fig.add_subplot(111)
+    plot_progress(ax, hist, info or {}, _RENDER_LANG)
+    fig.tight_layout()
     buf = io.BytesIO()
     fig.savefig(buf, format='png')
     return buf.getvalue()
 
 
 def render_trial_pngs(folder, n, payload):
-    """試行ごとの画像（g1・g4・g5）を保存する"""
-    L = _RENDER_LANG
-    for d, p in payload['dofs'].items():
-        base = os.path.join(folder, 'DOF', f'DOF{d}')
-        save_png(os.path.join(base, f'D{d}_g1_pot_trial{n:03d}.png'), lambda ax: plot_g1(ax, L, d, p, n))
-        save_png(os.path.join(base, f'D{d}_g4_pwm_adrc_trial{n:03d}.png'), lambda ax: plot_g4(ax, L, d, p, n))
-        save_png(os.path.join(base, f'D{d}_g5_ff_trial{n:03d}.png'), lambda ax: plot_g5(ax, L, d, p, n))
+    """試行ごとの画像（g1・g4・g5）を保存する。文字は英語、横軸は 0 秒〜評価時間"""
+    save_trial_pngs(folder, n, payload)
     return n
 
 
-def render_end_pngs(folder, dofs, hist, J_thr):
-    """終了時の画像（g2・g3）を保存する"""
-    L = _RENDER_LANG
+def save_trial_pngs(folder, n, payload):
+    L = SAVE_LANG
+    for d, p in payload['dofs'].items():
+        base = os.path.join(folder, 'DOF', f'DOF{d}')
+        save_png(os.path.join(base, f'D{d}_g1_pot_trial{n:03d}.png'), lambda ax: plot_g1(ax, L, d, p, n, final=True))
+        save_png(os.path.join(base, f'D{d}_g4_pwm_adrc_trial{n:03d}.png'), lambda ax: plot_g4(ax, L, d, p, n, final=True))
+        save_png(os.path.join(base, f'D{d}_g5_ff_trial{n:03d}.png'), lambda ax: plot_g5(ax, L, d, p, n, final=True))
+
+
+def render_end_pngs(folder, dofs, hist, J_thr, refs=None, progress=None):
+    """終了時の画像を保存する（文字は英語）。
+    DOF/DOF<d>/ に g2（累積誤差の推移。refs = {DOF: {'J_i': [...]}} でその自由度の FF=0 の基準試行も描く）と g3、
+    progress（plot_progress の info）を与えれば分析フォルダ analysis_YYYYMMDD_HHMM/ に J_progress.png（英語）と
+    J_progress_ja.png（日本語）も"""
+    L = SAVE_LANG
+    refs = refs or {}
     for d in dofs:
         base = os.path.join(folder, 'DOF', f'DOF{d}')
-        save_png(os.path.join(base, f'D{d}_g2_cost.png'), lambda ax: plot_g2(ax, L, d, hist, J_thr))
+        save_png(os.path.join(base, f'D{d}_g2_cost.png'), lambda ax: plot_g2(ax, L, d, hist, J_thr, refs.get(d)))
         save_png(os.path.join(base, f'D{d}_g3_extrema.png'), lambda ax, ax2: plot_g3(ax, ax2, L, d, hist), twin=True)
+    if progress is not None and any(h['state'] == 'COMPLETE' and h.get('J') is not None for h in hist):
+        out = analysis_folder(folder)
+        save_png(os.path.join(out, 'J_progress.png'), lambda ax: plot_progress(ax, hist, progress, SAVE_LANG),
+                 size=(12.0, 4.8))
+        if setup_mpl_japanese() == 'ja':              # 日本語版（2026-11-06 ユーザー指示）。日本語のフォントがあるときだけ
+            save_png(os.path.join(out, 'J_progress_ja.png'), lambda ax: plot_progress(ax, hist, progress, 'ja'),
+                     size=(12.0, 4.8))
     return len(dofs)
 
 
 class Offload:
-    """描画用（render）と計算用（compute）のプロセス。spawn で作る（ROS のスレッドを fork しないため）"""
+    """描画用（render：保存する写真）・GUI 表示用（preview：グラフタブと J過程タブ）・計算用（compute）のプロセス。
+    spawn で作る（ROS のスレッドを fork しないため）。
+    GUI 表示用を分けたのは、写真の保存（1試行 69 枚で、試行の終わりから 16〜82 秒遅れていた。2026-11-05 の実機）の後ろで
+    グラフタブの描画が待たされ、タブを切り替えてもグラフが出ないことがあったため（2026-11-06）"""
 
     def __init__(self):
         import multiprocessing as mp
         from concurrent.futures import ProcessPoolExecutor
         ctx = mp.get_context('spawn')
         self.render = ProcessPoolExecutor(max_workers=1, mp_context=ctx, initializer=_render_init)
+        self.preview = ProcessPoolExecutor(max_workers=1, mp_context=ctx, initializer=_render_init)
         self.compute = ProcessPoolExecutor(max_workers=1, mp_context=ctx)
 
     def close(self):
-        for pool in (self.render, self.compute):
+        for pool in (self.render, self.preview, self.compute):
             try:
                 pool.shutdown(wait=False, cancel_futures=True)
             except Exception:
@@ -1048,6 +1258,7 @@ class OptimizationRun:
         log(f"study を作りました: 事前の候補 enqueue {len(seeds)} 個・過去の試行 add_trial {len(past)} 個, "
             f"n_startup = {n_startup}（= {n_prior} + max(10, 2×{D})）")
         c.write_kv_csv(self.path('conditions.csv'), self._conditions_rows())
+        self._emit_setup()
 
     def study_params_x0(self, seeds):
         if seeds:
@@ -1086,7 +1297,7 @@ class OptimizationRun:
             if t.state.name in ('COMPLETE', 'FAIL'):
                 self.hist.append({'n': t.number, 'state': t.state.name, 'J': t.user_attrs.get('J'),
                                   'J_i': t.user_attrs.get('J_i', {}), 'ext': t.user_attrs.get('ext_sent', {}),
-                                  'fail_class': t.user_attrs.get('fail_class')})
+                                  'fail_class': t.user_attrs.get('fail_class'), 'source': t.user_attrs.get('source')})
         try:
             rec = c.load_trial_npz(self.tpath('ref_00.npz'))
             ser, _info = c.extract_series(rec.raw, cfg['initial'], cfg['target'], self.dofs, rec.t_target, cfg['T'],
@@ -1095,6 +1306,12 @@ class OptimizationRun:
         except Exception:
             self.ref_pot = {}
         c.write_kv_csv(self.path('conditions.csv'), self._conditions_rows())
+        self._emit_setup()
+
+    def _emit_setup(self):
+        """GUI の J過程タブ・グラフタブに、条件と基準試行の値と、それまでの履歴（再開のとき）を渡す"""
+        self.emit('info', {'progress': self._progress_info(), 'refs': self._ref_values()})
+        self.emit('hist', list(self.hist))
 
     # ---------------- 事前の候補（§6.5） ----------------
     def _seed_candidates(self):
@@ -1564,7 +1781,8 @@ class OptimizationRun:
                 'ref': ref.pot if ref is not None and len(ref.pot) == len(s.pot) else None,
                 'best': best.pot if best is not None and len(best.pot) == len(s.pot) else None,
                 'pwm': s.pwm, 'adrc': s.pwm - ffv, 'ff_t': t_ms / 1000.0,
-                'ff': c.firmware_ff(co, T_ff, t_ms).astype(float), 'ext': ex}
+                'ff': c.firmware_ff(co, T_ff, t_ms).astype(float), 'ext': ex,
+                'ref_Ji': list(self.targets[d].J_ref) if d in self.targets else []}
         return out
 
     def _check_render(self, wait=0.0):
@@ -1585,13 +1803,8 @@ class OptimizationRun:
             self._check_render()
             self.render_futures.append(self.offload.render.submit(render_trial_pngs, self.folder, n, payload))
             return
-        L = self.lang
         try:
-            for d, p in payload['dofs'].items():
-                base = os.path.join(self.folder, 'DOF', f'DOF{d}')
-                save_png(os.path.join(base, f'D{d}_g1_pot_trial{n:03d}.png'), lambda ax: plot_g1(ax, L, d, p, n))
-                save_png(os.path.join(base, f'D{d}_g4_pwm_adrc_trial{n:03d}.png'), lambda ax: plot_g4(ax, L, d, p, n))
-                save_png(os.path.join(base, f'D{d}_g5_ff_trial{n:03d}.png'), lambda ax: plot_g5(ax, L, d, p, n))
+            save_trial_pngs(self.folder, n, payload)
         except Exception as exc:
             self.log(f"  グラフの保存に失敗しました: {exc}")
 
@@ -1662,6 +1875,16 @@ class OptimizationRun:
                              '実機から受信'))
         return rows
 
+    def _ref_values(self):
+        """g2 に描く FF=0 の基準試行の値 {DOF: {'J_i': [この自由度の J_i, ...]}}（全体の J は描かない）"""
+        return {d: {'J_i': list(self.targets[d].J_ref) if d in self.targets else []} for d in self.dofs}
+
+    def _progress_info(self):
+        """分析フォルダの J_progress.png に書く条件"""
+        return {'J_ref': list(self.run_meta.get('J_ref') or []), 'J_thr': self.cfg['J_thr'],
+                'rms_thr': self.cfg.get('rms_thr'), 'n_startup': self.run_meta.get('n_startup'), 'T': self.cfg['T'],
+                'T_ff': cfg_T_ff(self.cfg)}
+
     def _save_all(self):
         if self.folder is None:
             return
@@ -1689,18 +1912,15 @@ class OptimizationRun:
                 log(f"保存: best は試行 {b.number}（J = {b.user_attrs['J']:.4g}）")
             else:
                 log("COMPLETE の試行がないので、結果 CSV は書きません")
+            end_args = (self.folder, list(self.dofs), list(self.hist), self.cfg['J_thr'], self._ref_values(),
+                        self._progress_info())
             if self.offload is not None:
-                self.render_futures.append(self.offload.render.submit(render_end_pngs, self.folder, list(self.dofs),
-                                                                      list(self.hist), self.cfg['J_thr']))
+                self.render_futures.append(self.offload.render.submit(render_end_pngs, *end_args))
                 self._check_render(wait=300.0)
             else:
-                L = self.lang
-                for d in self.dofs:
-                    base = os.path.join(self.folder, 'DOF', f'DOF{d}')
-                    save_png(os.path.join(base, f'D{d}_g2_cost.png'),
-                             lambda ax: plot_g2(ax, L, d, self.hist, self.cfg['J_thr']))
-                    save_png(os.path.join(base, f'D{d}_g3_extrema.png'),
-                             lambda ax, ax2: plot_g3(ax, ax2, L, d, self.hist), twin=True)
+                render_end_pngs(*end_args)
+            if b is not None:
+                log(f"分析フォルダ: {analysis_folder(self.folder)}（J_progress.png・J_progress_ja.png）")
             log(f"保存先: {self.folder}")
         except Exception as exc:
             log(f"保存に失敗しました: {exc}\n{traceback.format_exc()}")
@@ -1799,6 +2019,13 @@ class App:
         self.graph_future = None
         self.g_image = None
         self.g_width = 0
+        self.g_pending_n = None                         # 描画中のグラフの試行番号
+        self.p_dirty = False                            # J過程タブ
+        self.p_future = None
+        self.p_image = None
+        self.p_width = 0
+        self.progress_info = None                       # J_progress の条件（OptimizationRun の 'info' で受け取る）
+        self.refs = None                                # 自由度ごとの FF=0 の基準試行の J_i
         self.settings = self._load_settings()
         self._saved_snapshot = None
         self.log = RunLogger()
@@ -1931,6 +2158,26 @@ class App:
         self.g_label.pack(anchor='nw')
         self.g_canvas.bind('<Configure>', self._graph_resized)
         gvs.pack(side=tk.RIGHT, fill=tk.Y)
+        self._bind_wheel(self.g_canvas, self.tab_g)
+
+        self.tab_p = ttk.Frame(self.nb)
+        self.nb.add(self.tab_p, text="J過程")
+        self.p_note = ttk.Label(self.tab_p, text="開始すると、試行ごとの J の推移（分析フォルダの J_progress.png と同じ図）を表示します")
+        self.p_note.pack(anchor='w', padx=6)
+        pouter = ttk.Frame(self.tab_p)
+        pouter.pack(fill=tk.BOTH, expand=True)
+        self.p_canvas = tk.Canvas(pouter, highlightthickness=0)
+        pvs = ttk.Scrollbar(pouter, orient=tk.VERTICAL, command=self.p_canvas.yview)
+        self.p_inner = ttk.Frame(self.p_canvas)
+        self.p_inner.bind('<Configure>', lambda e: self.p_canvas.configure(scrollregion=self.p_canvas.bbox('all')))
+        self.p_canvas.create_window((0, 0), window=self.p_inner, anchor='nw')
+        self.p_canvas.configure(yscrollcommand=pvs.set)
+        self.p_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.p_label = tk.Label(self.p_inner)
+        self.p_label.pack(anchor='nw')
+        self.p_canvas.bind('<Configure>', self._progress_resized)
+        pvs.pack(side=tk.RIGHT, fill=tk.Y)
+        self._bind_wheel(self.p_canvas, self.tab_p)
 
         ctrl = ttk.Frame(self.root)
         ctrl.pack(fill=tk.X, padx=6, pady=4)
@@ -2191,6 +2438,9 @@ class App:
         self.stop_event.clear()
         self.hist = []
         self.last_payload = None
+        self.progress_info = None
+        self.refs = None
+        self.p_dirty = True
         self._make_figure(cfg['dofs'])
         self.run_obj = OptimizationRun(self.link, cfg, self.log, self.stop_event, self.events, self.lang, resume_folder,
                                        offload=self.offload)
@@ -2280,29 +2530,75 @@ class App:
         self.graph_dirty = True
 
     def _graph_resized(self, event):
-        if abs(event.width - self.g_width) > 40:
+        if event.width > 100 and abs(event.width - self.g_width) > 40:
             self.g_width = event.width
             self.graph_dirty = True
 
+    def _progress_resized(self, event):
+        if event.width > 100 and abs(event.width - self.p_width) > 40:
+            self.p_width = event.width
+            self.p_dirty = True
+
+    @staticmethod
+    def _bind_wheel(canvas, area):
+        """area の中のどこでマウスのホイールを回しても canvas を縦にスクロールする
+        （Linux・WSLg は Button-4/5、Windows・mac は MouseWheel。2026-11-06 ユーザー指示）"""
+        canvas.configure(yscrollincrement=20)
+
+        def on_wheel(e):
+            num = getattr(e, 'num', None)
+            step = -3 if num == 4 else 3 if num == 5 else (-3 if getattr(e, 'delta', 0) > 0 else 3)
+            canvas.yview_scroll(step, 'units')
+            return 'break'
+
+        def bind_all(w):
+            for seq in ('<MouseWheel>', '<Button-4>', '<Button-5>'):
+                w.bind(seq, on_wheel, add='+')
+            for ch in w.winfo_children():
+                bind_all(ch)
+        bind_all(area)
+
     def _graph_update(self):
-        """描画が終わっていれば表示し、グラフタブを開いていて更新が必要なら次の描画を頼む（同時に1つだけ）"""
+        """描画が終わっていれば表示し、更新が必要なら次の描画を頼む（同時に1つだけ）。
+        どのタブを開いていても描いておき、グラフタブに切り替えたときに最新の試行のグラフがすぐ見えるようにする（2026-11-06）。
+        描画は試行の写真の保存とは別のプロセス（Offload.preview）で行う"""
         if self.graph_future is not None and self.graph_future.done():
             try:
                 png = self.graph_future.result()
                 self.g_image = tk.PhotoImage(data=base64.b64encode(png).decode('ascii'), format='png')
                 self.g_label.configure(image=self.g_image)
+                n = self.g_pending_n
+                self.graph_note.configure(text=(f"試行 {n} のグラフ（{time.strftime('%H:%M:%S')} に更新）" if n is not None
+                                                else "試行が終わるとグラフを表示します"))
             except Exception as exc:
                 self.log(f"グラフの更新に失敗しました: {exc}")
             self.graph_future = None
         if not (self.graph_dirty and self.graph_future is None and self.fig_dofs):
             return
-        if self.nb.select() != str(self.tab_g):
-            return
         J_thr = self.run_obj.cfg.get('J_thr') if self.run_obj else None
-        width = max(800, self.g_canvas.winfo_width() - 20)
-        self.graph_future = self.offload.render.submit(render_preview, self.last_payload, list(self.hist),
-                                                       list(self.fig_dofs), J_thr, width)
+        width = max(800, (self.g_width or 1400) - 20)
+        self.g_pending_n = self.last_payload['n'] if self.last_payload else None
+        self.graph_future = self.offload.preview.submit(render_preview, self.last_payload, list(self.hist),
+                                                        list(self.fig_dofs), J_thr, width, self.refs)
         self.graph_dirty = False
+
+    def _progress_update(self):
+        """J過程タブ（J_progress と同じ図）の描画。グラフタブと同じく、どのタブを開いていても描いておく"""
+        if self.p_future is not None and self.p_future.done():
+            try:
+                png = self.p_future.result()
+                self.p_image = tk.PhotoImage(data=base64.b64encode(png).decode('ascii'), format='png')
+                self.p_label.configure(image=self.p_image)
+                n_c = sum(1 for h in self.hist if h['state'] == 'COMPLETE')
+                self.p_note.configure(text=f"COMPLETE {n_c} 回までの J の推移（{time.strftime('%H:%M:%S')} に更新）")
+            except Exception as exc:
+                self.log(f"J過程の更新に失敗しました: {exc}")
+            self.p_future = None
+        if not (self.p_dirty and self.p_future is None and self.progress_info is not None):
+            return
+        width = max(800, (self.p_width or 1400) - 20)
+        self.p_future = self.offload.preview.submit(render_progress, list(self.hist), dict(self.progress_info), width)
+        self.p_dirty = False
 
     def tick(self):
         self.logpane.poll()
@@ -2327,11 +2623,17 @@ class App:
             elif kind == 'hist':
                 self.hist = data
                 changed = True
+            elif kind == 'info':
+                self.progress_info = data.get('progress')
+                self.refs = data.get('refs')
+                changed = True
             elif kind == 'done':
                 self.status.configure(text=f"終了（{data[0]}{'：' + data[1] if data[1] else ''}）。次の探索を開始・再開できます")
         if changed:
             self.graph_dirty = True
+            self.p_dirty = True
         self._graph_update()
+        self._progress_update()
         if self.worker is not None and not self.worker.is_alive():
             self.worker = None
             self.lock(False)

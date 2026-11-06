@@ -547,3 +547,124 @@ def test_cond_hash_unchanged_when_T_ff_equals_T():
     assert h(dict(new, T_ff=0.9)) != h(old)
     assert h(dict(new, eval_min=3.0)) != h(old)
     assert app.OptimizationRun.cond_dict(dict(new, eval_min=3.0), params, 'th')['eval_rule'] == 'max(1.5T, 3 s)'
+
+
+def test_saved_png_english_and_eval_range():
+    """保存する画像（g1・g4・g5）：文字は英語、軸ラベルは指定どおり、横軸は 0 秒〜評価時間（g2・g3 も文字は英語）"""
+    import matplotlib
+    matplotlib.use('Agg')
+    from matplotlib.figure import Figure
+    import optimize_optuna_ff_ROS2 as app
+    t = np.arange(-120, 516) * c.TICK_DT
+    p = {'T': 1.0, 'T_ff': 3.0, 't_eval': 5.0, 't': t, 'pot': 300 + 0 * t, 't_win': t[120:621], 'target': 300 + 0 * t[120:621],
+         'ref': 300 + 0 * t, 'best': None, 'pwm': 0 * t, 'adrc': 0 * t, 'ff_t': np.arange(0, 5001) / 1000.0,
+         'ff': np.zeros(5001), 'ext': (0.5, 10.0, 2.0, -10.0)}
+    want = {'g1': ('POT [-]', app.plot_g1), 'g4': ('PWM [-]', app.plot_g4), 'g5': ('PWM [-]', app.plot_g5)}
+    for key, (ylab, fn) in want.items():
+        ax = Figure().add_subplot(111)
+        fn(ax, app.SAVE_LANG, 3, p, 7, final=True)
+        assert (ax.get_xlabel(), ax.get_ylabel()) == ('Time [s]', ylab), key
+        assert ax.get_xlim() == (0.0, 5.0), key
+        texts = [ax.get_title()] + [x.get_text() for x in ax.get_legend().get_texts()] + [x.get_text() for x in ax.texts]
+        assert all(ch.isascii() for s in texts for ch in s), (key, texts)
+        assert all(np.min(ln.get_xdata()) >= 0.0 and np.max(ln.get_xdata()) <= 5.0 + 1e-9
+                   for ln in ax.get_lines() if len(ln.get_xdata()) > 2), key        # y 軸の範囲も評価区間の値で決まる
+    hist = [{'n': 0, 'state': 'COMPLETE', 'J': 0.5, 'J_i': {'3': 0.4}, 'ext': {'3': [0.5, 10.0, 2.0, -10.0]}}]
+    ax = Figure().add_subplot(111)
+    app.plot_g2(ax, app.SAVE_LANG, 3, hist, 0.01)
+    ax2 = Figure().add_subplot(111)
+    app.plot_g3(ax2, ax2.twinx(), app.SAVE_LANG, 3, hist)
+    for a in (ax, ax2):
+        texts = [a.get_title(), a.get_xlabel(), a.get_ylabel()] + [x.get_text() for x in a.get_legend().get_texts()]
+        assert all(ch.isascii() for s in texts for ch in s), texts
+
+
+def test_cost_png_has_reference_and_progress_png(tmp_path):
+    """g2 にその自由度の FF=0 の基準試行（J_i の平均）の横線だけを描き（全体の J の基準は描かない）、
+    終了時に分析フォルダ analysis_YYYYMMDD_HHMM/J_progress.png を作る"""
+    import matplotlib
+    matplotlib.use('Agg')
+    from matplotlib.figure import Figure
+    import optimize_optuna_ff_ROS2 as app
+    hist = [{'n': k, 'state': 'COMPLETE', 'J': 1.0 / (k + 1), 'J_i': {'3': 0.5 / (k + 1)}, 'ext': {'3': [0.5, 10.0, 2.0, -10.0]}}
+            for k in range(6)] + [{'n': 6, 'state': 'FAIL', 'fail_class': 'unsafe'}]
+    ref = {'J_i': [0.02, 0.04]}
+    ax = Figure().add_subplot(111)
+    app.plot_g2(ax, app.SAVE_LANG, 3, hist, 0.01, ref)
+    ys = sorted(round(float(ln.get_ydata()[0]), 6) for ln in ax.get_lines() if len(set(np.atleast_1d(ln.get_ydata()))) == 1
+                and len(ln.get_xdata()) == 2)
+    assert ys == [0.03]                                                       # 基準の J_3 の平均の横線だけ（J と閾値は描かない）
+    labels = [x.get_text() for x in ax.get_legend().get_texts()]
+    assert labels == ['J_3', 'best [ J=mean(J_i) ]', 'reference J_3 (FF=0) = 0.03']
+    ref_line = [ln for ln in ax.get_lines() if ln.get_label().startswith('reference')][0]
+    assert ref_line.get_color() == 'k' and ref_line.get_linestyle() == '-.'                  # 黒の一点鎖線
+    assert all(ch.isascii() for s in labels for ch in s)
+    folder = tmp_path / 'optimize_20261104_1504'
+    info = {'J_ref': [0.08, 0.20], 'J_thr': 0.01, 'rms_thr': 10.0, 'n_startup': 3, 'T': 1.0, 'T_ff': 3.0}
+    app.render_end_pngs(str(folder), [3], hist, 0.01, {3: ref}, info)
+    assert app.analysis_folder(str(folder)) == str(tmp_path / 'analysis_20261104_1504')
+    assert (tmp_path / 'analysis_20261104_1504' / 'J_progress.png').stat().st_size > 1000
+    if app.setup_mpl_japanese() == 'ja':                                        # 日本語のフォントがあれば日本語版も
+        assert (tmp_path / 'analysis_20261104_1504' / 'J_progress_ja.png').stat().st_size > 1000
+    assert (folder / 'DOF' / 'DOF3' / 'D3_g2_cost.png').exists() and (folder / 'DOF' / 'DOF3' / 'D3_g3_extrema.png').exists()
+    ax = Figure().add_subplot(111)
+    app.plot_progress(ax, hist, info)
+    labels = [x.get_text() for x in ax.get_legend().get_texts()]
+    assert 'sampler starts using the model (trial 3)' in labels and 'reference (FF=0) J = 0.140' in labels and 'FAIL' in labels
+    assert all(ch.isascii() for s in labels + [ax.get_title(), ax.get_xlabel(), ax.get_ylabel()] for ch in s)
+
+
+
+def test_saved_png_rules_20261106():
+    """2026-11-06 の写真の決まり：POT の基準は黒の一点鎖線、cost と FF の極値の推移は凡例を x 軸の下、極値の推移の右軸ラベル、
+    FF の凡例は「FF」、極値の値は軸ラベルと同じ大きさで線に重ならない。GUI（日本語）も同じ描き方"""
+    import matplotlib
+    matplotlib.use('Agg')
+    from matplotlib.figure import Figure
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    import optimize_optuna_ff_ROS2 as app
+    t = np.arange(-120, 516) * c.TICK_DT
+    ff_t = np.arange(0, 5001) / 1000.0
+    co = c.quintic_from_extrema(3.0, 0.5, 2.0, 120.0, -60.0) * 1.0
+    fv = c.ff_eval(co, 3.0, ff_t)
+    ext = c.extrema_of(co, 3.0)
+    p = {'T': 1.0, 'T_ff': 3.0, 't_eval': 5.0, 't': t, 'pot': 300 + 0 * t, 't_win': t[120:621], 'target': 300 + 0 * t[120:621],
+         'ref': 300 + 0 * t, 'best': None, 'pwm': 0 * t, 'adrc': 0 * t, 'ff_t': ff_t, 'ff': fv, 'ext': ext, 'ref_Ji': [0.1]}
+    hist = [{'n': k, 'state': 'COMPLETE', 'J': 1.0 / (k + 1), 'J_i': {'3': 0.5 / (k + 1)}, 'ext': {'3': list(ext)}} for k in range(5)]
+    for L in ('en', 'ja'):
+        fig = Figure(figsize=(7.0, 4.2), dpi=110); FigureCanvasAgg(fig)
+        ax = fig.add_subplot(111)
+        app.plot_g1(ax, L, 3, p, 1, final=True)
+        ref = [ln for ln in ax.get_lines() if ln.get_label() == app.TXT[L]['ref']][0]
+        assert ref.get_color() == 'k' and ref.get_linestyle() == '-.'           # 黒の一点鎖線
+        for key in ('g2', 'g3'):
+            fig = Figure(figsize=(7.0, 4.2), dpi=110); FigureCanvasAgg(fig)
+            ax = fig.add_subplot(111)
+            if key == 'g2':
+                app.plot_g2(ax, L, 3, hist, 0.01, {'J_i': [0.1]})
+            else:
+                ax2 = ax.twinx()
+                app.plot_g3(ax, ax2, L, 3, hist)
+                assert ax2.get_ylabel() == app.TXT[L]['ext_y']
+            fig.tight_layout(); app._fit_legends(fig)
+            fig.canvas.draw()                                                   # 余白を変えた後の位置で測る
+            rend = fig.canvas.get_renderer()
+            leg = ax.get_legend().get_window_extent(rend)
+            xl = ax.xaxis.label.get_window_extent(rend)
+            assert leg.y1 <= xl.y0 + 1 and leg.y0 >= 0, (L, key)                  # 凡例は x 軸ラベルの下で、画像の中
+        fig = Figure(figsize=(7.0, 4.2), dpi=110); FigureCanvasAgg(fig)
+        ax = fig.add_subplot(111)
+        app.plot_g5(ax, L, 3, p, 1, final=True)
+        assert [x.get_text() for x in ax.get_legend().get_texts()] == ['FF']
+        rend = fig.canvas.get_renderer()
+        pts = ax.transData.transform(np.column_stack([ff_t, fv]))
+        for tx in ax.texts:
+            assert tx.get_fontsize() == ax.xaxis.label.get_fontsize()             # 軸ラベルと同じ大きさ
+            bb = tx.get_window_extent(rend)
+            assert not np.any((pts[:, 0] >= bb.x0) & (pts[:, 0] <= bb.x1) & (pts[:, 1] >= bb.y0) & (pts[:, 1] <= bb.y1))
+            assert ax.get_window_extent(rend).contains(bb.x0, bb.y0) and ax.get_window_extent(rend).contains(bb.x1, bb.y1)
+    assert app.TXT['en']['ext_y'] == 'extrema value (PWM) [-]' and app.TXT['en']['ff'] == 'FF'
+    fig = Figure(); FigureCanvasAgg(fig)
+    ax = fig.add_subplot(111)
+    app.plot_progress(ax, hist, {'J_ref': [0.1], 'J_thr': 0.01, 'rms_thr': 10, 'n_startup': 2, 'T': 1.0, 'T_ff': 3.0}, 'ja')
+    assert ax.get_xlabel() == '試行番号' and 'J の推移' in ax.get_title()
