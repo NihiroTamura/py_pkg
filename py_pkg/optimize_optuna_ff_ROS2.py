@@ -28,6 +28,7 @@ Optuna で5次関数FF（a t⁵ + b t⁴ + c t³ + d t² + e t, 0 ≤ t < T_FF�
     run.log … ログ      status.json … 状態
 <分析>  <保存先>/analysis_YYYYMMDD_HHMM/J_progress.png … J の推移（終了時に作る。文字は英語）
                                        J_progress_ja.png … 同じ図の日本語版
+                                       J_share_FF0.png / J_share_best.png … J に占める各自由度の割合（FF=0 / best）
 """
 import base64
 import json
@@ -571,7 +572,10 @@ TXT = {
            'p_each': '各試行の J', 'p_best': 'それまでの最小', 'p_past': '過去の試行（add_trial）',
            'p_tpe': 'Sampler が学習を使い始めた試行（{}）', 'p_ref': '基準試行（FF=0）の J = {:.3f}',
            'p_thr': '閾値 J = {:.4f}（RMS {:g}%）', 'p_fail': '失敗', 'p_x': '試行番号', 'p_y': 'J（対数）',
-           'p_title': 'J の推移（COMPLETE {}、n_startup = {}、T = {:g} s、T_FF = {:g} s）'},
+           'p_title': 'J の推移（COMPLETE {}、n_startup = {}、T = {:g} s、T_FF = {:g} s）',
+           's_x': '自由度', 's_y': 'J に占める割合 [%]（= J_i / Σ J_i）',
+           's_ref': 'J に占める各自由度の割合：基準試行（FF=0、{} 回の平均）、J = {:.4g}',
+           's_best': 'J に占める各自由度の割合：best（試行 {}）、J = {:.4g}'},
     # 保存する画像はこの英語の文字で描く（2026-11-04・11-06 ユーザー指示。軸ラベル・凡例は指定どおり）
     'en': {'t': 'Time [s]', 'pot': 'POT [-]', 'pwm': 'PWM [-]', 'trial': 'trial',
            'J': 'J (log)', 'ext_t': 'extremum time [s]', 'ext_y': 'extrema value (PWM) [-]', 'meas': 'measured POT',
@@ -583,7 +587,10 @@ TXT = {
            'p_each': 'J of each trial', 'p_best': 'best so far', 'p_past': 'past trial (add_trial)',
            'p_tpe': 'sampler starts using the model (trial {})', 'p_ref': 'reference (FF=0) J = {:.3f}',
            'p_thr': 'threshold J = {:.4f} (RMS {:g}%)', 'p_fail': 'FAIL', 'p_x': 'trial', 'p_y': 'J (log)',
-           'p_title': 'J history (COMPLETE {}, n_startup = {}, T = {:g} s, T_FF = {:g} s)'},
+           'p_title': 'J history (COMPLETE {}, n_startup = {}, T = {:g} s, T_FF = {:g} s)',
+           's_x': 'DOF', 's_y': 'share of J [%] (= J_i / sum J_i)',
+           's_ref': 'Share of each DOF in J: reference (FF=0, mean of {} trials), J = {:.4g}',
+           's_best': 'Share of each DOF in J: best (trial {}), J = {:.4g}'},
 }
 SAVE_LANG = 'en'        # 保存する画像（DOF/DOF<d>/*.png）の文字。GUI のグラフタブは日本語のまま
 FAIL_COLORS = {'presend': '#999999', 'tabu': '#bbbb00', 'unsafe': '#d62728', 'comm': '#9467bd', 'sensor': '#8c564b',
@@ -825,6 +832,65 @@ def plot_progress(ax, hist, info, L=SAVE_LANG):
     ax.grid(True, which='both', alpha=0.3)
 
 
+def plot_share(ax, L, dofs, J_i, title, color='#1f77b4'):
+    """J に占める各自由度の割合の棒グラフ（2026-11-06 ユーザー指示）。J = mean(J_i) なので割合は J_i / Σ J_i × 100 [%]。
+    2枚を比べやすいように縦軸は 0〜100% にそろえ、棒の上に割合の値を書く"""
+    X = TXT[L]
+    vals = np.array([float(J_i.get(d, np.nan)) for d in dofs], dtype=float)
+    share = 100.0 * vals / np.nansum(vals) if np.nansum(vals) > 0 else np.full(len(dofs), np.nan)
+    x = np.arange(len(dofs))
+    ax.bar(x, share, color=color, width=0.7)
+    for xi, v in zip(x, share):
+        if np.isfinite(v):
+            ax.text(xi, v + 1.0, f'{v:.1f}', ha='center', va='bottom', fontsize=7)
+    ax.set_xticks(x)
+    ax.set_xticklabels([str(d) for d in dofs], fontsize=8)
+    ax.set_ylim(0.0, 108.0)
+    ax.set_xlim(-0.6, len(dofs) - 0.4)
+    ax.set_xlabel(X['s_x'], fontsize=9)
+    ax.set_ylabel(X['s_y'], fontsize=9)
+    ax.set_title(title, fontsize=10)
+    ax.grid(axis='y', alpha=0.3)
+    return share
+
+
+def share_inputs(dofs, hist, refs):
+    """割合のグラフの値：基準試行（FF=0）の J_i の平均と、best（過去の試行を除いた COMPLETE で J 最小。study の best と同じ）の J_i。
+    戻り値 (ref_Ji, n_ref, best) 。best = (試行番号, J, J_i) または None"""
+    refs = refs or {}
+    ref_Ji, n_ref = {}, 0
+    for d in dofs:
+        v = [x for x in ((refs.get(d) or {}).get('J_i') or []) if x is not None and np.isfinite(x)]
+        if v:
+            ref_Ji[d] = float(np.mean(v))
+            n_ref = max(n_ref, len(v))
+    done = [h for h in hist if h['state'] == 'COMPLETE' and h.get('J') is not None and h.get('source') != 'past'
+            and h.get('J_i')]
+    best = None
+    if done:
+        b = min(done, key=lambda h: h['J'])
+        best = (b['n'], float(b['J']), {d: float(b['J_i'].get(str(d), b['J_i'].get(d, np.nan))) for d in dofs})
+    return ref_Ji, n_ref, best
+
+
+def save_share_pngs(out, dofs, hist, refs, L=SAVE_LANG):
+    """分析フォルダに J_share_FF0.png（基準試行）と J_share_best.png（best）を保存する。保存したファイル名を返す"""
+    ref_Ji, n_ref, best = share_inputs(dofs, hist, refs)
+    saved = []
+    if len(ref_Ji) == len(dofs):
+        J_ref = float(np.mean([ref_Ji[d] for d in dofs]))
+        save_png(os.path.join(out, 'J_share_FF0.png'),
+                 lambda ax: plot_share(ax, L, dofs, ref_Ji, TXT[L]['s_ref'].format(n_ref, J_ref), color='#7f7f7f'),
+                 size=(12.0, 4.8))
+        saved.append('J_share_FF0.png')
+    if best is not None:
+        n, J, J_i = best
+        save_png(os.path.join(out, 'J_share_best.png'),
+                 lambda ax: plot_share(ax, L, dofs, J_i, TXT[L]['s_best'].format(n, J)), size=(12.0, 4.8))
+        saved.append('J_share_best.png')
+    return saved
+
+
 def analysis_folder(folder):
     """結果フォルダ <保存先>/optimize_YYYYMMDD_HHMM に対する分析フォルダ <保存先>/analysis_YYYYMMDD_HHMM"""
     name = os.path.basename(os.path.normpath(folder))
@@ -945,8 +1011,8 @@ def save_trial_pngs(folder, n, payload):
 def render_end_pngs(folder, dofs, hist, J_thr, refs=None, progress=None):
     """終了時の画像を保存する（文字は英語）。
     DOF/DOF<d>/ に g2（累積誤差の推移。refs = {DOF: {'J_i': [...]}} でその自由度の FF=0 の基準試行も描く）と g3、
-    progress（plot_progress の info）を与えれば分析フォルダ analysis_YYYYMMDD_HHMM/ に J_progress.png（英語）と
-    J_progress_ja.png（日本語）も"""
+    progress（plot_progress の info）を与えれば分析フォルダ analysis_YYYYMMDD_HHMM/ に J_progress.png（英語）・
+    J_progress_ja.png（日本語）・J_share_FF0.png・J_share_best.png（J に占める各自由度の割合）も"""
     L = SAVE_LANG
     refs = refs or {}
     for d in dofs:
@@ -960,6 +1026,7 @@ def render_end_pngs(folder, dofs, hist, J_thr, refs=None, progress=None):
         if setup_mpl_japanese() == 'ja':              # 日本語版（2026-11-06 ユーザー指示）。日本語のフォントがあるときだけ
             save_png(os.path.join(out, 'J_progress_ja.png'), lambda ax: plot_progress(ax, hist, progress, 'ja'),
                      size=(12.0, 4.8))
+        save_share_pngs(out, list(dofs), hist, refs)  # J に占める各自由度の割合（FF=0 と best。2026-11-06 ユーザー指示）
     return len(dofs)
 
 
@@ -1920,7 +1987,8 @@ class OptimizationRun:
             else:
                 render_end_pngs(*end_args)
             if b is not None:
-                log(f"分析フォルダ: {analysis_folder(self.folder)}（J_progress.png・J_progress_ja.png）")
+                log(f"分析フォルダ: {analysis_folder(self.folder)}（J_progress.png・J_progress_ja.png・"
+                    f"J_share_FF0.png・J_share_best.png）")
             log(f"保存先: {self.folder}")
         except Exception as exc:
             log(f"保存に失敗しました: {exc}\n{traceback.format_exc()}")

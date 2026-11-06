@@ -668,3 +668,28 @@ def test_saved_png_rules_20261106():
     ax = fig.add_subplot(111)
     app.plot_progress(ax, hist, {'J_ref': [0.1], 'J_thr': 0.01, 'rms_thr': 10, 'n_startup': 2, 'T': 1.0, 'T_ff': 3.0}, 'ja')
     assert ax.get_xlabel() == '試行番号' and 'J の推移' in ax.get_title()
+
+
+def test_share_pngs_ff0_and_best(tmp_path):
+    """分析フォルダに、J に占める各自由度の割合（J_i / Σ J_i）の写真を FF=0 と best の2種類保存する。
+    best は過去の試行を除いた COMPLETE の J 最小（study の best と同じ）"""
+    import matplotlib
+    matplotlib.use('Agg')
+    from matplotlib.figure import Figure
+    import optimize_optuna_ff_ROS2 as app
+    dofs = [3, 8]
+    hist = [{'n': 0, 'state': 'COMPLETE', 'J': 0.5, 'J_i': {'3': 0.2, '8': 0.8}},
+            {'n': 1, 'state': 'COMPLETE', 'J': 0.2, 'J_i': {'3': 0.3, '8': 0.1}},
+            {'n': 2, 'state': 'COMPLETE', 'J': 0.01, 'J_i': {'3': 0.01, '8': 0.01}, 'source': 'past'},
+            {'n': 3, 'state': 'FAIL', 'fail_class': 'unsafe'}]
+    refs = {3: {'J_i': [0.1, 0.3]}, 8: {'J_i': [0.6, 1.0]}}
+    ref_Ji, n_ref, best = app.share_inputs(dofs, hist, refs)
+    assert ref_Ji == {3: 0.2, 8: 0.8} and n_ref == 2
+    assert best[0] == 1 and best[1] == 0.2 and best[2] == {3: 0.3, 8: 0.1}       # 過去の試行（J 0.01）は除く
+    ax = Figure().add_subplot(111)
+    share = app.plot_share(ax, 'en', dofs, ref_Ji, 'x')
+    assert np.allclose(share, [20.0, 80.0]) and ax.get_ylim() == (0.0, 108.0)
+    assert [t.get_text() for t in ax.texts] == ['20.0', '80.0']
+    saved = app.save_share_pngs(str(tmp_path), dofs, hist, refs)
+    assert saved == ['J_share_FF0.png', 'J_share_best.png']
+    assert all((tmp_path / f).stat().st_size > 1000 for f in saved)
