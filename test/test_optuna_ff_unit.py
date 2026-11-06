@@ -595,7 +595,7 @@ def test_cost_png_has_reference_and_progress_png(tmp_path):
                 and len(ln.get_xdata()) == 2)
     assert ys == [0.03]                                                       # 基準の J_3 の平均の横線だけ（J と閾値は描かない）
     labels = [x.get_text() for x in ax.get_legend().get_texts()]
-    assert labels == ['J_3', 'best [ J=mean(J_i) ]', 'reference J_3 (FF=0) = 0.03']
+    assert labels == ['J_3', 'J_3 at best J', 'reference J_3 (FF=0) = 0.03']
     ref_line = [ln for ln in ax.get_lines() if ln.get_label().startswith('reference')][0]
     assert ref_line.get_color() == 'k' and ref_line.get_linestyle() == '-.'                  # 黒の一点鎖線
     assert all(ch.isascii() for s in labels for ch in s)
@@ -693,3 +693,26 @@ def test_share_pngs_ff0_and_best(tmp_path):
     saved = app.save_share_pngs(str(tmp_path), dofs, hist, refs)
     assert saved == ['J_share_FF0.png', 'J_share_best.png']
     assert all((tmp_path / f).stat().st_size > 1000 for f in saved)
+
+
+
+def test_cost_png_best_ji_track():
+    """cost の緑の線は、その時点の best J の試行の J_i（best が更新されたときだけ変わる。過去の試行は除く）"""
+    import matplotlib
+    matplotlib.use('Agg')
+    from matplotlib.figure import Figure
+    import optimize_optuna_ff_ROS2 as app
+    hist = [{'n': 0, 'state': 'COMPLETE', 'J': 1.0, 'J_i': {'3': 0.5}},
+            {'n': 1, 'state': 'COMPLETE', 'J': 2.0, 'J_i': {'3': 0.01}},       # J が悪いので best ではない（J_i が小さくても）
+            {'n': 2, 'state': 'FAIL', 'fail_class': 'unsafe'},
+            {'n': 3, 'state': 'COMPLETE', 'J': 0.5, 'J_i': {'3': 0.9}},        # best が更新される（J_i は大きくなる）
+            {'n': 4, 'state': 'COMPLETE', 'J': 0.1, 'J_i': {'3': 0.05}, 'source': 'past'},   # 過去の試行は best にしない
+            {'n': 5, 'state': 'COMPLETE', 'J': 0.6, 'J_i': {'3': 0.2}}]
+    ns, vals = app.best_ji_track(hist, 3)
+    assert ns == [0, 1, 3, 5] and vals == [0.5, 0.5, 0.9, 0.9]
+    for L in ('en', 'ja'):
+        ax = Figure().add_subplot(111)
+        app.plot_g2(ax, L, 3, hist, None, {'J_i': [0.1]})
+        line = [ln for ln in ax.get_lines() if ln.get_label() == app.TXT[L]['best_Ji'].format(3)][0]
+        assert list(line.get_xdata()) == ns and list(line.get_ydata()) == vals and line.get_drawstyle() == 'steps-post'
+    assert app.TXT['en']['best_Ji'].format(3) == 'J_3 at best J'

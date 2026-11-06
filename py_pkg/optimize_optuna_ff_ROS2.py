@@ -565,7 +565,7 @@ TXT = {
     'ja': {'t': '時間 [s]', 'pot': 'POT [-]', 'pwm': 'PWM [-]',
            'trial': '試行番号', 'J': '累積誤差 J（対数）', 'ext_t': '極値の時刻 [s]', 'ext_y': '極値の値 (PWM) [-]',
            'meas': '実測 POT', 'tgt': '目標軌道（固定）', 'ref': '基準試行（FF=0）', 'best': 'best',
-           'best_J': 'best [ J=mean(J_i) ]',
+           'best_Ji': 'best J のときの J_{}',
            'adrc': 'ADRC = PWM − FF', 'ff': 'FF', 'thr': '閾値', 'fail': '失敗',
            'g1': 'POT と目標軌道', 'g2': '累積誤差の推移', 'g3': 'FF の極値の推移', 'g4': 'PWM と ADRC', 'g5': 'FF と極値',
            'ff_y': 'PWM [-]', 'ref_Ji': '基準試行（FF=0）の J_{}',
@@ -580,7 +580,7 @@ TXT = {
     'en': {'t': 'Time [s]', 'pot': 'POT [-]', 'pwm': 'PWM [-]', 'trial': 'trial',
            'J': 'J (log)', 'ext_t': 'extremum time [s]', 'ext_y': 'extrema value (PWM) [-]', 'meas': 'measured POT',
            'tgt': 'target (fixed)', 'ref': 'reference (FF=0)', 'best': 'best',
-           'best_J': 'best [ J=mean(J_i) ]', 'adrc': 'ADRC = PWM - FF',
+           'best_Ji': 'J_{} at best J', 'adrc': 'ADRC = PWM - FF',
            'ff': 'FF', 'thr': 'threshold', 'fail': 'FAIL',
            'g1': 'POT and target', 'g2': 'cost history', 'g3': 'FF extrema', 'g4': 'PWM and ADRC', 'g5': 'FF',
            'ff_y': 'PWM [-]', 'ref_Ji': 'reference J_{} (FF=0)',
@@ -652,19 +652,39 @@ def _legend_below(ax, handles=None, labels=None, ncol=3):
     return ax.legend(handles, labels, **kw) if handles is not None else ax.legend(**kw)
 
 
+def _ji_of(h, d):
+    v = h['J_i'].get(str(d), h['J_i'].get(d)) if h.get('J_i') else None
+    return float(v) if v is not None else np.nan
+
+
+def best_ji_track(hist, d):
+    """その時点の best（J が最小の試行。過去の試行は除く＝study の best と同じ）の、自由度 d の J_i の軌跡。
+    戻り値 (試行番号の列, J_i の列)。best が更新されるたびに、その試行の J_i に変わる"""
+    own = sorted((h for h in hist if h['state'] == 'COMPLETE' and h.get('J') is not None and h.get('source') != 'past'),
+                 key=lambda h: h['n'])
+    ns, vals, best_J, cur = [], [], np.inf, np.nan
+    for h in own:
+        if h['J'] < best_J:
+            best_J, cur = h['J'], _ji_of(h, d)
+        ns.append(h['n'])
+        vals.append(cur)
+    return ns, vals
+
+
 def plot_g2(ax, L, d, hist, J_thr=None, ref=None):
-    """累積誤差の推移：その自由度の J_i・best（それまでの J の最小）・FF=0 の基準試行の J_i（2026-11-06 ユーザー指示。
-    J と閾値は描かない）。ref = {'J_i': [基準試行のこの自由度の J_i, ...]}。J_thr は使わない（呼び出し側との互換のため残す）"""
+    """累積誤差の推移：その自由度の J_i・best J の試行のその自由度の J_i の軌跡・FF=0 の基準試行の J_i
+    （2026-11-06 ユーザー指示。J と閾値は描かない）。ref = {'J_i': [基準試行のこの自由度の J_i, ...]}。
+    J_thr は使わない（呼び出し側との互換のため残す）"""
     ax.clear()
     done = [h for h in hist if h['state'] == 'COMPLETE' and h.get('J') is not None]
     if done:
         ns = [h['n'] for h in done]
-        ji = [h['J_i'].get(str(d), h['J_i'].get(d)) if h.get('J_i') else None for h in done]
-        if any(v is not None for v in ji):
-            ax.semilogy(ns, [v if v is not None else np.nan for v in ji], 's', color='#ff7f0e', ms=2,
-                        label=f'J_{d}')
-        best = np.minimum.accumulate([h['J'] for h in done])
-        ax.semilogy(ns, best, color='#2ca02c', lw=1, label=TXT[L]['best_J'])
+        ji = [_ji_of(h, d) for h in done]
+        if any(np.isfinite(v) for v in ji):
+            ax.semilogy(ns, ji, 's', color='#ff7f0e', ms=2, label=f'J_{d}')
+        bn, bv = best_ji_track(hist, d)
+        if bn:
+            ax.semilogy(bn, bv, color='#2ca02c', lw=1.2, drawstyle='steps-post', label=TXT[L]['best_Ji'].format(d))
     ref = ref or {}
     rji = [v for v in (ref.get('J_i') or []) if v is not None and np.isfinite(v)]
     if rji:
