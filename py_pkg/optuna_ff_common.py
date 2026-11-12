@@ -213,6 +213,28 @@ def rms_percent(J_i):
     return float(np.sqrt(J_i) * 100.0) if np.isfinite(J_i) and J_i >= 0 else float('nan')
 
 
+# 評価値の正規化（2026-11-12 ユーザー指示で選べるようにした）
+#   'dP'   : J_i = mean(((POT − Target)/ΔP_i)²)  無次元（従来どおり。既定）
+#   'none' : J_i = mean((POT − Target)²)          [count²]
+ERR_NORMS = ('dP', 'none')
+
+
+def rms_value(J, norm='dP'):
+    """J を RMS にした表示用の値（'dP' なら ΔP に対する % 、'none' なら count）"""
+    if not (np.isfinite(J) and J >= 0):
+        return float('nan')
+    return float(np.sqrt(J) * 100.0) if norm == 'dP' else float(np.sqrt(J))
+
+
+def rms_unit(norm='dP'):
+    return '% of ΔP' if norm == 'dP' else 'count'
+
+
+def rms_column(norm='dP'):
+    """trials.csv の RMS の列名"""
+    return 'RMS_percent' if norm == 'dP' else 'RMS_count'
+
+
 # 移植元: optimize_EL2_common.py:372-528 @f8fba60
 def _rf(t):
     return np.array([t ** 5, t ** 4, t ** 3, t ** 2, t])
@@ -1098,8 +1120,9 @@ def fit_target_constrained(dof, ys, valids, P0s, Pi, Pf, T, eps, bounds=None, dt
                       free_t_eps=t_free, warnings=warnings, **common)
 
 
-def noise_floor(spec_list, ys_by_dof, valids_by_dof):
-    """J_noise = ½·mean_{組}(mean(((y_r1 − y_r2)/ΔP)²))（自由度で平均）と、量子化の下限 mean_i 1/(12ΔP_i²)"""
+def noise_floor(spec_list, ys_by_dof, valids_by_dof, norm='dP'):
+    """J_noise = ½·mean_{組}(mean(((y_r1 − y_r2)/ΔP)²))（自由度で平均）と、量子化の下限 mean_i 1/(12ΔP_i²)。
+    norm='none'（ΔP で割らない評価値）では ΔP を 1 にする（[count²]）"""
     vals = []
     for sp in spec_list:
         ys, vs = ys_by_dof[sp.dof], valids_by_dof[sp.dof]
@@ -1108,11 +1131,12 @@ def noise_floor(spec_list, ys_by_dof, valids_by_dof):
             for k in range(i + 1, len(ys)):
                 m = vs[i] & vs[k] & np.isfinite(ys[i]) & np.isfinite(ys[k])
                 if m.any():
-                    pairs.append(0.5 * float(np.mean(((ys[i][m] - ys[k][m]) / sp.dP) ** 2)))
+                    pairs.append(0.5 * float(np.mean(((ys[i][m] - ys[k][m]) / (sp.dP if norm == 'dP' else 1.0)) ** 2)))
         if pairs:
             vals.append(float(np.mean(pairs)))
     J_noise = float(np.mean(vals)) if vals else float('nan')
-    J_quant = float(np.mean([1.0 / (12.0 * sp.dP ** 2) for sp in spec_list])) if spec_list else float('nan')
+    J_quant = float(np.mean([1.0 / (12.0 * (sp.dP if norm == 'dP' else 1.0) ** 2) for sp in spec_list])) \
+        if spec_list else float('nan')
     return J_noise, J_quant
 
 
@@ -1416,13 +1440,14 @@ def extract_series(raw, initial, target, dofs, t_send, T, history_s=HISTORY_S, e
     return out, info
 
 
-def evaluate(series, targets):
-    """J_i = mean((POT − Target)/ΔP)²（評価区間・受信できた配信）、J = 自由度の平均（計画書 §5.2）"""
+def evaluate(series, targets, norm='dP'):
+    """J_i = mean((POT − Target)/ΔP)²（評価区間・受信できた配信）、J = 自由度の平均（計画書 §5.2）。
+    norm='none' なら ΔP で割らない J_i = mean((POT − Target)²) [count²]（2026-11-12）"""
     J_i = {}
     for d, s in series.items():
         w = s.win()
         pot = s.pot[w]
-        J_i[d] = normalized_error(pot, targets[d].seq(), s.dP, np.isfinite(pot))
+        J_i[d] = normalized_error(pot, targets[d].seq(), s.dP if norm == 'dP' else 1.0, np.isfinite(pot))
     vals = [v for v in J_i.values() if np.isfinite(v)]
     J = float(np.mean(vals)) if len(vals) == len(J_i) and vals else float('nan')
     return J, J_i
@@ -2375,9 +2400,9 @@ class TrialsCsv:
             os.fsync(f.fileno())
 
 
-def trial_columns(dofs):
+def trial_columns(dofs, norm='dP'):
     cols = ['trial', 'state', 'fail_class', 'fail_reason', 'fail_stage', 'source', 'retry_of', 'confirm_of',
-            'remeasure', 'started_at', 'finished_at', 'J', 'log10J', 'RMS_percent', 'best_trial_so_far',
+            'remeasure', 'started_at', 'finished_at', 'J', 'log10J', rms_column(norm), 'best_trial_so_far',
             'best_J_so_far', 'J_partial', 'missing_max']
     for d in dofs:
         p = f'd{d}_'

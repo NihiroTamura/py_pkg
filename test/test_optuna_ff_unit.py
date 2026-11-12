@@ -716,3 +716,34 @@ def test_cost_png_best_ji_track():
         line = [ln for ln in ax.get_lines() if ln.get_label() == app.TXT[L]['best_Ji'].format(3)][0]
         assert list(line.get_xdata()) == ns and list(line.get_ydata()) == vals and line.get_drawstyle() == 'steps-post'
     assert app.TXT['en']['best_Ji'].format(3) == 'J_3 at best J'
+
+
+def test_err_norm_option():
+    """評価値を ΔP_i で割る（従来）か割らないかを選べる（2026-11-12）。割らない J_i は [count²]、閾値は RMS [count]²。
+    割る場合の条件 hash は従来と同じ（それまでの study を再開できる）"""
+    import optimize_optuna_ff_ROS2 as app
+    initial = [300.0] * c.N_DOF
+    target = list(initial)
+    target[3] = 400.0
+    T, j0 = 1.0, 150
+    t_send = j0 * c.TICK_DT - 0.004
+    raw = _fake_raw(j0, 150 + c.n_eval(T) + 40, initial, target, [3], t_send=t_send)
+    ser, _ = c.extract_series(raw, initial, target, [3], t_send, T)
+    s = ser[3]
+
+    class Tg:
+        def seq(self):
+            return s.pot[s.win()] + 5.0                                       # 目標軌道から一律 5 count ずれた応答
+    J_dp, J_i_dp = c.evaluate(ser, {3: Tg()})
+    J_no, J_i_no = c.evaluate(ser, {3: Tg()}, 'none')
+    assert J_no == pytest.approx(25.0) and J_dp == pytest.approx(25.0 / 100.0 ** 2)
+    assert c.rms_value(J_no, 'none') == pytest.approx(5.0) and c.rms_value(J_dp, 'dP') == pytest.approx(5.0)
+    assert c.rms_column('none') == 'RMS_count' and 'RMS_count' in c.trial_columns([3], 'none')
+    old = {'m': 0.02, 'sep': 0.02, 'A_max': 255.0, 'rho': 0.05, 'tabu_on': True, 'dofs': [3], 'T': 1.5, 'eps': 0.02,
+           'initial': initial, 'target': target}
+    params = {3: c.AdrcParams(1000.0, 144.0, 50000.0, 700.0)}
+
+    def h(cfg):
+        return c.condition_hash(app.OptimizationRun.cond_dict(cfg, params, 'th'))
+    assert app.cfg_err_norm(old) == 'dP' and h(dict(old, err_norm='dP')) == h(old)
+    assert h(dict(old, err_norm='none')) != h(old)

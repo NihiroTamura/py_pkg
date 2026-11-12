@@ -240,15 +240,19 @@ class Fields:
         self.frame = ttk.LabelFrame(parent, text=title) if title else ttk.Frame(parent)
         self.frame.pack(fill=tk.X, padx=6, pady=4)
         self.vars = {}
+        self.labels = {}                # 変更: 欄の名前と説明の Label を後から書き換えられるように残す
+        self.notes = {}
         self.row = 0
 
     def add(self, name, label, default, width=12, note=''):
         var = tk.StringVar(value=str(default))
-        ttk.Label(self.frame, text=label).grid(row=self.row, column=0, sticky='w', padx=4, pady=2)
+        self.labels[name] = ttk.Label(self.frame, text=label)
+        self.labels[name].grid(row=self.row, column=0, sticky='w', padx=4, pady=2)
         e = ttk.Entry(self.frame, textvariable=var, width=width)
         e.grid(row=self.row, column=1, sticky='w', padx=4, pady=2)
-        if note:
-            ttk.Label(self.frame, text=note, foreground='#555').grid(row=self.row, column=2, sticky='w', padx=4)
+        if note:                        # 説明がある欄だけ（移植元と同じ部品の構成）
+            self.notes[name] = ttk.Label(self.frame, text=note, foreground='#555')
+            self.notes[name].grid(row=self.row, column=2, sticky='w', padx=4)
         self.vars[name] = var
         self.row += 1
         return e
@@ -571,7 +575,7 @@ TXT = {
            'ff_y': 'PWM [-]', 'ref_Ji': '基準試行（FF=0）の J_{}',
            'p_each': '各試行の J', 'p_best': 'それまでの最小', 'p_past': '過去の試行（add_trial）',
            'p_tpe': 'Sampler が学習を使い始めた試行（{}）', 'p_ref': '基準試行（FF=0）の J = {:.3f}',
-           'p_thr': '閾値 J = {:.4f}（RMS {:g}%）', 'p_fail': '失敗', 'p_x': '試行番号', 'p_y': 'J（対数）',
+           'p_thr': '閾値 J = {:.4g}（RMS {:g}{}）', 'p_fail': '失敗', 'p_x': '試行番号', 'p_y': 'J（対数）',
            'p_title': 'J の推移（COMPLETE {}、n_startup = {}、T = {:g} s、T_FF = {:g} s）',
            's_x': '自由度', 's_y': 'J に占める割合 [%]（= J_i / Σ J_i）',
            's_ref': 'J に占める各自由度の割合：基準試行（FF=0、{} 回の平均）、J = {:.4g}',
@@ -586,12 +590,13 @@ TXT = {
            'ff_y': 'PWM [-]', 'ref_Ji': 'reference J_{} (FF=0)',
            'p_each': 'J of each trial', 'p_best': 'best so far', 'p_past': 'past trial (add_trial)',
            'p_tpe': 'sampler starts using the model (trial {})', 'p_ref': 'reference (FF=0) J = {:.3f}',
-           'p_thr': 'threshold J = {:.4f} (RMS {:g}%)', 'p_fail': 'FAIL', 'p_x': 'trial', 'p_y': 'J (log)',
+           'p_thr': 'threshold J = {:.4g} (RMS {:g}{})', 'p_fail': 'FAIL', 'p_x': 'trial', 'p_y': 'J (log)',
            'p_title': 'J history (COMPLETE {}, n_startup = {}, T = {:g} s, T_FF = {:g} s)',
            's_x': 'DOF', 's_y': 'share of J [%] (= J_i / sum J_i)',
            's_ref': 'Share of each DOF in J: reference (FF=0, mean of {} trials), J = {:.4g}',
            's_best': 'Share of each DOF in J: best (trial {}), J = {:.4g}'},
 }
+ERR_NORM_LABELS = {'dP': 'ΔP_i で割る（無次元。従来どおり）', 'none': 'ΔP_i で割らない [count²]'}
 SAVE_LANG = 'en'        # 保存する画像（DOF/DOF<d>/*.png）の文字。GUI のグラフタブは日本語のまま
 FAIL_COLORS = {'presend': '#999999', 'tabu': '#bbbb00', 'unsafe': '#d62728', 'comm': '#9467bd', 'sensor': '#8c564b',
                'eval': '#e377c2', 'stopped': '#7f7f7f', 'orphan': '#17becf', 'error': '#000000'}
@@ -837,7 +842,8 @@ def plot_progress(ax, hist, info, L=SAVE_LANG):
     if rj:
         ax.axhline(float(np.mean(rj)), color='k', ls='--', label=X['p_ref'].format(np.mean(rj)))
     if info.get('J_thr'):
-        ax.axhline(info['J_thr'], color='r', ls=':', label=X['p_thr'].format(info['J_thr'], info.get('rms_thr') or 0))
+        ax.axhline(info['J_thr'], color='r', ls=':',
+                   label=X['p_thr'].format(info['J_thr'], info.get('rms_thr') or 0, info.get('rms_unit', '%')))
     fails = [h for h in hist if h['state'] == 'FAIL']
     if fails:
         tr = mtrans.blended_transform_factory(ax.transData, ax.transAxes)
@@ -1085,6 +1091,12 @@ def cfg_eval_min(cfg):
     return float(cfg.get('eval_min', c.EVAL_MIN_S))
 
 
+def cfg_err_norm(cfg):
+    """評価値の正規化 'dP'（ΔP_i で割る。既定・従来）/ 'none'（割らない [count²]）。2026-11-12 より前の config.json にはない"""
+    v = cfg.get('err_norm', 'dP')
+    return v if v in c.ERR_NORMS else 'dP'
+
+
 def cfg_eval_time(cfg):
     """評価区間の長さ max(1.5T, E) [s]（T は動作完了時間）"""
     return c.eval_time(cfg['T'], cfg_eval_min(cfg))
@@ -1139,6 +1151,8 @@ class OptimizationRun:
              'target_hash': target_hash}
         if cfg_T_ff(cfg) != float(cfg['T']):
             d['T_ff'] = cfg_T_ff(cfg)
+        if cfg_err_norm(cfg) != 'dP':                # ΔP で割らない評価値（割る場合は従来と同じ hash）
+            d['err_norm'] = cfg_err_norm(cfg)
         return d
 
     @staticmethod
@@ -1237,7 +1251,8 @@ class OptimizationRun:
         log(f"最適化対象 DOF {self.dofs}  動作完了時間 T = {T} s, FF 入力時間 T_FF = {T_ff} s, "
             f"評価区間 max(1.5T, {E:g} s) = {c.eval_time(T, E):.3f} s（{c.n_eval(T, E) + 1} 配信, 100 Hz）, "
             f"Sampler {cfg['sampler']}（seed {cfg['seed']}）, 最大試行数 {cfg['max_trials']}, "
-            f"閾値 J ≤ {cfg['J_thr']:.3g}（RMS {cfg['rms_thr']:g}%）")
+            f"閾値 J ≤ {cfg['J_thr']:.3g}（RMS {cfg['rms_thr']:g} {c.rms_unit(cfg_err_norm(cfg))}）, "
+            f"評価値 {'ΔP_i で割る' if cfg_err_norm(cfg) == 'dP' else 'ΔP_i で割らない [count²]'}")
         log("FF の可行域の表を用意しています（初回だけ十数秒かかります）…")
         table = self._compute(c.ffmap_table_cached, cfg['m'], cfg['sep'])
         table.save(os.path.join(self.folder, 'ffmap_table.npz'))
@@ -1295,11 +1310,11 @@ class OptimizationRun:
                 log(f"  DOF {d}: 警告: {w}")
         J_refs = []
         for m in refs:
-            J, J_i = c.evaluate(m.series, self.targets)
+            J, J_i = c.evaluate(m.series, self.targets, cfg_err_norm(self.cfg))
             J_refs.append(J)
             for d in self.dofs:
                 self.targets[d].J_ref.append(J_i[d])
-        J_noise, J_quant = c.noise_floor(list(self.targets.values()), ys_by, vs_by)
+        J_noise, J_quant = c.noise_floor(list(self.targets.values()), ys_by, vs_by, cfg_err_norm(cfg))
         sigma = float(np.std(J_refs, ddof=1)) if len(J_refs) >= 2 else float('nan')
         for sp in self.targets.values():
             sp.J_noise, sp.J_quant = J_noise, J_quant
@@ -1332,7 +1347,7 @@ class OptimizationRun:
         c.write_json_atomic(os.path.join(self.folder, 'run.json'), self.run_meta)
         self.study.study.set_user_attr('cond_hash', self.run_meta['cond_hash'])
         self.study.study.set_user_attr('target_hash', target_hash)
-        self.trials_csv = c.TrialsCsv(self.path('trials.csv'), c.trial_columns(self.dofs))
+        self.trials_csv = c.TrialsCsv(self.path('trials.csv'), c.trial_columns(self.dofs, cfg_err_norm(self.cfg)))
         for u, attrs in seeds:
             self.study.enqueue(u, attrs)
         for u, J, attrs, row in past:
@@ -1379,7 +1394,7 @@ class OptimizationRun:
         c.write_json_atomic(os.path.join(folder, 'run.json'), self.run_meta)
         n_orphan = self.study.handle_orphans()
         log(f"Sampler {cfg['sampler']} を seed {self.study.seed} で作り直しました。孤立した試行 {n_orphan} 個を FAIL にしました")
-        self.trials_csv = c.TrialsCsv(self.path('trials.csv'), c.trial_columns(self.dofs))
+        self.trials_csv = c.TrialsCsv(self.path('trials.csv'), c.trial_columns(self.dofs, cfg_err_norm(self.cfg)))
         for t in self.study.trials():
             if t.state.name in ('COMPLETE', 'FAIL'):
                 self.hist.append({'n': t.number, 'state': t.state.name, 'J': t.user_attrs.get('J'),
@@ -1510,7 +1525,7 @@ class OptimizationRun:
             try:
                 ser, _info = c.extract_series(rec.raw, cfg['initial'], cfg['target'], self.dofs, rec.t_target, T,
                                               eval_min=E)
-                J, J_i = c.evaluate(ser, self.targets)
+                J, J_i = c.evaluate(ser, self.targets, cfg_err_norm(self.cfg))
             except Exception as exc:
                 self.log(f"  過去の試行 {name}: 解析できません（{exc}）")
                 continue
@@ -1523,7 +1538,7 @@ class OptimizationRun:
                 continue
             attrs = {'past_file': name, 'J_i': {str(d): v for d, v in J_i.items()},
                      'ext_sent': {str(d): list(v) for d, v in ext.items()}}
-            row = {'J': J, 'log10J': math.log10(max(J, 1e-12)), 'RMS_percent': c.rms_percent(J)}
+            row = {'J': J, 'log10J': math.log10(max(J, 1e-12)), c.rms_column(cfg_err_norm(cfg)): c.rms_value(J, cfg_err_norm(cfg))}
             out.append((u, J, attrs, row))
             self.log(f"  過去の試行 {name} を学習データに入れます（J = {J:.4g}）")
         return out
@@ -1611,7 +1626,8 @@ class OptimizationRun:
                          f"追いつかなかった分）")
 
     def _npz_extra(self, m, ff_rows):
-        ex = {'ff_sent_rows': np.asarray(ff_rows, dtype=np.float32).astype(float), 'time_axis': '100Hz'}
+        ex = {'ff_sent_rows': np.asarray(ff_rows, dtype=np.float32).astype(float), 'time_axis': '100Hz',
+              'err_norm': cfg_err_norm(self.cfg)}                 # x_J がどちらの評価値か
         for b, inf in m.info.items():
             ex[f'{b}_j0'] = inf['j0']
             ex[f'{b}_n_drop'] = inf['n_drop']
@@ -1756,7 +1772,7 @@ class OptimizationRun:
             return self._fail(trial, 'eval', exc.reason, row, attrs, files)
         st.stage(trial, 'evaluating')
         self._log_ticks(m)
-        J, J_i = c.evaluate(m.series, self.targets)
+        J, J_i = c.evaluate(m.series, self.targets, cfg_err_norm(self.cfg))
         name = f'trial_{n:03d}.npz'
         extra = self._npz_extra(m, sent)
         extra.update({'J': J if np.isfinite(J) else np.nan})
@@ -1772,11 +1788,11 @@ class OptimizationRun:
                       'P0': {str(d): s.P0 for d, s in m.series.items()}})
         st.tell_complete(trial, J, attrs)
         row.update({'trial': n, 'state': 'COMPLETE', 'J': J, 'log10J': math.log10(max(J, 1e-12)),
-                    'RMS_percent': c.rms_percent(J), 'remeasure': len(m.attempts),
+                    c.rms_column(cfg_err_norm(cfg)): c.rms_value(J, cfg_err_norm(cfg)), 'remeasure': len(m.attempts),
                     'missing_max': max(s.missing() for s in m.series.values()),
                     'finished_at': time.strftime('%Y-%m-%d %H:%M:%S')})
         self._after_complete(n, J, J_i, m, sent, designs, row, attrs)
-        log(f"  試行 {n}: J = {J:.4g}（RMS {c.rms_percent(J):.2f}% of ΔP）  "
+        log(f"  試行 {n}: J = {J:.4g}（RMS {c.rms_value(J, cfg_err_norm(cfg)):.3g} {c.rms_unit(cfg_err_norm(cfg))}）  "
             + "  ".join(f"DOF{d}: {J_i[d]:.4g}" for d in self.dofs)
             + (f"  測り直し {len(m.attempts)} 回" if m.attempts else ''))
         return {'kind': 'complete', 'J': J, 'sent': sent, 'params': dict(trial.params)}
@@ -1812,7 +1828,7 @@ class OptimizationRun:
             m = c.measure_with_retries(self.link, cfg['initial'], cfg['target'], self.dofs, sent, cfg['T'], cfg['wait'],
                                        self.safety, self.stop, log, rest_ref, T_ff=cfg_T_ff(cfg),
                                        eval_min=cfg_eval_min(cfg))
-            J2, J_i2 = c.evaluate(m.series, self.targets)
+            J2, J_i2 = c.evaluate(m.series, self.targets, cfg_err_norm(self.cfg))
             if not np.isfinite(J2):
                 fail = ('eval', 'J を計算できません', None)
         except c.StopRequested:
@@ -1841,7 +1857,7 @@ class OptimizationRun:
             row.update({f'd{d}_J_i': J_i2[d], f'd{d}_P0': s.P0, f'd{d}_delta_P0': s.P0 - self.targets[d].P0_ref,
                         f'd{d}_missing': s.missing()})
         row.update({'trial': ft.number, 'state': 'COMPLETE', 'J': J2, 'log10J': math.log10(max(J2, 1e-12)),
-                    'RMS_percent': c.rms_percent(J2), 'remeasure': len(m.attempts),
+                    c.rms_column(cfg_err_norm(cfg)): c.rms_value(J2, cfg_err_norm(cfg)), 'remeasure': len(m.attempts),
                     'missing_max': max(s.missing() for s in m.series.values()),
                     'finished_at': time.strftime('%Y-%m-%d %H:%M:%S')})
         self._after_complete(ft.number, J2, J_i2, m, sent, designs, row, attrs)
@@ -1925,8 +1941,11 @@ class OptimizationRun:
             ('写像', 'A_max / |A| の下限', f"{cfg['A_max']} / {c.A_MIN}", '[PWM]'),
             ('目標軌道', 'ε', cfg['eps'], '完了: t ≥ T で |y| ≤ ε|ΔP|'),
             ('目標軌道', 'ξ の上限 / ωn の上限', f"{c.XI_CAP:.6g} / {c.WN_MAX:g}", 'ξ ≤ ln 10'),
-            ('評価', '累積誤差', 'J_i = mean((POT − Target)/ΔP)²', 'J = 対象自由度の平均'),
-            ('評価', '終了閾値 J', cfg['J_thr'], f"RMS {cfg['rms_thr']}%"),
+            ('評価', '累積誤差', 'J_i = mean((POT − Target)/ΔP)²' if cfg_err_norm(cfg) == 'dP'
+             else 'J_i = mean(POT − Target)² [count²]', 'J = 対象自由度の平均'),
+            ('評価', '評価値の正規化', cfg_err_norm(cfg),
+             'dP: J_i を ΔP_i² で割る（無次元） / none: 割らない [count²]'),
+            ('評価', '終了閾値 J', cfg['J_thr'], f"RMS {cfg['rms_thr']} {c.rms_unit(cfg_err_norm(cfg))}"),
             ('評価', '基準試行の回数', cfg['n_ref'], ''),
             ('評価', '基準試行の J / σ_J', f"{meta.get('J_ref')} / {meta.get('sigma_J')}", ''),
             ('評価', 'J_noise / 量子化の下限', f"{meta.get('J_noise')} / {meta.get('J_quant')}", ''),
@@ -1969,7 +1988,8 @@ class OptimizationRun:
     def _progress_info(self):
         """分析フォルダの J_progress.png に書く条件"""
         return {'J_ref': list(self.run_meta.get('J_ref') or []), 'J_thr': self.cfg['J_thr'],
-                'rms_thr': self.cfg.get('rms_thr'), 'n_startup': self.run_meta.get('n_startup'), 'T': self.cfg['T'],
+                'rms_thr': self.cfg.get('rms_thr'), 'rms_unit': '%' if cfg_err_norm(self.cfg) == 'dP' else ' count',
+                'n_startup': self.run_meta.get('n_startup'), 'T': self.cfg['T'],
                 'T_ff': cfg_T_ff(self.cfg)}
 
     def _save_all(self):
@@ -2149,7 +2169,15 @@ class App:
         self.basic.add('wait', "初期姿勢に戻った後の待機時間 [s]", s.get('wait', 5.0), note="実際は max(待機時間, T_FF+0.5)")
         self.basic.add('n_ref', "基準試行（FF=0）の回数", s.get('n_ref', 2), note="2回以上で試行間のばらつきを推定する")
         self.basic.add('max_trials', "最大試行数（COMPLETE の数）", s.get('max_trials', 40))
+        ttk.Label(self.basic.frame, text="評価値 J_i").grid(row=self.basic.row, column=0, sticky='w', padx=4, pady=2)
+        self.norm_var = tk.StringVar(value=ERR_NORM_LABELS.get(s.get('err_norm', 'dP'), ERR_NORM_LABELS['dP']))
+        self.norm_cb = ttk.Combobox(self.basic.frame, textvariable=self.norm_var, values=list(ERR_NORM_LABELS.values()),
+                                    state='readonly', width=34)
+        self.norm_cb.grid(row=self.basic.row, column=1, columnspan=2, sticky='w', padx=4, pady=2)
+        self.basic.row += 1
         self.basic.add('rms_thr', "終了閾値 RMS [% of ΔP]", s.get('rms_thr', 1.0), note="J_thr = (RMS/100)²（1% → 1e−4）")
+        self.norm_var.trace_add('write', lambda *a: self._norm_changed())
+        self._norm_changed()
         self.basic.add('eps', "完了の許容 ε [% of ΔP]", s.get('eps', 2.0), note="目標軌道は t ≥ T で |y| ≤ ε|ΔP|")
         self.basic.add('A_max', "FF の振幅の上限 A_max [PWM]", s.get('A_max', 255.0), note="≤ 255。最初の実機確認では小さく")
         self.basic.add('base', "保存先フォルダ", s.get('base', os.path.expanduser('~/ArmRobot/optimize_data')), width=50)
@@ -2334,6 +2362,7 @@ class App:
         if sampler == 'GP' and not self.torch_ok:
             raise ValueError(f"GP は選べません: {self.torch_why}")
         rms = parse_float(b.get('rms_thr'), '終了閾値 RMS', positive=True)
+        err_norm = self.err_norm()
         base = b.get('base').strip()
         if not base:
             raise ValueError("保存先フォルダを指定してください")
@@ -2358,7 +2387,8 @@ class App:
             'wait': parse_float(b.get('wait'), '待機時間', lo=0.0, hi=600.0),
             'n_ref': int(parse_float(b.get('n_ref'), '基準試行の回数', lo=1, hi=10)),
             'max_trials': int(parse_float(b.get('max_trials'), '最大試行数', lo=1, hi=100000)),
-            'rms_thr': rms, 'J_thr': (rms / 100.0) ** 2,
+            'rms_thr': rms, 'err_norm': err_norm,
+            'J_thr': (rms / 100.0) ** 2 if err_norm == 'dP' else rms ** 2,     # 'none' の RMS は count
             'eps': parse_float(b.get('eps'), 'ε', positive=True, hi=50.0) / 100.0, 'A_max': A_max, 'base': base,
             'sampler': sampler, 'seed': int(parse_float(sr.get('seed'), 'seed', lo=0, hi=2 ** 31 - 1)),
             'm': parse_float(sr.get('m'), 'm', lo=0.001, hi=0.2), 'sep': parse_float(sr.get('sep'), 'sep', lo=0.001, hi=0.3),
@@ -2419,7 +2449,8 @@ class App:
         return {
             'T': b.get('T'), 'T_ff': b.get('T_ff'), 'eval_min': b.get('eval_min'), 'dofs': b.get('dofs'),
             'wait': b.get('wait'), 'n_ref': b.get('n_ref'),
-            'max_trials': b.get('max_trials'), 'rms_thr': b.get('rms_thr'), 'eps': b.get('eps'), 'A_max': b.get('A_max'),
+            'max_trials': b.get('max_trials'), 'rms_thr': b.get('rms_thr'), 'err_norm': self.err_norm(),
+            'eps': b.get('eps'), 'A_max': b.get('A_max'),
             'base': b.get('base'),
             'sampler': self.sampler_var.get(), 'seed': sr.get('seed'), 'm': sr.get('m'), 'sep': sr.get('sep'),
             'rho': sr.get('rho'), 'tabu_on': bool(self.tabu_var.get()), 'seed_csv': self.seed_files.get(),
@@ -2452,10 +2483,24 @@ class App:
             except ValueError as exc:
                 messagebox.showwarning("Settings", f"設定は保存しましたが、正しくない値があります（開始できません）:\n{exc}")
 
+    def err_norm(self):
+        """選んだ評価値の正規化（'dP' / 'none'）"""
+        return next((k for k, v in ERR_NORM_LABELS.items() if v == self.norm_var.get()), 'dP')
+
+    def _norm_changed(self):
+        """評価値の選択に合わせて、終了閾値の単位の表示を変える（ΔP で割るなら % of ΔP、割らないなら count）"""
+        if self.err_norm() == 'dP':
+            self.basic.labels['rms_thr'].configure(text="終了閾値 RMS [% of ΔP]")
+            self.basic.notes['rms_thr'].configure(text="J_thr = (RMS/100)²（1% → 1e−4）")
+        else:
+            self.basic.labels['rms_thr'].configure(text="終了閾値 RMS [count]")
+            self.basic.notes['rms_thr'].configure(text="J_thr = RMS²（5 count → 25 count²）")
+
     def show_cfg(self, cfg):
         """再開する study の設定を欄に表示する（再開中は変更できない）"""
         for k in ('T', 'wait', 'n_ref', 'max_trials', 'rms_thr', 'A_max', 'base'):
             self.basic.set(k, cfg[k])
+        self.norm_var.set(ERR_NORM_LABELS[cfg_err_norm(cfg)])
         self.basic.set('T_ff', cfg_T_ff(cfg))            # 分ける前の study は T_FF = T、固定値 5 秒
         self.basic.set('eval_min', cfg_eval_min(cfg))
         self.basic.set('eps', cfg['eps'] * 100.0)
@@ -2551,6 +2596,7 @@ class App:
         if not messagebox.askokcancel("Start", f"ロボットが動きます。\n\n最適化対象:\n{moves}\n\n"
                                                f"T = {cfg['T']} s, T_FF = {cfg['T_ff']} s, "
                                                f"評価区間 {cfg_eval_time(cfg):g} s, "
+                                               f"評価値 {ERR_NORM_LABELS[cfg['err_norm']]}, "
                                                f"基準試行 {cfg['n_ref']} 回, 最大試行数 {cfg['max_trials']}, "
                                                f"A_max = {cfg['A_max']:g} PWM, Sampler {cfg['sampler']}\n\n開始しますか？"):
             return
