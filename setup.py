@@ -82,6 +82,7 @@ setup(
             'view_optimization_2=py_pkg.view_optimization_2:main',
             'GUI_android_tk=py_pkg.GUI_android_tk:main',
             'GUI_android_tk_ADRCparamChg=py_pkg.GUI_android_tk_ADRCparamChg:main',
+            'GUI_android_tk_cfFF=py_pkg.GUI_android_tk_cfFF:main',
             'GUI_android_tk_FFsetting=py_pkg.GUI_android_tk_FFsetting:main'
         ],
     },
