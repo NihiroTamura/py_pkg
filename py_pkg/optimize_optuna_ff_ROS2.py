@@ -1103,8 +1103,11 @@ def cfg_eval_time(cfg):
 
 
 class OptimizationRun:
-    def __init__(self, link, cfg, log, stop_event, events, lang='ja', resume_folder=None, offload=None):
+    def __init__(self, link, cfg, log, stop_event, events, lang='ja', resume_folder=None, offload=None,
+                 enqueue_ff0=None):
         self.offload = offload                          # 別プロセスでの描画・計算（None ならこのスレッドで行う）
+        # 最初に全自由度 FF=0 の候補を入れるか（2026-11-12）。None なら設定（cfg['seed_ff0']）に従う。再開のときは GUI で指定
+        self.enqueue_ff0 = bool(cfg.get('seed_ff0', False)) if enqueue_ff0 is None else bool(enqueue_ff0)
         self.render_futures = []
         self.link = link
         self.cfg = cfg
@@ -1333,11 +1336,14 @@ class OptimizationRun:
         params = refs[-1].rec.params
         cond = self.cond_dict(cfg, params, target_hash)
         seeds = self._seed_candidates()
+        x0 = self.study_params_x0(seeds)                # CMA-ES の始点は従来どおり（FF=0 の候補では決めない）
+        if self.enqueue_ff0:
+            seeds.insert(0, (self._ff0_candidate(), {'source': 'seed_ff0'}))
+            log("  最初の候補として、全自由度 FF=0（振幅は下限の 1 PWM）の試行を enqueue します")
         past = self._past_candidates(refs[0])
         D = 4 * len(self.dofs)
         n_prior = len(seeds) + len(past)
         n_startup = n_prior + max(10, 2 * D)
-        x0 = self.study_params_x0(seeds)
         self.study = c.FFStudy(self.folder, self.dofs, cfg['A_max'], cfg['sampler'], cfg['seed'], n_startup, self.ffmap,
                                cfg['rho'], cfg['tabu_on'], resume=False, x0=x0, log=log)
         self.run_meta = {'cond': cond, 'cond_hash': c.condition_hash(cond), 'target_hash': target_hash,
@@ -1361,6 +1367,11 @@ class OptimizationRun:
             f"n_startup = {n_startup}（= {n_prior} + max(10, 2×{D})）")
         c.write_kv_csv(self.path('conditions.csv'), self._conditions_rows())
         self._emit_setup()
+
+    def _ff0_candidate(self):
+        """全自由度 FF=0 の候補。A = 0 は写像で |A| の下限（A_MIN = 1 PWM）に寄せられるので、最大 1 PWM の FF になる
+        （ファームの弁への指令は 128 ± (ADRC + FF)/2 の切り捨てなので、ほぼ FF=0）。極値の位置と高さの比は範囲の中央"""
+        return {d: {'u1': 0.5, 'u2': 0.5, 'u3': 0.5, 'A': 0.0} for d in self.dofs}
 
     def study_params_x0(self, seeds):
         if seeds:
@@ -1394,6 +1405,9 @@ class OptimizationRun:
         c.write_json_atomic(os.path.join(folder, 'run.json'), self.run_meta)
         n_orphan = self.study.handle_orphans()
         log(f"Sampler {cfg['sampler']} を seed {self.study.seed} で作り直しました。孤立した試行 {n_orphan} 個を FAIL にしました")
+        if self.enqueue_ff0:
+            self.study.enqueue(self._ff0_candidate(), {'source': 'seed_ff0'})
+            log("  再開の最初の候補として、全自由度 FF=0（振幅は下限の 1 PWM）の試行を enqueue しました")
         self.trials_csv = c.TrialsCsv(self.path('trials.csv'), c.trial_columns(self.dofs, cfg_err_norm(self.cfg)))
         for t in self.study.trials():
             if t.state.name in ('COMPLETE', 'FAIL'):
@@ -1957,6 +1971,8 @@ class OptimizationRun:
             ('Optuna', 'study', f"{c.STUDY_NAME} / study.journal", 'JournalStorage(JournalFileBackend)'),
             ('Optuna', '近傍棄却', f"{'有効' if cfg['tabu_on'] else '無効'} ρ = {cfg['rho']}", ''),
             ('Optuna', '初期候補（結果 CSV）', '; '.join(cfg.get('seed_csv', [])), ''),
+            ('Optuna', '最初に全自由度 FF=0 の候補', 'あり' if self.enqueue_ff0 else 'なし',
+             'この実行（開始または再開）で enqueue したか'),
             ('Optuna', '過去の npz', '; '.join(cfg.get('past_npz', [])) if cfg.get('use_past') else '使わない', ''),
             ('Optuna', '条件 hash', meta.get('cond_hash'), ''),
             ('Optuna', 'target hash', meta.get('target_hash'), ''),
@@ -2204,6 +2220,10 @@ class App:
         ttk.Checkbutton(fr, text="近傍棄却（FF が原因で安全中断した点の近くは実機に送らない）", variable=self.tabu_var).grid(
             row=self.search.row, column=0, columnspan=3, sticky='w', padx=4)
         self.search.row += 1
+        self.ff0_var = tk.BooleanVar(value=s.get('seed_ff0', False))
+        ttk.Checkbutton(fr, text="最初に全自由度 FF=0 の候補を入れる（新しい study でも再開でも。振幅は下限の 1 PWM）",
+                        variable=self.ff0_var).grid(row=self.search.row, column=0, columnspan=3, sticky='w', padx=4)
+        self.search.row += 1
         self.seed_files = FileList(tab_s, "初期候補（(a)(b) 結果 CSV。最後の行の極値を enqueue する）",
                                    s.get('seed_csv', []), [('CSV', '*.csv')])
         self.use_past_var = tk.BooleanVar(value=s.get('use_past', False))
@@ -2394,6 +2414,7 @@ class App:
             'm': parse_float(sr.get('m'), 'm', lo=0.001, hi=0.2), 'sep': parse_float(sr.get('sep'), 'sep', lo=0.001, hi=0.3),
             'rho': parse_float(sr.get('rho'), 'ρ', lo=0.0, hi=2.0), 'tabu_on': bool(self.tabu_var.get()),
             'seed_csv': self.seed_files.get(), 'past_npz': self.past_files.get(), 'use_past': bool(self.use_past_var.get()),
+            'seed_ff0': bool(self.ff0_var.get()),
             'safety': safety,
             'limits': {'norobot': int(parse_float(sa.get('lim_norobot'), '上限', lo=1, hi=10000)),
                        'unsafe': int(parse_float(sa.get('lim_unsafe'), '上限', lo=1, hi=10000)),
@@ -2454,7 +2475,7 @@ class App:
             'base': b.get('base'),
             'sampler': self.sampler_var.get(), 'seed': sr.get('seed'), 'm': sr.get('m'), 'sep': sr.get('sep'),
             'rho': sr.get('rho'), 'tabu_on': bool(self.tabu_var.get()), 'seed_csv': self.seed_files.get(),
-            'use_past': bool(self.use_past_var.get()), 'past_npz': self.past_files.get(),
+            'use_past': bool(self.use_past_var.get()), 'past_npz': self.past_files.get(), 'seed_ff0': bool(self.ff0_var.get()),
             'safety': {k: sa.get(k) for k in ('sensor_lo', 'sensor_hi', 'dev_const', 'rest_tol', 'still_wait',
                                               'missing_tol', 'remeasure_max')}
             | {'joint': [[a.get(), b_.get()] for a, b_ in self.joint.vars]},
@@ -2576,7 +2597,7 @@ class App:
         self.p_dirty = True
         self._make_figure(cfg['dofs'])
         self.run_obj = OptimizationRun(self.link, cfg, self.log, self.stop_event, self.events, self.lang, resume_folder,
-                                       offload=self.offload)
+                                       offload=self.offload, enqueue_ff0=bool(self.ff0_var.get()))
         self.worker = threading.Thread(target=self.run_obj.run, daemon=True)
         self.worker.start()
         self.lock(True)
