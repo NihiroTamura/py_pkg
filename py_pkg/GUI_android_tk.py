@@ -166,6 +166,16 @@ RANDOM_SERIES_INTERVAL_MIN = 0.1        # 間隔の範囲 [s]
 RANDOM_SERIES_INTERVAL_MAX = 3600.0
 RANDOM_SERIES_COUNT_MAX = 100000        # 回数の上限
 
+# 線形入力: Step Input・プリセット・Random（連続ランダム送信を含む）の目標値を、操作した時点の目標値から
+#   指定した時間をかけて一定の速さで変える。スライダー操作と Reset pose は対象外（従来どおり即時）。
+#   ファームは受信した最後の目標値を使い続けるだけなので、途中の目標値をGUIから一定間隔で送る。
+#   ※ファームは目標値の値が変わった周回で FF の開始時刻 t_start を更新するので、線形入力中に変わり続ける
+#     自由度の FF は毎周 t=0 に戻り、実質的に到達した後から掛かる（GUIでは対処しない。2026-11-22 ユーザー指示）。
+#   ※時間はPC（WSL2）の時計で測る。WSL2 の時計が遅れている分だけ、実際の所要時間は長くなる。
+LINEAR_PUBLISH_PERIOD = 0.010           # 線形入力中に途中の目標値を送る間隔 [s]（ボードの配信周期 10 ms・制御1周 約11 ms とそろえる）
+LINEAR_TIME_DEFAULT = 2.0               # 線形入力時間の初期値 [s]
+LINEAR_TIME_MAX = 3600.0                # 線形入力時間の上限 [s]（0 は即時＝ステップと同じ）
+
 # ------------------------------
 # 自由度(DOF)とボードの対応・トピック
 # ------------------------------
@@ -192,7 +202,8 @@ SENSOR_QOS_DEPTH = 100
 #        "initial_pose": [26個], "presets": [[26個] または null（未登録）, ×5],
 #        "graph_dofs": [グラフを表示するDOF番号, ...],
 #        "record_dir": 記録の保存先フォルダ（null なら起動したフォルダ）, "record_duration": 記録時間 [s],
-#        "random_interval": 連続ランダム送信の間隔 [s], "random_count": 連続ランダム送信の回数}
+#        "random_interval": 連続ランダム送信の間隔 [s], "random_count": 連続ランダム送信の回数,
+#        "linear_enabled": 線形入力を使うか, "linear_time": 線形入力時間 [s]}
 SETTINGS_FILE = os.path.expanduser('~/.armrobot_gui_android_tk.json')
 NUM_PRESETS = 5
 # 「現在の目標値をプリセットに登録」ボタンの登録先（プリセット5）。これ以外はタブで編集する
@@ -231,7 +242,7 @@ RECORD_PARTS_DIR = '.parts'     # 記録中にトピックごとに書く一時C
 # 他プログラムからの目標値変更への追従
 # ------------------------------
 OWN_ECHO_KEEP_SEC = 5.0     # GUIが送った値をこの時間は「自分の送信の折り返し」として無視する
-OWN_SENT_KEEP = 256         # 上の判定のために覚えておく送信の最大数（スライダのドラッグ中は連続送信になる）
+OWN_SENT_KEEP = 2048        # 上の判定のために覚えておく送信の最大数（線形入力中は10 msごと、スライダのドラッグ中も連続送信になる）
 ECHO_SYNC_QUIET_SEC = 1.0   # 目標値トピックの送受信がこの時間なければ、ボードが使っている目標値に表示を合わせる
 ECHO_SYNC_STABLE_SEC = 0.5  # ただしボードの目標値がこの時間変化していない（落ち着いている）ときだけ
 
@@ -248,6 +259,8 @@ def default_settings():
         'record_duration': RECORD_DURATION_DEFAULT,
         'random_interval': RANDOM_SERIES_INTERVAL_DEFAULT,
         'random_count': RANDOM_SERIES_COUNT_DEFAULT,
+        'linear_enabled': False,
+        'linear_time': LINEAR_TIME_DEFAULT,
     }
 
 
@@ -323,6 +336,19 @@ def load_settings(path=None):
     elif count is not None:
         bad.append("random_count")
 
+    linear_enabled = data.get('linear_enabled')
+    if isinstance(linear_enabled, bool):
+        settings['linear_enabled'] = linear_enabled
+    elif linear_enabled is not None:
+        bad.append("linear_enabled")
+
+    linear_time = data.get('linear_time')
+    if (isinstance(linear_time, (int, float)) and not isinstance(linear_time, bool)
+            and 0 <= linear_time <= LINEAR_TIME_MAX):
+        settings['linear_time'] = float(linear_time)
+    elif linear_time is not None:
+        bad.append("linear_time")
+
     if bad:
         return settings, (f"{path} の次の項目が不正なため既定値にしました:\n  " + ", ".join(bad)
                           + "\n（初期姿勢・プリセットは26個の数値のリストである必要があります）")
@@ -349,6 +375,8 @@ def save_settings(settings, path=None):
         'record_duration': float(settings['record_duration']),
         'random_interval': float(settings['random_interval']),
         'random_count': int(settings['random_count']),
+        'linear_enabled': bool(settings['linear_enabled']),
+        'linear_time': float(settings['linear_time']),
     }
     tmp = path + '.tmp'
     with open(tmp, 'w') as f:
@@ -767,8 +795,20 @@ class PotGuiNode(Node):
         # ADRCパラメータの送信と、Teensy が返す現在設定値の受信
         self.adrc = adrc.AdrcParamLink(self)
 
+        # desired = いま送っている目標値（線形入力中は途中の値）、goal = 最終目標値（線形入力の到達先。即時なら desired と同じ）
+        #   GUIの表示（Step Input 欄・スライダー・Desired）は goal を使う
         self.desired = [float(v) for v in initial_desired]
+        self.goal = list(self.desired)
         self.real_raw = [0.0]*26
+
+        # 線形入力: {'start': 開始値, 'end': 最終目標値, 't0': 開始時刻, 'duration': 線形入力時間 [s],
+        #            'ramping': 自由度ごとに線形入力中か（スライダーで動かした自由度は外す）}。線形入力中でなければ None
+        #   途中の目標値は ROS の受信と同じスレッドのタイマーで送る（GUIの描画に左右されない）。
+        #   desired・goal・ramp・own_sent は GUIスレッドとタイマーの両方から触るので target_lock で守る
+        self.target_lock = threading.RLock()
+        self.ramp = None
+        self.ramp_end_reason = None         # 最後の線形入力の終わり方: 'done'（到達）/ 'external'（他プログラム）/ 'immediate'（即時の送信）
+        self.create_timer(LINEAR_PUBLISH_PERIOD, self.ramp_tick)
 
         # ボードが実際に使っている目標値（実測トピックの [6..11]）。未受信の自由度は None
         self.board_desired = [None]*26
@@ -778,8 +818,12 @@ class PotGuiNode(Node):
         # 目標値トピックの送受信の記録（他プログラムによる変更かどうかの判定に使う）
         self.last_publish_time = 0.0        # GUIが最後に送信した時刻
         self.last_cmd_recv_time = 0.0       # 目標値トピックを最後に受信した時刻（自分の送信の折り返しも含む）
-        self.own_sent = deque(maxlen=OWN_SENT_KEEP)     # GUIが送った目標値 (送信時刻, float32に丸めた値)
-        # 受信した目標値 (受信時刻, 値)。node.desired はGUIスレッドだけが書き換えるので、ここで受け渡す
+        self.own_sent = deque()             # GUIが送った目標値 (送信時刻, float32に丸めた値)。古いものから消す
+        self.own_sent_count = {}            # float32に丸めた値 -> own_sent の中の個数（受信ごとに速く判定するため）
+        # GUIが最後に送信操作をした時刻（線形入力の途中の送信は含まない）。これより前に受信した他プログラムの目標値は、
+        # 後からGUIが送り直しているので反映しない
+        self.last_action_time = 0.0
+        # 受信した目標値 (受信時刻, 値, GUI自身の送信か)。GUIの表示への反映はGUIスレッドで行うので、ここで受け渡す
         self.cmd_queue = queue.SimpleQueue()
         # 目標値トピックで最後に受信した値（記録開始の判定に使う。自分の送信の折り返しも含む）
         self.last_cmd_values = None
@@ -867,7 +911,11 @@ class PotGuiNode(Node):
             session.trigger(t)
         self.last_cmd_values = values
         self.last_cmd_recv_time = t
-        self.cmd_queue.put((t, values))
+        own = self.is_own_payload(values)
+        if not own:
+            # 他プログラムが目標値を送ってきたら線形入力をすぐにやめる（途中の目標値で上書きし続けないように）
+            self.stop_ramp_for_external()
+        self.cmd_queue.put((t, values, own))
 
     def target_changed(self, values):
         """受信した目標値が、直前の目標値と1つの自由度でも違うか"""
@@ -883,26 +931,111 @@ class PotGuiNode(Node):
                     return True
         return False
 
+    def _forget_own(self):
+        _, old = self.own_sent.popleft()
+        n = self.own_sent_count[old] - 1
+        if n:
+            self.own_sent_count[old] = n
+        else:
+            del self.own_sent_count[old]
+
     def is_own_payload(self, values):
         """受信した目標値が、GUI自身が最近送ったものと同じか"""
-        now = time.monotonic()
-        while self.own_sent and now - self.own_sent[0][0] > OWN_ECHO_KEEP_SEC:
-            self.own_sent.popleft()
-        return any(values == sent for _, sent in self.own_sent)
+        with self.target_lock:
+            now = time.monotonic()
+            while self.own_sent and now - self.own_sent[0][0] > OWN_ECHO_KEEP_SEC:
+                self._forget_own()
+            return tuple(values) in self.own_sent_count
 
     def publish(self):
-        msg = Float32MultiArray()
-        # ROS2 は各要素が Python の float 型であることを要求する（int は不可）
-        msg.data = [float(v) for v in self.desired]
-        # 自分の送信がトピック経由で戻ってきたときに「他プログラムによる変更」と誤認しないよう記録する
-        now = time.monotonic()
-        self.own_sent.append((now, to_float32_tuple(msg.data)))
-        self.last_publish_time = now
-        self.publisher.publish(msg)
+        with self.target_lock:
+            msg = Float32MultiArray()
+            # ROS2 は各要素が Python の float 型であることを要求する（int は不可）
+            msg.data = [float(v) for v in self.desired]
+            # 自分の送信がトピック経由で戻ってきたときに「他プログラムによる変更」と誤認しないよう記録する
+            now = time.monotonic()
+            payload = to_float32_tuple(msg.data)
+            self.own_sent.append((now, payload))
+            self.own_sent_count[payload] = self.own_sent_count.get(payload, 0) + 1
+            if len(self.own_sent) > OWN_SENT_KEEP:
+                self._forget_own()
+            self.last_publish_time = now
+            self.publisher.publish(msg)
 
     def publish_initial(self, initial=INITIAL_DESIRED):
-        self.desired = [float(v) for v in initial]
-        self.publish()
+        self.start_targets(initial, 0.0)
+
+    # -------------------------
+    # 目標値の送信（GUIの操作から呼ぶ）
+    # -------------------------
+    def start_targets(self, values, duration):
+        """26自由度の目標値を values にする送信操作（Step Input・プリセット・Random・Reset pose）
+
+        duration > 0 なら、いま送っている目標値（線形入力の途中ならその時点の値）から duration 秒かけて線形に変える。
+        線形入力中に呼ばれたら、その時点の値を開始値として線形入力をやり直す。duration <= 0 は即時（ステップ）。
+        """
+        values = [float(v) for v in values]
+        with self.target_lock:
+            now = time.monotonic()
+            self.last_action_time = now
+            self.goal = list(values)
+            if duration > 0:
+                self.ramp = {'start': list(self.desired), 'end': values, 't0': now, 'duration': float(duration),
+                             'ramping': [True]*26}
+                self.ramp_end_reason = None
+                # 最初の途中の値は次のタイマー（10 ms 以内）で送る
+            else:
+                if self.ramp is not None:
+                    self.ramp_end_reason = 'immediate'
+                self.ramp = None
+                self.desired = list(values)
+                self.publish()
+
+    def set_dof_now(self, dof, value):
+        """1自由度の目標値をすぐに変えて送る（スライダー操作）。線形入力中ならその自由度だけ線形入力から外す"""
+        with self.target_lock:
+            self.last_action_time = time.monotonic()
+            self.desired[dof] = self.goal[dof] = float(value)
+            if self.ramp is not None:
+                self.ramp['ramping'][dof] = False
+            self.publish()
+
+    def set_targets_known(self, values_by_dof):
+        """他プログラムの目標値・ボードの目標値を反映する（送信はしない）。{DOF: 値}"""
+        with self.target_lock:
+            for dof, value in values_by_dof.items():
+                self.desired[dof] = self.goal[dof] = float(value)
+
+    def stop_ramp_for_external(self):
+        with self.target_lock:
+            if self.ramp is not None:
+                self.ramp = None
+                self.ramp_end_reason = 'external'
+
+    def ramp_status(self):
+        """線形入力の (経過秒, 線形入力時間)。線形入力中でなければ None"""
+        with self.target_lock:
+            ramp = self.ramp
+            if ramp is None:
+                return None
+            return min(time.monotonic() - ramp['t0'], ramp['duration']), ramp['duration']
+
+    def ramp_tick(self):
+        """線形入力中なら途中の目標値を送る（LINEAR_PUBLISH_PERIOD ごと）。時間が来たら最終目標値を送って終える"""
+        with self.target_lock:
+            ramp = self.ramp
+            if ramp is None:
+                return
+            alpha = (time.monotonic() - ramp['t0']) / ramp['duration']
+            done = alpha >= 1.0
+            for i in range(26):
+                if ramp['ramping'][i]:
+                    start, end = ramp['start'][i], ramp['end'][i]
+                    self.desired[i] = end if done else start + (end - start) * alpha
+            if done:
+                self.ramp = None
+                self.ramp_end_reason = 'done'
+            self.publish()
 
 
 # ------------------------------
@@ -1351,6 +1484,32 @@ class PotGuiTk:
         self.step_button = tk.Button(step, text="Send Step Input", command=self.send_step)
         self.step_button.grid(row=1, column=1, padx=(10, 0))
 
+        self.build_linear_area(step).grid(row=0, column=2, rowspan=2, padx=(12, 0), sticky="n")
+
+    def build_linear_area(self, parent):
+        """線形入力の設定（Step Input・プリセット・Random に使う。スライダー・Reset pose は即時）"""
+        box = tk.LabelFrame(parent, text="線形入力")
+        row = tk.Frame(box)
+        row.pack(fill=tk.X, padx=4, pady=(2, 0))
+        self.linear_var = tk.BooleanVar(value=self.settings['linear_enabled'])
+        tk.Checkbutton(row, text="線形入力", variable=self.linear_var,
+                       command=self.on_linear_edit).pack(side=tk.LEFT)
+        tk.Label(row, text="  時間 [s]").pack(side=tk.LEFT)
+        self.linear_time_var = tk.StringVar()
+        self.linear_time_spin = tk.Spinbox(row, from_=0, to=LINEAR_TIME_MAX, increment=0.5, width=6,
+                                           textvariable=self.linear_time_var)
+        self.linear_time_spin.pack(side=tk.LEFT, padx=(2, 0))
+        # Spinbox は作成時に値を increment の桁に丸めてしまうので、作成後に設定する
+        self.linear_time_var.set(format_value(self.settings['linear_time']))
+        self.linear_time_var.trace_add("write", lambda *a: self.on_linear_edit())
+        tk.Label(box, text="Step Input・プリセット・Random に適用\n（スライダー・Reset pose は即時）",
+                 font=(UI_FONT, 8), fg="#505050", justify="left").pack(anchor="w", padx=4)
+        self.linear_label = tk.Label(box, text="", font=(UI_FONT, 9, "bold"), fg="#0050a0", anchor="w", width=22)
+        self.linear_label.pack(anchor="w", padx=4, pady=(0, 2))
+        self.linear_running = False     # 線形入力中の表示をしているか（終わったときに結果を表示するため）
+        self.on_linear_edit()
+        return box
+
     def build_record_area(self, parent):
         row1 = tk.Frame(parent)
         row1.pack(fill=tk.X, padx=4, pady=(4, 2))
@@ -1422,7 +1581,7 @@ class PotGuiTk:
 
             if editable:
                 tk.Button(inner, text="現在の目標値", font=(UI_FONT, 8),
-                          command=lambda col=col: self.fill_pose_column(col, self.node.desired)
+                          command=lambda col=col: self.fill_pose_column(col, self.node.goal)
                           ).grid(row=1, column=gc, padx=4, pady=1, sticky="ew")
             if editable and col != 'init':
                 tk.Button(inner, text="クリア", font=(UI_FONT, 8),
@@ -1650,7 +1809,7 @@ class PotGuiTk:
         """Step Input 欄に現在の目標値を書く。手入力して未送信の欄は force でない限り触らない"""
         if not force and self.step_entry_dirty(i):
             return
-        want = str(int(self.node.desired[i]))
+        want = str(int(self.node.goal[i]))
         e = self.step_entries[i]
         if e.get() != want:
             e.delete(0, tk.END)
@@ -1677,7 +1836,7 @@ class PotGuiTk:
 
     def update_ui(self):
         mn, mx = POT_RANGE[self.current_dof]
-        desired = int(self.node.desired[self.current_dof])
+        desired = int(self.node.goal[self.current_dof])
 
         # config()/set() はどちらも command=on_slider を呼び得るのでガードしてから触る
         self.slider_programmatic = True
@@ -1688,7 +1847,7 @@ class PotGuiTk:
 
     def update_info_label(self):
         mn, mx = POT_RANGE[self.current_dof]
-        desired = int(self.node.desired[self.current_dof])
+        desired = int(self.node.goal[self.current_dof])
         self.info_label.config(text=f"Desired: {desired} Range: [{mn},{mx}]")
 
     # -------------------------
@@ -1713,14 +1872,13 @@ class PotGuiTk:
         if self.slider_programmatic:
             return
 
-        val = float(value)
-        self.node.desired[self.current_dof] = float(val)
+        # スライダー操作は線形入力の設定に関係なく即時に送る（線形入力中ならこの自由度だけ線形入力から外れる）
+        self.node.set_dof_now(self.current_dof, float(value))
 
         # Entryも同期
         self.write_step_entry(self.current_dof, force=True)
         self.update_info_label()
 
-        self.node.publish()
         self.target_known = [True]*26
 
     def after_send(self, text, overwrite=range(26)):
@@ -1731,22 +1889,87 @@ class PotGuiTk:
         self.update_ui()
         self.set_pot_status(text)
 
+    # -------------------------
+    # 線形入力
+    # -------------------------
+    def read_linear_time(self):
+        """線形入力時間 [s]。不正な値は None"""
+        try:
+            v = float(self.linear_time_var.get())
+        except ValueError:
+            return None
+        return v if 0 <= v <= LINEAR_TIME_MAX else None
+
+    def on_linear_edit(self):
+        enabled = self.linear_var.get()
+        v = self.read_linear_time()
+        # チェックを外すと時間の欄は使わないので無効にする
+        self.linear_time_spin.config(state=(tk.NORMAL if enabled else tk.DISABLED),
+                                     bg=("white" if v is not None or not enabled else "#ffc0c0"))
+        changed = enabled != self.settings['linear_enabled']
+        if v is not None and v != self.settings['linear_time']:
+            self.settings['linear_time'] = v
+            changed = True
+        if changed:
+            self.settings['linear_enabled'] = enabled
+            self.save_prefs_later()
+
+    def linear_duration(self, show_error=True):
+        """送信操作に使う線形入力時間 [s]。線形入力が無効なら 0（即時）。時間が不正なら None（送らない）"""
+        if not self.linear_var.get():
+            return 0.0
+        v = self.read_linear_time()
+        if v is None and show_error:
+            messagebox.showerror("Linear input", f"線形入力時間は 0〜{LINEAR_TIME_MAX:g} 秒で入力してください。\n"
+                                                 "目標値は送信していません。")
+        return v
+
+    def send_targets(self, values, text, overwrite=range(26), duration=None):
+        """Step Input・プリセット・Random の共通の送信処理（線形入力が有効なら線形入力で送る）
+
+        戻り値: 送ったら True（線形入力時間が不正で送らなかったら False）
+        """
+        if duration is None:
+            duration = self.linear_duration()
+        if duration is None:
+            return False
+        self.node.start_targets(values, duration)
+        if duration > 0:
+            text += f"（線形入力 {duration:g} s）"
+        self.after_send(text, overwrite)
+        self.update_linear_label()
+        return True
+
+    def update_linear_label(self):
+        status = self.node.ramp_status()
+        if status is not None:
+            elapsed, duration = status
+            self.linear_label.config(text=f"線形入力中 {elapsed:.1f} / {duration:g} s", fg="#0050a0")
+            self.linear_running = True
+        elif self.linear_running:
+            self.linear_running = False
+            reason = self.node.ramp_end_reason
+            text = {'done': "最終目標値に到達しました", 'external': "他プログラムの目標値で中止しました",
+                    'immediate': "即時の送信で中止しました"}.get(reason, "")
+            self.linear_label.config(text=text, fg="#006000" if reason == 'done' else "#c06000")
+
     def send_initial(self):
+        # Reset pose は線形入力の対象外（常に即時。2026-11-22 ユーザー指示）
         self.node.publish_initial(self.settings['initial_pose'])
         self.after_send("初期姿勢 (Reset pose) を送信しました")
+        self.update_linear_label()
 
     def send_preset(self, k):
         values = self.settings['presets'][k]
         if values is None:
             return
-        self.node.desired = [float(v) for v in values]
-        self.node.publish()
-        self.after_send(f"プリセット{k+1} を送信しました")
+        self.send_targets(values, f"プリセット{k+1} を送信しました")
 
     def register_current_preset(self):
         k = REGISTER_PRESET_INDEX
         old = self.settings['presets'][k]
-        self.settings['presets'][k] = [float(v) for v in self.node.desired]
+        # 線形入力中なら到達先（最終目標値）を登録する
+        self.settings['presets'][k] = [float(v) for v in self.node.goal]
         if not self.write_settings():
             self.settings['presets'][k] = old
             return
@@ -1759,6 +1982,7 @@ class PotGuiTk:
     # -------------------------
     def send_step(self):
         clamped = []
+        values = list(self.node.goal)       # 読めない欄の自由度は今の最終目標値のまま
         for i in range(26):
             try:
                 val = float(self.step_entries[i].get().strip())
@@ -1766,29 +1990,33 @@ class PotGuiTk:
                 limited = float(max(mn, min(mx, val)))  # 範囲制限（POT_RANGE、float で保持）
                 if limited != val:
                     clamped.append(i)
-                self.node.desired[i] = limited
+                values[i] = limited
             except (ValueError, IndexError):
                 pass
 
-        self.node.publish()
-        self.after_send("Step Input を送信しました")
+        if not self.send_targets(values, "Step Input を送信しました"):
+            return
         if clamped:
             self.set_pot_status("Step Input を送信しました（POT_RANGE の外だったため範囲内に丸めた DOF: "
                                 f"{', '.join(map(str, clamped))}）", "#c06000")
 
 
-    def send_random(self, status_text="Random Target を送信しました"):
+    def send_random(self, status_text="Random Target を送信しました", duration=None):
+        if duration is None:
+            duration = self.linear_duration()
+            if duration is None:
+                return False
         changed=[]
+        values = list(self.node.goal)       # ランダム対象外の自由度は今の最終目標値のまま
         for i in range(26):
             if not self.random_enable_vars[i].get():
                 continue
             mn,mx=RANDOM_RANGE[i]
             val=random.randint(int(mn),int(mx))
-            self.node.desired[i]=float(val)
+            values[i]=float(val)
             changed.append(i)
-        self.node.publish()
         # 従来どおり、ランダム対象外の欄に手入力した値はそのまま残す
-        self.after_send(status_text, overwrite=changed)
+        return self.send_targets(values, status_text, overwrite=changed, duration=duration)
 
     # -------------------------
     # 連続ランダム送信
@@ -1832,6 +2060,8 @@ class PotGuiTk:
         if not any(v.get() for v in self.random_enable_vars):
             messagebox.showerror("Random series", "Random DOF を1つ以上選んでください")
             return
+        if self.linear_duration() is None:
+            return
         # 1回目はすぐに送る
         self.random_series = {'interval': interval, 'count': count, 'sent': 0, 'next': time.monotonic(), 'job': None}
         self.random_series_button.config(text="■ 停止", bg="#ffd27f", activebackground="#ffc04d")
@@ -1846,8 +2076,13 @@ class PotGuiTk:
         rs['job'] = None
         now = time.monotonic()
         if now >= rs['next']:
+            duration = self.linear_duration(show_error=False)
+            if duration is None:
+                # 途中で線形入力時間が不正な値にされた（毎回エラー画面を出さずに止める）
+                self.stop_random_series(f"線形入力時間が不正なため停止しました（{rs['sent']} / {rs['count']} 回送信）")
+                return
             rs['sent'] += 1
-            self.send_random(f"連続ランダム送信 {rs['sent']} / {rs['count']} 回目を送信しました")
+            self.send_random(f"連続ランダム送信 {rs['sent']} / {rs['count']} 回目を送信しました", duration=duration)
             if rs['sent'] >= rs['count']:
                 self.stop_random_series(f"完了（{rs['count']} 回送信）")
                 return
@@ -1879,18 +2114,19 @@ class PotGuiTk:
         external = None
         while True:
             try:
-                t_recv, values = self.node.cmd_queue.get_nowait()
+                t_recv, values, own = self.node.cmd_queue.get_nowait()
             except queue.Empty:
                 break
-            if self.node.is_own_payload(values):
-                continue    # 自分の送信がトピック経由で戻ってきたもの
-            if t_recv < self.node.last_publish_time:
-                continue    # 受信後にGUIが全自由度を送り直しているので、ボードにはGUIの値が届いている
+            if own:
+                continue    # 自分の送信がトピック経由で戻ってきたもの（受信した時点で判定済み）
+            if t_recv < self.node.last_action_time:
+                continue    # 受信後にGUIが送信操作をしているので、ボードにはGUIの値が届いている
             external = values
 
         if external is not None:
+            self.node.stop_ramp_for_external()
+            self.node.set_targets_known({i: external[i] for i in range(min(26, len(external)))})
             for i in range(min(26, len(external))):
-                self.node.desired[i] = float(external[i])
                 self.target_known[i] = True
             self.set_pot_status("他プログラムから目標値を受信して反映しました", "#0050a0")
 
@@ -1910,8 +2146,9 @@ class PotGuiTk:
             elif (quiet and abs(bd - self.node.desired[i]) >= 1.0
                     and now - self.node.board_desired_changed[i] > ECHO_SYNC_STABLE_SEC):
                 adopted.append(i)
+        if adopted:
+            self.node.set_targets_known({i: self.node.board_desired[i] for i in adopted})
         for i in adopted:
-            self.node.desired[i] = self.node.board_desired[i]
             self.target_known[i] = True
         if adopted and external is None:
             dofs = ", ".join(map(str, adopted)) if len(adopted) <= 8 else f"{len(adopted)}自由度"
@@ -1923,11 +2160,12 @@ class PotGuiTk:
             # スライダの表示を更新（ドラッグ中は触らない）
             if not self.slider_active:
                 mn, mx = POT_RANGE[self.current_dof]
-                cur = int(max(mn, min(mx, self.node.desired[self.current_dof])))
+                cur = int(max(mn, min(mx, self.node.goal[self.current_dof])))
                 if int(self.slider.get()) != cur:
                     self.set_slider_silently(cur)
             self.update_info_label()
 
+        self.update_linear_label()
         self.root.after(100, self.poll_targets)
 
     # -------------------------
@@ -1980,7 +2218,7 @@ class PotGuiTk:
 
         dof = self.current_dof
         raw = self.node.real_raw[dof]
-        desired = self.node.desired[dof]
+        desired = self.node.goal[dof]
         bd = self.node.board_desired[dof]
         board_text = "-" if bd is None else str(int(bd))
         self.real_label.config(text=f"Real: {int(raw)}  Desired: {int(desired)}  (board: {board_text})")
