@@ -279,6 +279,24 @@ def main(work):
         exp = np.array([best['dof'][0][k] for k in ('a', 'b', 'c', 'd', 'e')], dtype=np.float32)
         check(np.array_equal(np.asarray(sent_b1[0:5], dtype=np.float32), exp) and sent_b1[5] == 3.0,
               "DOF 0 には試行 902 で Optuna が送った係数がそのまま届く")
+        # 6. グループごとの best を送信（verify_optuna_20261122: 24 グループ）
+        og = os.path.expanduser('~/ArmRobot/optimize_data/verify_optuna_20261122/optimize_20261122_1306')
+        if os.path.exists(og):
+            app.optuna_dir_var.set(og)
+            app.load_optuna()
+            n_before = {k: len(v) for k, v in fake.ff_msgs.items()}
+            app.send_group_best()
+            yield 0.5
+            res = app.optuna
+            okc = True
+            for d in res.dofs:
+                k, b, local, _c = g.DOF_BOARD[d]
+                t, _v = res.group_best(res.group_of(d)[0])
+                exp = np.array([t['dof'][d][c] for c in ('a', 'b', 'c', 'd', 'e')], dtype=np.float32)
+                got = np.asarray(fake.ff_msgs[k][-1][6 * local:6 * local + 5], dtype=np.float32)
+                okc &= np.array_equal(got, exp) and f"試行{t['n']}" in app.models[d].source
+            check(all(len(fake.ff_msgs[k]) > n_before[k] for k in n_before) and okc,
+                  "④ グループごとの best を送信: 全ボードに、各グループの best の試行で Optuna が送った係数が届く")
         report['dialogs'] = dialogs
         app.root.after(100, app.root.destroy)
 

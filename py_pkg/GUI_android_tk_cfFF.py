@@ -18,6 +18,10 @@ import せず、必要な処理をこのファイルに移植した（移植し�
     ① J が最小の試行（COMPLETE かつ source≠past。optuna_ff_common.FFStudy.best() と同じ）
     ② その自由度の J_i が最小の試行（①と同じ集合の中で。自由度ごとに試行番号が違うことがある）
     ③ 試行番号を指定
+    ④ その自由度が入っているグループの best（2026-11-20 以降の Optuna の「自由度ごと・グループを指定」。グループ g の評価値
+       J_g = グループ内の J_i の平均 が最小の試行。optuna_ff_common.FFStudy.group_bests() と同じ。1グループなら①と同じ）
+       「④ グループごとの best を送信」で全自由度に読み込んで送る（最適化していない自由度は FFなし。確認してから送る）。
+    ①②④ の対象は COMPLETE で、過去の試行（source='past'）と最後の組み合わせの測定（source='final'）を除く。
     極値は送った float32 の係数から求めた d{DOF}_t1_sent, y1_sent, t2_sent, y2_sent（_results.csv と同じ基準）、
     T は d{DOF}_T（FF 入力時間 T_FF）。列は DOF番号で引く（FF番号ではない）。読み込むと設定欄に入るだけで、送信はしない。
     T・極値を読み込んだままにしている間は、極値から作り直した係数ではなく、その試行で Optuna が実際に送った float32 の係数
@@ -1689,6 +1693,7 @@ def save_record_outputs(payload, folder, progress):
 # ==============================================================================
 # Optuna の最適化結果（optimize_optuna_ff_ROS2.py の <フォルダ名>_trials.csv）
 # ==============================================================================
+OPTUNA_NOT_COUNTED = ('past', 'final')     # best に数えない試行（optuna_ff_common.NOT_COUNTED_SOURCES と同じ）
 OPTUNA_DOF_KEYS = ('T', 't1_sent', 'y1_sent', 't2_sent', 'y2_sent', 'a', 'b', 'c', 'd', 'e', 'J_i')
 
 
@@ -1733,11 +1738,37 @@ class OptunaResult:
                 self.config = json.load(f)
         except (OSError, ValueError):
             pass
+        # グループ（config.json の groups。ない・不正なら最適化した自由度全体で1グループ＝従来どおり）
+        groups = self.config.get('groups') if isinstance(self.config, dict) else None
+        ok = (isinstance(groups, list) and groups
+              and all(isinstance(g, list) and g and all(isinstance(d, int) and d in self.dofs for d in g) for g in groups))
+        self.groups = [list(g) for g in groups] if ok else [list(self.dofs)]
 
     def candidates(self):
-        """① ② の対象: COMPLETE かつ source≠past で J が有限（optuna_ff_common.FFStudy.best() と同じ集合。確認試行を含む）"""
+        """①②④ の対象: COMPLETE で J が有限、過去の試行（past）と最後の組み合わせの測定（final）を除く
+        （optuna_ff_common.FFStudy.best()・group_bests() と同じ集合。確認試行・再投入を含む）"""
         return [t for t in self.trials.values()
-                if t['state'] == 'COMPLETE' and t['source'] != 'past' and np.isfinite(t['J'])]
+                if t['state'] == 'COMPLETE' and t['source'] not in OPTUNA_NOT_COUNTED and np.isfinite(t['J'])]
+
+    def group_of(self, dof):
+        """自由度が入っているグループ (番号, 自由度のリスト)。最適化していない自由度は (None, None)"""
+        for k, g in enumerate(self.groups):
+            if dof in g:
+                return k, g
+        return None, None
+
+    def group_best(self, k):
+        """グループ k の best: J_g = グループ内の J_i の平均 が最小の試行と J_g（optuna_ff_common.FFStudy.group_bests と同じ。
+        J_i が1つでも欠ける試行は使わない。同じ値なら番号の小さい試行）。戻り値 (試行 or None, J_g)"""
+        g = self.groups[k]
+        best, bv = None, float('inf')
+        for t in sorted(self.candidates(), key=lambda t: t['n']):
+            vals = [t['dof'][d]['J_i'] for d in g]
+            if all(np.isfinite(vals)):
+                v = float(np.mean(vals))
+                if v < bv:
+                    best, bv = t, v
+        return best, (bv if best is not None else float('nan'))
 
     def best_overall(self):
         c = self.candidates()
@@ -1769,6 +1800,15 @@ class OptunaResult:
                 f"最適化した自由度 {', '.join(map(str, self.dofs))}")
         if best is not None:
             text += f"、J 最小 = 試行 {best['n']}（J = {best['J']:.4g}）"
+        if len(self.groups) >= 2:
+            parts = []
+            for k in range(len(self.groups)):
+                t, v = self.group_best(k)
+                parts.append(f"g{k}（DOF {' '.join(map(str, self.groups[k]))}）: 試行 {t['n']}" if t is not None
+                             else f"g{k}: なし")
+            text += f"\nグループ {len(self.groups)} 個の best: " + "、".join(parts)
+        norm = cfg.get('err_norm', 'dP') if cfg else 'dP'
+        text += "、評価値は ΔP で割る" if norm == 'dP' else "、評価値は ΔP で割らない [count²]"
         if cfg:
             text += (f"\n動作完了時間 T = {cfg.get('T')} s、FF入力時間 T_FF = {cfg.get('T_ff', cfg.get('T'))} s、"
                      f"ε = {float(cfg.get('eps', float('nan'))) * 100:g}%、評価時間の固定値 E = {cfg.get('eval_min', EVAL_MIN_S)} s")
@@ -2736,8 +2776,8 @@ def _fmt_cell(v, digits=6):
 COORD_KEYS = ('t1', 'y1', 't2', 'y2')
 ENTRY_KEYS = ('T', 'ylo', 'yhi') + COORD_KEYS
 TABLE_HEAD = ("DOF", "ボード", "FF", "T [s]", "y下限", "y上限", "t1 [s]", "y1", "t2 [s]", "y2", "判定",
-              "極値の出どころ", "①J最小", "②J_i最小", "③試行", "", "GUIが最後に送信した値")
-MODE_TEXT = {'1': "①J最小", '2': "②J_i最小", '3': "③指定"}
+              "極値の出どころ", "①J最小", "②J_i最小", "③試行", "", "④群best", "GUIが最後に送信した値")
+MODE_TEXT = {'1': "①J最小", '2': "②J_i最小", '3': "③指定", '4': "④グループの best"}
 
 
 class CfApp:
@@ -2800,7 +2840,7 @@ class CfApp:
         self.refresh_sent_views()
         if node is None:
             self.show_record_state('noros', f"ROS 2 に接続できないため記録・FF送信はできません（比較タブは使えます）: {ros_error}")
-            for b in (self.record_button, self.send_button, self.zero_button):
+            for b in (self.record_button, self.send_button, self.zero_button, self.group_send_button):
                 b.config(state=tk.DISABLED)
         else:
             self.show_record_state('idle', "「● 記録開始」を押してから、GUI_android_tk.py などで目標値を送ってください")
@@ -2933,6 +2973,11 @@ class CfApp:
         self.bulk_trial_var = tk.StringVar()
         tk.Entry(r4, textvariable=self.bulk_trial_var, width=6).pack(side=tk.LEFT)
         tk.Button(r4, text="③ 読み込む", command=lambda: self.apply_optuna_all('3')).pack(side=tk.LEFT, padx=1)
+        tk.Button(r4, text="④ グループごとの best", command=lambda: self.apply_optuna_all('4')).pack(side=tk.LEFT,
+                                                                                               padx=(6, 1))
+        self.group_send_button = tk.Button(r4, text="④ グループごとの best を送信", command=self.send_group_best,
+                                           bg='#d8f0d8', font=(UI_FONT, 9, 'bold'))
+        self.group_send_button.pack(side=tk.LEFT, padx=(6, 1))
         self.optuna_info = tk.Label(bar, text="Optuna の結果: 未読み込み（読み込んでも送信はしません。送るときは「FFパラメータ送信」）",
                                     font=(UI_FONT, 9), anchor='w', justify='left', fg='#304080')
         self.optuna_info.pack(fill=tk.X, padx=8)
@@ -2987,8 +3032,10 @@ class CfApp:
             w['trial'].grid(row=r, column=14)
             tk.Button(table, text="③", width=2, command=lambda d=d: self.apply_optuna_one(d, '3')
                       ).grid(row=r, column=15)
+            tk.Button(table, text="④", width=2, command=lambda d=d: self.apply_optuna_one(d, '4')
+                      ).grid(row=r, column=16)
             w['sent'] = tk.Label(table, text="", anchor='w', font=(UI_FONT, 8), justify='left')
-            w['sent'].grid(row=r, column=16, sticky='w', padx=4)
+            w['sent'].grid(row=r, column=17, sticky='w', padx=4)
             self.rows[d] = w
 
     def build_detail(self, parent):
@@ -3255,6 +3302,7 @@ class CfApp:
         s = self.node.session
         recording = s is not None and s.state == Recorder.RECORDING
         self.send_button.config(state=tk.DISABLED if recording else tk.NORMAL)
+        self.group_send_button.config(state=tk.DISABLED if recording else tk.NORMAL)
         self.zero_button.config(state=tk.DISABLED if recording else tk.NORMAL)
 
     def read_duration(self):
@@ -3450,16 +3498,7 @@ class CfApp:
     # ---------- FFの送信 ----------
     # 移植元: GUI_android_tk_FFsetting.py:2939-3008 @105a28e（変更: 出どころを一緒に覚える。First は使わない）
     def send_ff(self):
-        bad = [d for d in FF_DOF_MAP if self.models[d].coeffs6() is None]
-        if bad:
-            messagebox.showerror(TITLE_SEND,
-                                 "次の自由度のFF設定が条件を満たしていないため、送信しません（全自由度とも送信していません）:\n"
-                                 + "\n".join(f"  DOF {d}: {' / '.join(self.models[d].check().errors)}" for d in bad))
-            return
-        table = np.array([self.models[d].coeffs6() for d in FF_DOF_MAP])
-        settings = [self.models[d].setting() if self.models[d].enabled else None for d in FF_DOF_MAP]
-        sources = [self.models[d].source if self.models[d].enabled else 'FFなし' for d in FF_DOF_MAP]
-        self.publish_all(table, settings, sources)
+        self.publish_all_current(TITLE_SEND)
 
     def send_zero(self):
         """全自由度を「FFなし」にして送る。確認でOKを押すまで、設定も変えず何も送らない"""
@@ -3533,6 +3572,11 @@ class CfApp:
         if mode == '2':
             tr = res.best_for_dof(dof)
             return (tr, f"②J_i最小 J_i={tr['dof'][dof]['J_i']:.4g}") if tr else (None, "J_i のある試行がありません")
+        if mode == '4':
+            k, g = res.group_of(dof)
+            tr, v = res.group_best(k)
+            return ((tr, f"④グループ g{k}（DOF {' '.join(map(str, g))}）の best J_g={v:.4g}") if tr
+                    else (None, f"グループ g{k} に J_i のそろった試行がありません"))
         try:
             n = int(str(n_text).strip())
         except ValueError:
@@ -3624,6 +3668,59 @@ class CfApp:
             msg += "\n\n読み込んだ自由度:\n  " + "\n  ".join(done)
         messagebox.showinfo(TITLE_OPTUNA, msg)
 
+    def send_group_best(self):
+        """④ グループごとの best を全自由度に読み込んで送信する（確認してから）。Optuna で最適化していない自由度は FFなし
+        （Optuna の「グループの best を組み合わせた FF」と同じ）"""
+        res = self.optuna
+        if res is None:
+            messagebox.showerror(TITLE_OPTUNA, "先に Optuna の結果フォルダを読み込んでください")
+            return
+        picks, missing = [], []
+        for k, g in enumerate(res.groups):
+            t, v = res.group_best(k)
+            if t is None:
+                missing.append(f"g{k}（DOF {' '.join(map(str, g))}）")
+            else:
+                picks.append(f"g{k}（DOF {' '.join(map(str, g))}）: 試行 {t['n']}、J_g = {v:.4g}")
+        if missing:
+            messagebox.showerror(TITLE_OPTUNA, "best のないグループがあるため送信しません: " + "、".join(missing))
+            return
+        others = [d for d in FF_DOF_MAP if d not in res.dofs]
+        text = (f"{res.name} のグループごとの best（{len(res.groups)} グループ）を全自由度に読み込んで送信します。\n\n  "
+                + "\n  ".join(picks[:30]) + (f"\n  …ほか {len(picks) - 30} グループ" if len(picks) > 30 else ""))
+        if others:
+            text += f"\n\nOptuna で最適化していない DOF {', '.join(map(str, others))} は FFなし にして送ります。"
+        text += "\n\nよろしいですか？（キャンセルすると何も変えません）"
+        if not messagebox.askokcancel(TITLE_SEND, text):
+            return
+        failed = []
+        for d in FF_DOF_MAP:
+            if d in res.dofs:
+                tr, how = self.optuna_pick(d, '4')
+                ok, msg = self.optuna_apply(d, tr, how) if tr is not None else (False, how)
+                if not ok:
+                    failed.append(f"DOF {d}: {msg}")
+            elif self.models[d].enabled:
+                self.models[d].update(enabled=False)
+        if failed:
+            messagebox.showerror(TITLE_OPTUNA, "次の自由度を読み込めなかったため送信しません（読み込めた自由度の設定は変わっています）:\n  "
+                                 + "\n  ".join(failed))
+            return
+        if self.publish_all_current(TITLE_SEND):
+            self.add_warning(f"{res.name} のグループごとの best（{len(res.groups)} グループ）を送信しました")
+
+    def publish_all_current(self, title=None):
+        """今の設定を全自由度送る（send_ff と同じ判定。戻り値: 送ったか）"""
+        bad = [d for d in FF_DOF_MAP if self.models[d].coeffs6() is None]
+        if bad:
+            messagebox.showerror(title or TITLE_SEND, "次の自由度のFF設定が条件を満たしていないため、送信しません:\n"
+                                 + "\n".join(f"  DOF {d}: {' / '.join(self.models[d].check().errors)}" for d in bad))
+            return False
+        table = np.array([self.models[d].coeffs6() for d in FF_DOF_MAP])
+        settings = [self.models[d].setting() if self.models[d].enabled else None for d in FF_DOF_MAP]
+        sources = [self.models[d].source if self.models[d].enabled else 'FFなし' for d in FF_DOF_MAP]
+        return self.publish_all(table, settings, sources, title)
+
     # =========================================================
     # 比較タブ
     # =========================================================
@@ -3690,7 +3787,7 @@ class CfApp:
             tk.Label(p, text=text).pack(side=tk.LEFT, padx=(6, 1))
             self.cmp_vars[key] = tk.StringVar(value=c.get(key, ''))
             tk.Entry(p, textvariable=self.cmp_vars[key], width=7, justify='right').pack(side=tk.LEFT)
-        tk.Button(p, text="Optuna の T・ε・E を入れる", command=self.optuna_to_compare).pack(side=tk.LEFT, padx=6)
+        tk.Button(p, text="Optuna の T・ε・E・評価値の定義を入れる", command=self.optuna_to_compare).pack(side=tk.LEFT, padx=6)
         tk.Label(p, text="   保存先").pack(side=tk.LEFT)
         self.cmp_dir_var = tk.StringVar(value=c.get('dir') or self.settings.get('record_dir') or os.getcwd())
         tk.Entry(p, textvariable=self.cmp_dir_var, width=40).pack(side=tk.LEFT)
@@ -3813,6 +3910,7 @@ class CfApp:
             self.cmp_vars['T'].set(f"{float(cfg['T']):g}")
             self.cmp_vars['eps'].set(f"{float(cfg['eps']) * 100:g}")
             self.cmp_vars['E'].set(f"{float(cfg.get('eval_min', EVAL_MIN_S)):g}")
+            self.cmp_norm_var.set(cfg.get('err_norm', 'dP') == 'dP')     # Optuna の評価値（ΔP で割るか）に合わせる
         except (KeyError, TypeError, ValueError) as e:
             messagebox.showerror(TITLE_COMPARE, f"config.json の T・ε・E を読めません: {e}")
             return

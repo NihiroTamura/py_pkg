@@ -408,3 +408,35 @@ def test_exact_coefficients_used_until_edited():
     m.update(y1=49.0)
     assert not m.exact_valid()
     assert m.coeffs6()[:5] == pytest.approx(list(g.quintic_from_extrema(3.0, 1.0, 49.0, 2.5, -20.0)[0][0]))
+
+
+# ------------------------------------------------------------------ グループごとの best（2026-11-20 以降の Optuna）
+OPTUNA_G = os.path.expanduser('~/ArmRobot/optimize_data/verify_optuna_20261122/optimize_20261122_1306')
+
+
+@pytest.mark.skipif(not os.path.exists(os.path.join(OPTUNA_G, 'optimize_20261122_1306_group_best.csv')),
+                    reason='グループで最適化した Optuna の記録がない')
+def test_group_best_matches_optuna():
+    res = g.OptunaResult(OPTUNA_G)
+    assert len(res.groups) == 24
+    with open(os.path.join(OPTUNA_G, 'optimize_20261122_1306_group_best.csv'), encoding='utf-8-sig') as f:
+        rows = list(csv.DictReader(f))
+    for r in rows:
+        d = int(r['DOF'])
+        k, _grp = res.group_of(d)
+        assert k == int(r['group'])
+        t, v = res.group_best(k)
+        assert t['n'] == int(r['best_trial']) and v == pytest.approx(float(r['J_g']), rel=1e-7)
+        _T, t1, y1, t2, y2, _co = res.extrema(t, d)
+        assert (t1, y1, t2, y2) == pytest.approx(tuple(float(r[c]) for c in ('t1', 'y1', 't2', 'y2')), abs=1e-7)
+    # results.csv（各グループの best を組み合わせた FF）の極値とも一致する
+    with open(os.path.join(OPTUNA_G, 'optimize_20261122_1306_results.csv'), encoding='utf-8-sig') as f:
+        rr = list(csv.DictReader(f))[-1]
+    for d in res.dofs:
+        n = g.FF_INDEX[d] + 1
+        t, _v = res.group_best(res.group_of(d)[0])
+        assert res.extrema(t, d)[1:5] == pytest.approx(tuple(float(rr[f'{c}_{n}']) for c in ('t1', 'y1', 't2', 'y2')),
+                                                       abs=1e-6)
+    # ① は最後の組み合わせの測定（source='final'）を除く
+    assert all(t['source'] != 'final' for t in res.candidates())
+    assert res.best_overall()['n'] == 750
