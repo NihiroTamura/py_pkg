@@ -15,6 +15,12 @@ Optuna で5次関数FF（a t⁵ + b t⁴ + c t³ + d t² + e t, 0 ≤ t < T_FF�
      評価に失敗した試行は TrialState.FAIL（原因・データ・ログを残す）。
 <時間軸> 100 Hz 配信の番号 × 10 ms（制御周期は使わない）。<計算・通信・保存> optuna_ff_common.py
 <対応 Arduino プログラム> ADRC_ROS2_tk_FF_ADRCparamChange-board1〜5（変更しない）
+<最適化の単位>（2026-11-20 ユーザー指示。探索タブで選ぶ）
+  全体（1グループ。既定）… 従来とまったく同じ処理（J を最小化。J ≤ 閾値なら確認試行で終了）。
+  自由度ごと・グループを指定 … グループ g の評価値 J_g = グループ内の J_i の平均 を、グループごとの study がそれぞれ最小化する。
+     n_startup はグループごとに n_prior + max(20, 2D_g)。途中の確認試行・終了はなく、最大試行数か停止ボタンでだけ終わる。
+     最大試行数で終わったときだけ、各グループの best を組み合わせた FF を1回測る（最大試行数・best には数えない）。
+  A_max は全自由度で共通か、自由度ごとに指定する（基本タブ）。
 
 <保存>  <保存先>/optimize_YYYYMMDD_HHMM/
     *_results.csv           … best（COMPLETE で J 最小）の、送った float32 の係数から求めた極値（既存と同じ168列）
@@ -26,9 +32,17 @@ Optuna で5次関数FF（a t⁵ + b t⁴ + c t³ + d t² + e t, 0 ≤ t < T_FF�
     ffmap_table.npz         … FF の可行域の表        trials/      … 全測定の生データ（npz）と例外の traceback
     DOF/DOF<d>/             … グラフの画像（文字は英語。時刻の軸は 0 秒〜評価時間。g2 にはその自由度の FF=0 の基準試行も描く）
     run.log … ログ      status.json … 状態
+  2グループ以上のときは *_best_trial.csv・*_best_trial_grid.csv の代わりに
+    *_results.csv           … 各グループの best を組み合わせた FF の極値（168列）
+    *_group_best.csv        … 自由度ごとに、所属するグループの best の試行・J_g・J_i・極値
+    *_best_trial_g<k>.csv   … グループ k の best の試行の受信データ（*_best_trial.csv と同じ形式）
+    *_final_trial.csv・*_final_trial_grid.csv … 最後の組み合わせの測定（最大試行数で終わったとき）
 <分析>  <保存先>/analysis_YYYYMMDD_HHMM/J_progress.png … J の推移（終了時に作る。文字は英語）
                                        J_progress_ja.png … 同じ図の日本語版
                                        J_share_FF0.png / J_share_best.png … J に占める各自由度の割合（FF=0 / best）
+                                       J_progress_g<k>.png・J_progress_g<k>_ja.png … グループ k の J_g の推移（2グループ以上）
+  2グループ以上で最後の組み合わせの測定があるときは、D<d>_g2_cost・J_progress・J_progress_g<k>・J_share_best を2通り保存する
+  （2026-11-21 ユーザー指示）。従来の名前 … 最後の測定を描かない。*_with_final … ★で描き、それまでの最小の線の候補にも入れる
 """
 import base64
 import json
@@ -579,7 +593,16 @@ TXT = {
            'p_title': 'J の推移（COMPLETE {}、n_startup = {}、T = {:g} s、T_FF = {:g} s）',
            's_x': '自由度', 's_y': 'J に占める割合 [%]（= J_i / Σ J_i）',
            's_ref': 'J に占める各自由度の割合：基準試行（FF=0、{} 回の平均）、J = {:.4g}',
-           's_best': 'J に占める各自由度の割合：best（試行 {}）、J = {:.4g}'},
+           's_best': 'J に占める各自由度の割合：best（試行 {}）、J = {:.4g}',
+           # 2グループ以上（2026-11-20）
+           'best_Ji_g': 'グループの best のときの J_{}', 'final': '最後の組み合わせの測定',
+           'g_each': '各試行の J_g', 'g_best': 'それまでの最小', 'g_ref': '基準試行（FF=0）の J_g = {:.4g}',
+           'g_thr': '閾値 J = {:.4g}（参考）', 'g_y': 'J_g（対数）',
+           'g_title': 'グループ {}（DOF {}）の J_g の推移（n_startup = {}）',
+           's_best_g': 'J に占める各自由度の割合：グループごとの best、J の予測 = {:.4g}',
+           # 最後の組み合わせの測定を best の候補に入れた「載せる」版（2026-11-21）
+           'best_Ji_gf': 'グループの best（最後の測定を含む）のときの J_{}', 'p_best_f': 'それまでの最小（最後の測定を含む）',
+           's_best_gf': 'J に占める各自由度の割合：グループごとの best（最後の組み合わせの測定を含む）、J = {:.4g}'},
     # 保存する画像はこの英語の文字で描く（2026-11-04・11-06 ユーザー指示。軸ラベル・凡例は指定どおり）
     'en': {'t': 'Time [s]', 'pot': 'POT [-]', 'pwm': 'PWM [-]', 'trial': 'trial',
            'J': 'J (log)', 'ext_t': 'extremum time [s]', 'ext_y': 'extrema value (PWM) [-]', 'meas': 'measured POT',
@@ -594,8 +617,18 @@ TXT = {
            'p_title': 'J history (COMPLETE {}, n_startup = {}, T = {:g} s, T_FF = {:g} s)',
            's_x': 'DOF', 's_y': 'share of J [%] (= J_i / sum J_i)',
            's_ref': 'Share of each DOF in J: reference (FF=0, mean of {} trials), J = {:.4g}',
-           's_best': 'Share of each DOF in J: best (trial {}), J = {:.4g}'},
+           's_best': 'Share of each DOF in J: best (trial {}), J = {:.4g}',
+           'best_Ji_g': 'J_{} at group best', 'final': 'final combination',
+           'g_each': 'J_g of each trial', 'g_best': 'best so far', 'g_ref': 'reference (FF=0) J_g = {:.4g}',
+           'g_thr': 'threshold J = {:.4g} (reference)', 'g_y': 'J_g (log)',
+           'g_title': 'Group {} (DOF {}) J_g history (n_startup = {})',
+           's_best_g': 'Share of each DOF in J: group bests, predicted J = {:.4g}',
+           'best_Ji_gf': 'J_{} at group best (incl. final)', 'p_best_f': 'best so far (incl. final)',
+           's_best_gf': 'Share of each DOF in J: group bests (incl. final combination), J = {:.4g}'},
 }
+GROUP_MODE_LABELS = {'all': '全体（1グループ。全自由度の J をまとめて最小化。従来どおり）',
+                     'each': '自由度ごと（各自由度の J_i をそれぞれ最小化）',
+                     'custom': 'グループを指定（グループ内の J_i の平均をグループごとに最小化）'}
 ERR_NORM_LABELS = {'dP': 'ΔP_i で割る（無次元。従来どおり）', 'none': 'ΔP_i で割らない [count²]'}
 SAVE_LANG = 'en'        # 保存する画像（DOF/DOF<d>/*.png）の文字。GUI のグラフタブは日本語のまま
 FAIL_COLORS = {'presend': '#999999', 'tabu': '#bbbb00', 'unsafe': '#d62728', 'comm': '#9467bd', 'sensor': '#8c564b',
@@ -662,11 +695,40 @@ def _ji_of(h, d):
     return float(v) if v is not None else np.nan
 
 
-def best_ji_track(hist, d):
+# 最後の組み合わせの測定（2グループ以上）の描き方（2026-11-21 ユーザー指示）
+#   'mark'    … ★の印だけ描き、best・グループの best の線（それまでの最小）には入れない（GUI の表示）
+#   'hide'    … まったく描かない（保存する画像の「載せない」版。従来の名前の画像）
+#   'include' … ★の印を描き、線の最小の候補にも入れる（保存する画像の「載せる」版。*_with_final.png）
+FINAL_MODES = ('mark', 'hide', 'include')
+
+
+def _counted(h, with_final=False):
+    """best・グループの best の対象か（COMPLETE で J を持ち、過去の試行ではない＝study の best と同じ）。
+    最後の組み合わせの測定は with_final のときだけ入れる"""
+    if not (h['state'] == 'COMPLETE' and h.get('J') is not None):
+        return False
+    s = h.get('source')
+    return s != 'past' and (s != 'final' or with_final)
+
+
+def _is_final(h):
+    return h.get('source') == 'final'
+
+
+def _hidden(h, final):
+    """final='hide' のとき描かない試行（最後の組み合わせの測定。失敗したものも）"""
+    return final == 'hide' and _is_final(h)
+
+
+def has_final(hist):
+    """最後の組み合わせの測定（COMPLETE）があるか"""
+    return any(h['state'] == 'COMPLETE' and h.get('J') is not None and _is_final(h) for h in hist)
+
+
+def best_ji_track(hist, d, with_final=False):
     """その時点の best（J が最小の試行。過去の試行は除く＝study の best と同じ）の、自由度 d の J_i の軌跡。
     戻り値 (試行番号の列, J_i の列)。best が更新されるたびに、その試行の J_i に変わる"""
-    own = sorted((h for h in hist if h['state'] == 'COMPLETE' and h.get('J') is not None and h.get('source') != 'past'),
-                 key=lambda h: h['n'])
+    own = sorted((h for h in hist if _counted(h, with_final)), key=lambda h: h['n'])
     ns, vals, best_J, cur = [], [], np.inf, np.nan
     for h in own:
         if h['J'] < best_J:
@@ -676,20 +738,47 @@ def best_ji_track(hist, d):
     return ns, vals
 
 
-def plot_g2(ax, L, d, hist, J_thr=None, ref=None):
+def group_best_ji_track(hist, d, group, with_final=False):
+    """その時点のグループの best（グループの J_g が最小の試行）の、自由度 d の J_i の軌跡（2026-11-20 ユーザー指示）。
+    戻り値 (試行番号の列, J_i の列)。グループの best が更新されるたびに、その試行の J_i に変わる。
+    with_final なら最後の組み合わせの測定も best の候補に入れる（2026-11-21）"""
+    own = sorted((h for h in hist if _counted(h, with_final) and h.get('J_i')), key=lambda h: h['n'])
+    ns, vals, best, cur = [], [], np.inf, np.nan
+    for h in own:
+        v = c.group_mean(h['J_i'], group)
+        if np.isfinite(v) and v < best:
+            best, cur = v, _ji_of(h, d)
+        ns.append(h['n'])
+        vals.append(cur)
+    return ns, vals
+
+
+def plot_g2(ax, L, d, hist, J_thr=None, ref=None, group=None, final='mark'):
     """累積誤差の推移：その自由度の J_i・best J の試行のその自由度の J_i の軌跡・FF=0 の基準試行の J_i
     （2026-11-06 ユーザー指示。J と閾値は描かない）。ref = {'J_i': [基準試行のこの自由度の J_i, ...]}。
+    group（2グループ以上のとき、この自由度が入っているグループ）を与えると、軌跡は「グループの J_g がその時点で最小だった
+    試行での J_i」にする（2026-11-20）。最後の組み合わせの測定の描き方は final（FINAL_MODES。2026-11-21）。
     J_thr は使わない（呼び出し側との互換のため残す）"""
     ax.clear()
-    done = [h for h in hist if h['state'] == 'COMPLETE' and h.get('J') is not None]
+    incl = final == 'include'
+    done = [h for h in hist if h['state'] == 'COMPLETE' and h.get('J') is not None and not _is_final(h)]
     if done:
         ns = [h['n'] for h in done]
         ji = [_ji_of(h, d) for h in done]
         if any(np.isfinite(v) for v in ji):
             ax.semilogy(ns, ji, 's', color='#ff7f0e', ms=2, label=f'J_{d}')
-        bn, bv = best_ji_track(hist, d)
+        if group is None:
+            bn, bv = best_ji_track(hist, d, with_final=incl)
+            lab = TXT[L]['best_Ji'].format(d)
+        else:
+            bn, bv = group_best_ji_track(hist, d, group, with_final=incl)
+            lab = TXT[L]['best_Ji_gf' if incl and has_final(hist) else 'best_Ji_g'].format(d)
         if bn:
-            ax.semilogy(bn, bv, color='#2ca02c', lw=1.2, drawstyle='steps-post', label=TXT[L]['best_Ji'].format(d))
+            ax.semilogy(bn, bv, color='#2ca02c', lw=1.2, drawstyle='steps-post', label=lab)
+    fin = [h for h in hist if h['state'] == 'COMPLETE' and _is_final(h) and np.isfinite(_ji_of(h, d))]
+    if fin and final != 'hide':
+        ax.semilogy([h['n'] for h in fin], [_ji_of(h, d) for h in fin], '*', color='#d62728', ms=9,
+                    label=TXT[L]['final'])
     ref = ref or {}
     rji = [v for v in (ref.get('J_i') or []) if v is not None and np.isfinite(v)]
     if rji:
@@ -698,7 +787,7 @@ def plot_g2(ax, L, d, hist, J_thr=None, ref=None):
     import matplotlib.transforms as mtrans
     tr = mtrans.blended_transform_factory(ax.transData, ax.transAxes)
     for h in hist:
-        if h['state'] == 'FAIL':
+        if h['state'] == 'FAIL' and not _hidden(h, final):
             ax.plot([h['n']], [0.03], marker='x', color=FAIL_COLORS.get(h.get('fail_class'), '#000'), ms=5,
                     transform=tr, clip_on=False)
     ax.set_xlabel(TXT[L]['trial'], fontsize=8)
@@ -820,20 +909,31 @@ def _legend_free(ax, line_xy, texts, fontsize=7):
     return ax.legend(fontsize=fontsize, loc='best')
 
 
-def plot_progress(ax, hist, info, L=SAVE_LANG):
+def plot_progress(ax, hist, info, L=SAVE_LANG, final='mark'):
     """J の推移（分析フォルダの J_progress.png は英語、GUI の J過程タブは日本語）。info: J_ref・J_thr・rms_thr・n_startup・T・T_ff。
-    過去の試行（add_trial）は別の印で描き、best（それまでの最小）には入れない（study の best と同じ）"""
+    過去の試行（add_trial）は別の印で描き、best（それまでの最小）には入れない（study の best と同じ）。
+    最後の組み合わせの測定（2グループ以上）の描き方は final（FINAL_MODES。2026-11-21）"""
     X = TXT[L]
     import matplotlib.transforms as mtrans
-    done = sorted((h for h in hist if h['state'] == 'COMPLETE' and h.get('J') is not None), key=lambda h: h['n'])
+    done = sorted((h for h in hist if h['state'] == 'COMPLETE' and h.get('J') is not None and not _is_final(h)),
+                  key=lambda h: h['n'])
     own = [h for h in done if h.get('source') != 'past']
     past = [h for h in done if h.get('source') == 'past']
+    fin = [h for h in hist if h['state'] == 'COMPLETE' and h.get('J') is not None and _is_final(h)]
     if own:
         ns, J = [h['n'] for h in own], [h['J'] for h in own]
         ax.semilogy(ns, J, 'o', ms=3, label=X['p_each'])
-        ax.semilogy(ns, np.minimum.accumulate(J), '-', label=X['p_best'])
+        if final == 'include' and fin:              # 「載せる」版：最後の組み合わせの測定も最小の候補に入れる
+            line = sorted(own + fin, key=lambda h: h['n'])
+            ax.semilogy([h['n'] for h in line], np.minimum.accumulate([h['J'] for h in line]), '-',
+                        label=X['p_best_f'])
+        else:
+            ax.semilogy(ns, np.minimum.accumulate(J), '-', label=X['p_best'])
     if past:
         ax.semilogy([h['n'] for h in past], [h['J'] for h in past], 's', color='#7f7f7f', ms=3, label=X['p_past'])
+    if fin and final != 'hide':                     # 最後の組み合わせの測定（2グループ以上。2026-11-20）
+        ax.semilogy([h['n'] for h in fin], [h['J'] for h in fin], '*', color='#d62728', ms=12, ls='none',
+                    label=X['final'])
     k = info.get('n_startup')
     if k is not None and len(done) > int(k):
         n_tpe = done[int(k)]['n']
@@ -844,7 +944,7 @@ def plot_progress(ax, hist, info, L=SAVE_LANG):
     if info.get('J_thr'):
         ax.axhline(info['J_thr'], color='r', ls=':',
                    label=X['p_thr'].format(info['J_thr'], info.get('rms_thr') or 0, info.get('rms_unit', '%')))
-    fails = [h for h in hist if h['state'] == 'FAIL']
+    fails = [h for h in hist if h['state'] == 'FAIL' and not _hidden(h, final)]
     if fails:
         tr = mtrans.blended_transform_factory(ax.transData, ax.transAxes)
         for i, h in enumerate(fails):
@@ -855,6 +955,57 @@ def plot_progress(ax, hist, info, L=SAVE_LANG):
     ax.set_title(X['p_title'].format(len(done), k, info.get('T', 0), info.get('T_ff', 0)))
     if ax.get_legend_handles_labels()[0]:
         ax.legend(fontsize=8)
+    ax.grid(True, which='both', alpha=0.3)
+
+
+def plot_group_progress(ax, hist, info, k, L=SAVE_LANG, final='mark'):
+    """グループ k の J_g（グループ内の J_i の平均）の推移（2026-11-20 ユーザー指示）。各試行の J_g・それまでの最小・
+    基準試行（FF=0）の J_g・閾値（参考。全グループが閾値以下なら J も閾値以下）・そのグループの n_startup・失敗・
+    最後の組み合わせの測定（描き方は final。FINAL_MODES）。info: groups・n_startup_groups・ref_Ji・J_thr"""
+    X = TXT[L]
+    import matplotlib.transforms as mtrans
+    g = info['groups'][k]
+    done = sorted((h for h in hist if h['state'] == 'COMPLETE' and h.get('J_i') and not _is_final(h)),
+                  key=lambda h: h['n'])
+    own = [h for h in done if h.get('source') != 'past']
+    past = [h for h in done if h.get('source') == 'past']
+    fin = [h for h in hist if h['state'] == 'COMPLETE' and h.get('J_i') and _is_final(h)]
+    if own:
+        ns, v = [h['n'] for h in own], np.array([c.group_mean(h['J_i'], g) for h in own])
+        ax.semilogy(ns, v, 'o', ms=2.5, label=X['g_each'])
+        if final == 'include' and fin:              # 「載せる」版：最後の組み合わせの測定も最小の候補に入れる
+            line = sorted(own + fin, key=lambda h: h['n'])
+            ax.semilogy([h['n'] for h in line], np.fmin.accumulate([c.group_mean(h['J_i'], g) for h in line]), '-',
+                        label=X['p_best_f'])
+        else:
+            ax.semilogy(ns, np.fmin.accumulate(v), '-', label=X['g_best'])
+    if past:
+        ax.semilogy([h['n'] for h in past], [c.group_mean(h['J_i'], g) for h in past], 's', color='#7f7f7f', ms=3,
+                    label=X['p_past'])
+    if fin and final != 'hide':
+        ax.semilogy([h['n'] for h in fin], [c.group_mean(h['J_i'], g) for h in fin], '*', color='#d62728', ms=10,
+                    ls='none', label=X['final'])
+    nsg = (info.get('n_startup_groups') or [None] * len(info['groups']))[k]
+    if nsg is not None and len(done) > int(nsg):
+        n_tpe = done[int(nsg)]['n']
+        ax.axvline(n_tpe, color='g', ls='-.', label=X['p_tpe'].format(n_tpe))
+    rg = c.group_mean(info.get('ref_Ji') or {}, g)
+    if np.isfinite(rg):
+        ax.axhline(rg, color='k', ls='--', label=X['g_ref'].format(rg))
+    if info.get('J_thr'):
+        ax.axhline(info['J_thr'], color='r', ls=':', label=X['g_thr'].format(info['J_thr']))
+    fails = [h for h in hist if h['state'] == 'FAIL' and not _hidden(h, final)]
+    if fails:
+        tr = mtrans.blended_transform_factory(ax.transData, ax.transAxes)
+        for i, h in enumerate(fails):
+            ax.plot([h['n']], [0.03], marker='x', color=FAIL_COLORS.get(h.get('fail_class'), '#000'), ms=4, ls='none',
+                    transform=tr, clip_on=False, label=X['p_fail'] if i == 0 else None)
+    ax.set_xlabel(X['p_x'], fontsize=8)
+    ax.set_ylabel(X['g_y'], fontsize=8)
+    ax.tick_params(labelsize=7)
+    ax.set_title(X['g_title'].format(k, c.format_groups([g]), nsg), fontsize=9)
+    if ax.get_legend_handles_labels()[0]:
+        ax.legend(fontsize=6)
     ax.grid(True, which='both', alpha=0.3)
 
 
@@ -880,8 +1031,10 @@ def plot_share(ax, L, dofs, J_i, title, color='#1f77b4'):
     return share
 
 
-def share_inputs(dofs, hist, refs):
+def share_inputs(dofs, hist, refs, groups=None, with_final=False):
     """割合のグラフの値：基準試行（FF=0）の J_i の平均と、best（過去の試行を除いた COMPLETE で J 最小。study の best と同じ）の J_i。
+    groups（2グループ以上）を与えると、best は「各自由度の、所属するグループの best の試行での J_i」（試行番号は None、
+    J はその平均＝組み合わせの J の予測）にする（2026-11-20）。with_final なら最後の組み合わせの測定も best の候補に入れる。
     戻り値 (ref_Ji, n_ref, best) 。best = (試行番号, J, J_i) または None"""
     refs = refs or {}
     ref_Ji, n_ref = {}, 0
@@ -890,18 +1043,30 @@ def share_inputs(dofs, hist, refs):
         if v:
             ref_Ji[d] = float(np.mean(v))
             n_ref = max(n_ref, len(v))
-    done = [h for h in hist if h['state'] == 'COMPLETE' and h.get('J') is not None and h.get('source') != 'past'
-            and h.get('J_i')]
+    done = [h for h in hist if _counted(h, with_final) and h.get('J_i')]
     best = None
-    if done:
+    if done and groups and len(groups) >= 2:
+        def gval(h, g):
+            v = c.group_mean(h['J_i'], g)
+            return v if np.isfinite(v) else np.inf
+
+        J_i = {}
+        for g in groups:
+            b = min(sorted(done, key=lambda h: h['n']), key=lambda h: gval(h, g))
+            for d in g:
+                J_i[d] = _ji_of(b, d)
+        if all(np.isfinite(J_i.get(d, np.nan)) for d in dofs):
+            best = (None, float(np.mean([J_i[d] for d in dofs])), J_i)
+    elif done:
         b = min(done, key=lambda h: h['J'])
         best = (b['n'], float(b['J']), {d: float(b['J_i'].get(str(d), b['J_i'].get(d, np.nan))) for d in dofs})
     return ref_Ji, n_ref, best
 
 
-def save_share_pngs(out, dofs, hist, refs, L=SAVE_LANG):
-    """分析フォルダに J_share_FF0.png（基準試行）と J_share_best.png（best）を保存する。保存したファイル名を返す"""
-    ref_Ji, n_ref, best = share_inputs(dofs, hist, refs)
+def save_share_pngs(out, dofs, hist, refs, L=SAVE_LANG, groups=None):
+    """分析フォルダに J_share_FF0.png（基準試行）と J_share_best.png（best。2グループ以上ならグループごとの best）を保存する。
+    保存したファイル名を返す"""
+    ref_Ji, n_ref, best = share_inputs(dofs, hist, refs, groups)
     saved = []
     if len(ref_Ji) == len(dofs):
         J_ref = float(np.mean([ref_Ji[d] for d in dofs]))
@@ -911,9 +1076,16 @@ def save_share_pngs(out, dofs, hist, refs, L=SAVE_LANG):
         saved.append('J_share_FF0.png')
     if best is not None:
         n, J, J_i = best
+        title = TXT[L]['s_best'].format(n, J) if n is not None else TXT[L]['s_best_g'].format(J)
         save_png(os.path.join(out, 'J_share_best.png'),
-                 lambda ax: plot_share(ax, L, dofs, J_i, TXT[L]['s_best'].format(n, J)), size=(12.0, 4.8))
+                 lambda ax: plot_share(ax, L, dofs, J_i, title), size=(12.0, 4.8))
         saved.append('J_share_best.png')
+    if groups and len(groups) >= 2 and has_final(hist):     # 「載せる」版（最後の組み合わせの測定も best の候補。2026-11-21）
+        _r, _n, bf = share_inputs(dofs, hist, refs, groups, with_final=True)
+        if bf is not None:
+            save_png(os.path.join(out, 'J_share_best_with_final.png'),
+                     lambda ax: plot_share(ax, L, dofs, bf[2], TXT[L]['s_best_gf'].format(bf[1])), size=(12.0, 4.8))
+            saved.append('J_share_best_with_final.png')
     return saved
 
 
@@ -971,14 +1143,23 @@ PREVIEW_ROW_IN = 3.8        # GUI のグラフタブの1自由度分の高さ [i
 PREVIEW_GAP_IN = 1.35       # 段の間（軸の下の凡例と次の段の題名が入る高さ）[inch]
 
 
-def render_preview(payload, hist, dofs, J_thr, width_px, refs=None):
+def group_of_dof(groups):
+    """{DOF: その自由度が入っているグループ}（2グループ以上のときだけ。1グループなら空）"""
+    if not groups or len(groups) < 2:
+        return {}
+    return {d: list(g) for g in groups for d in g}
+
+
+def render_preview(payload, hist, dofs, J_thr, width_px, refs=None, groups=None):
     """GUI のグラフタブ用の画像（PNG のバイト列）。1 DOF 分の5つを横1段、複数の DOF は縦に積む。
     描き方は保存する画像と同じ（横軸は 0 秒〜評価時間、cost は J_i・best・基準の J_i、凡例の位置など）で、文字は日本語
-    （2026-11-06 ユーザー指示）。refs = {DOF: {'J_i': [...]}}（なければ payload の ref_Ji を使う）"""
+    （2026-11-06 ユーザー指示）。refs = {DOF: {'J_i': [...]}}（なければ payload の ref_Ji を使う）。
+    groups（2グループ以上）を与えると、cost の軌跡はその自由度のグループの best のときの J_i にする（2026-11-20）"""
     import io
     from matplotlib.figure import Figure
     from matplotlib.backends.backend_agg import FigureCanvasAgg
     L = _RENDER_LANG
+    gmap = group_of_dof(groups)
     n = max(1, len(dofs))
     dpi = 80
     H = PREVIEW_ROW_IN * n
@@ -994,7 +1175,7 @@ def render_preview(payload, hist, dofs, J_thr, width_px, refs=None):
         nn = payload['n'] if payload else None
         ref = (refs or {}).get(d) or ({'J_i': pd.get('ref_Ji')} if pd and pd.get('ref_Ji') else None)
         plot_g1(axs[0], L, d, pd, nn, final=True)
-        plot_g2(axs[1], L, d, hist, J_thr, ref)
+        plot_g2(axs[1], L, d, hist, J_thr, ref, gmap.get(d))
         plot_g3(axs[2], axs[2].twinx(), L, d, hist)
         plot_g4(axs[3], L, d, pd, nn, final=True)
         plot_g5(axs[4], L, d, pd, nn, final=True)
@@ -1003,16 +1184,44 @@ def render_preview(payload, hist, dofs, J_thr, width_px, refs=None):
     return buf.getvalue()
 
 
+PROGRESS_TOP_IN = 5.6      # J過程タブの全体の J のグラフの高さ [inch]
+PROGRESS_ROW_IN = 3.6      # J過程タブのグループごとのグラフ1段の高さ [inch]
+PROGRESS_PANEL_PX = 460    # グループごとのグラフ1枚の最小の幅 [px]（GUI の幅に合わせて列数を決める）
+
+
+def progress_columns(width_px, n_groups):
+    """J過程タブのグループごとのグラフの列数（GUI の幅に合わせる。2026-11-20 ユーザー指示）"""
+    return max(1, min(int(n_groups), int(max(width_px, 600) // PROGRESS_PANEL_PX)))
+
+
 def render_progress(hist, info, width_px):
-    """GUI の J過程タブ用の画像（PNG のバイト列。分析フォルダの J_progress.png と同じ図で、文字は日本語）"""
+    """GUI の J過程タブ用の画像（PNG のバイト列。分析フォルダの J_progress.png と同じ図で、文字は日本語）。
+    2グループ以上なら、一番上に全体の J のグラフを1枚、その下にグループごとの J_g のグラフを GUI の幅に合わせた列数で並べる
+    （2026-11-20 ユーザー指示。1グループなら従来どおり全体の1枚だけ）"""
     import io
     from matplotlib.figure import Figure
     from matplotlib.backends.backend_agg import FigureCanvasAgg
     dpi = 80
-    fig = Figure(figsize=(max(width_px, 600) / dpi, 5.6), dpi=dpi)
+    info = info or {}
+    groups = info.get('groups')
+    if not groups or len(groups) < 2:
+        fig = Figure(figsize=(max(width_px, 600) / dpi, 5.6), dpi=dpi)
+        FigureCanvasAgg(fig)
+        ax = fig.add_subplot(111)
+        plot_progress(ax, hist, info, _RENDER_LANG)
+        fig.tight_layout()
+        buf = io.BytesIO()
+        fig.savefig(buf, format='png')
+        return buf.getvalue()
+    ncol = progress_columns(width_px, len(groups))
+    nrow = int(math.ceil(len(groups) / ncol))
+    H = PROGRESS_TOP_IN + nrow * PROGRESS_ROW_IN
+    fig = Figure(figsize=(max(width_px, 600) / dpi, H), dpi=dpi)
     FigureCanvasAgg(fig)
-    ax = fig.add_subplot(111)
-    plot_progress(ax, hist, info or {}, _RENDER_LANG)
+    gs = fig.add_gridspec(1 + nrow, ncol, height_ratios=[PROGRESS_TOP_IN] + [PROGRESS_ROW_IN] * nrow)
+    plot_progress(fig.add_subplot(gs[0, :]), hist, info, _RENDER_LANG)
+    for k in range(len(groups)):
+        plot_group_progress(fig.add_subplot(gs[1 + k // ncol, k % ncol]), hist, info, k, _RENDER_LANG)
     fig.tight_layout()
     buf = io.BytesIO()
     fig.savefig(buf, format='png')
@@ -1038,21 +1247,46 @@ def render_end_pngs(folder, dofs, hist, J_thr, refs=None, progress=None):
     """終了時の画像を保存する（文字は英語）。
     DOF/DOF<d>/ に g2（累積誤差の推移。refs = {DOF: {'J_i': [...]}} でその自由度の FF=0 の基準試行も描く）と g3、
     progress（plot_progress の info）を与えれば分析フォルダ analysis_YYYYMMDD_HHMM/ に J_progress.png（英語）・
-    J_progress_ja.png（日本語）・J_share_FF0.png・J_share_best.png（J に占める各自由度の割合）も"""
+    J_progress_ja.png（日本語）・J_share_FF0.png・J_share_best.png（J に占める各自由度の割合）も。
+    2グループ以上で最後の組み合わせの測定があるときは、g2・J_progress・J_progress_g<k>・J_share_best を2通り保存する
+    （2026-11-21 ユーザー指示）：従来の名前 … 最後の測定を描かない（「載せない」版）、
+    *_with_final … ★の印を描き、best・グループの best の線（それまでの最小）の候補にも入れる（「載せる」版）"""
     L = SAVE_LANG
     refs = refs or {}
+    groups = (progress or {}).get('groups')
+    gmap = group_of_dof(groups)
+    two = bool(gmap) and has_final(hist)                # 「載せる」版も保存するか
     for d in dofs:
         base = os.path.join(folder, 'DOF', f'DOF{d}')
-        save_png(os.path.join(base, f'D{d}_g2_cost.png'), lambda ax: plot_g2(ax, L, d, hist, J_thr, refs.get(d)))
+        save_png(os.path.join(base, f'D{d}_g2_cost.png'),
+                 lambda ax: plot_g2(ax, L, d, hist, J_thr, refs.get(d), gmap.get(d), final='hide'))
+        if two:
+            save_png(os.path.join(base, f'D{d}_g2_cost_with_final.png'),
+                     lambda ax: plot_g2(ax, L, d, hist, J_thr, refs.get(d), gmap.get(d), final='include'))
         save_png(os.path.join(base, f'D{d}_g3_extrema.png'), lambda ax, ax2: plot_g3(ax, ax2, L, d, hist), twin=True)
     if progress is not None and any(h['state'] == 'COMPLETE' and h.get('J') is not None for h in hist):
         out = analysis_folder(folder)
-        save_png(os.path.join(out, 'J_progress.png'), lambda ax: plot_progress(ax, hist, progress, SAVE_LANG),
+        save_png(os.path.join(out, 'J_progress.png'), lambda ax: plot_progress(ax, hist, progress, SAVE_LANG, 'hide'),
                  size=(12.0, 4.8))
-        if setup_mpl_japanese() == 'ja':              # 日本語版（2026-11-06 ユーザー指示）。日本語のフォントがあるときだけ
-            save_png(os.path.join(out, 'J_progress_ja.png'), lambda ax: plot_progress(ax, hist, progress, 'ja'),
+        ja = setup_mpl_japanese() == 'ja'               # 従来と同じく、J_progress.png の後で日本語のフォントを設定する
+        if ja:                                          # 日本語版（2026-11-06 ユーザー指示）。日本語のフォントがあるときだけ
+            save_png(os.path.join(out, 'J_progress_ja.png'), lambda ax: plot_progress(ax, hist, progress, 'ja', 'hide'),
                      size=(12.0, 4.8))
-        save_share_pngs(out, list(dofs), hist, refs)  # J に占める各自由度の割合（FF=0 と best。2026-11-06 ユーザー指示）
+        if two:
+            save_png(os.path.join(out, 'J_progress_with_final.png'),
+                     lambda ax: plot_progress(ax, hist, progress, SAVE_LANG, 'include'), size=(12.0, 4.8))
+            if ja:
+                save_png(os.path.join(out, 'J_progress_with_final_ja.png'),
+                         lambda ax: plot_progress(ax, hist, progress, 'ja', 'include'), size=(12.0, 4.8))
+        if gmap:                                        # グループごとの J_g の推移（2グループ以上。2026-11-20 ユーザー指示）
+            for k in range(len(groups)):
+                for suf, mode in (('', 'hide'), ('_with_final', 'include')) if two else (('', 'hide'),):
+                    save_png(os.path.join(out, f'J_progress_g{k}{suf}.png'),
+                             lambda ax: plot_group_progress(ax, hist, progress, k, SAVE_LANG, mode), size=(12.0, 4.8))
+                    if ja:
+                        save_png(os.path.join(out, f'J_progress_g{k}{suf}_ja.png'),
+                                 lambda ax: plot_group_progress(ax, hist, progress, k, 'ja', mode), size=(12.0, 4.8))
+        save_share_pngs(out, list(dofs), hist, refs, groups=groups)  # J に占める各自由度の割合（FF=0 と best）
     return len(dofs)
 
 
@@ -1102,6 +1336,36 @@ def cfg_eval_time(cfg):
     return c.eval_time(cfg['T'], cfg_eval_min(cfg))
 
 
+def cfg_groups(cfg):
+    """最適化の単位のグループ（2026-11-20）。設定にない（それより前の study）なら全自由度で1グループ"""
+    g = cfg.get('groups')
+    if g:
+        return [[int(d) for d in x] for x in g]
+    return [list(cfg['dofs'])]
+
+
+def cfg_multi(cfg):
+    """2グループ以上か（1グループなら従来とまったく同じ処理）"""
+    return len(cfg_groups(cfg)) >= 2
+
+
+def cfg_amax(cfg):
+    """自由度ごとの A_max {DOF: 値} [PWM]（2026-11-20）。「自由度ごとに指定する」でなければ全自由度で共通の値"""
+    per = cfg.get('A_max_dof') if cfg.get('A_max_per_dof') else None
+    return {d: float(per[d]) if per is not None else float(cfg['A_max']) for d in cfg['dofs']}
+
+
+def cfg_amax_key(cfg):
+    """条件 hash の A_max：共通の値なら従来どおりその数値（同じ hash）。自由度ごとでも全部同じ値ならその数値、
+    違えば {DOF: 値}"""
+    if not cfg.get('A_max_per_dof'):
+        return cfg['A_max']
+    vals = sorted(set(cfg_amax(cfg).values()))
+    if len(vals) == 1:
+        return vals[0]
+    return {str(d): v for d, v in cfg_amax(cfg).items()}
+
+
 class OptimizationRun:
     def __init__(self, link, cfg, log, stop_event, events, lang='ja', resume_folder=None, offload=None,
                  enqueue_ff0=None):
@@ -1129,6 +1393,15 @@ class OptimizationRun:
         self.run_meta = {}
         self.safety = None
         self.dofs = list(cfg.get('dofs', []))
+        self._set_units()
+        self.ffmaps = {}                                # 自由度ごとの写像（A_max が自由度ごとに違えるため）
+        self.final_mem = None                           # 最後の組み合わせの測定（2グループ以上）
+
+    def _set_units(self):
+        """最適化の単位と自由度ごとの A_max を設定から読む（2026-11-20）"""
+        self.groups = cfg_groups(self.cfg) if self.cfg.get('dofs') else []
+        self.multi = len(self.groups) >= 2
+        self.amax = cfg_amax(self.cfg) if self.cfg.get('dofs') else {}
 
     # ---------------- 補助 ----------------
     def path(self, name):
@@ -1145,7 +1418,7 @@ class OptimizationRun:
         """条件 hash の項目。T_FF は T と違うときだけ入れ、評価時間の固定値は eval_rule の文字列に入れる
         （T_FF = T・固定値 5 秒なら、分ける前と同じ hash になり、それまでの study を再開できる）"""
         d = {'map_version': c.MAP_VERSION, 'm': cfg['m'], 'sep': cfg['sep'], 'r_margin': 1.01,
-             'r_range': [c.R_MIN, c.R_MAX], 'shrink': 1e-4, 'A_max': cfg['A_max'], 'A_min': c.A_MIN,
+             'r_range': [c.R_MIN, c.R_MAX], 'shrink': 1e-4, 'A_max': cfg_amax_key(cfg), 'A_min': c.A_MIN,
              'A_sign': 'signed A (|A| < 1 -> +-1)', 'rho': cfg['rho'], 'tabu_on': cfg['tabu_on'],
              'dofs': cfg['dofs'], 'T': cfg['T'], 'time_axis': '100 Hz publish (0.010 s)', 'eps': cfg['eps'],
              'eval_time': cfg_eval_time(cfg), 'eval_rule': f'max(1.5T, {cfg_eval_min(cfg):g} s)',
@@ -1156,6 +1429,8 @@ class OptimizationRun:
             d['T_ff'] = cfg_T_ff(cfg)
         if cfg_err_norm(cfg) != 'dP':                # ΔP で割らない評価値（割る場合は従来と同じ hash）
             d['err_norm'] = cfg_err_norm(cfg)
+        if cfg_multi(cfg):                           # 最適化の単位（2グループ以上だけ。1グループなら従来と同じ hash）
+            d['groups'] = cfg_groups(cfg)
         return d
 
     @staticmethod
@@ -1256,10 +1531,16 @@ class OptimizationRun:
             f"Sampler {cfg['sampler']}（seed {cfg['seed']}）, 最大試行数 {cfg['max_trials']}, "
             f"閾値 J ≤ {cfg['J_thr']:.3g}（RMS {cfg['rms_thr']:g} {c.rms_unit(cfg_err_norm(cfg))}）, "
             f"評価値 {'ΔP_i で割る' if cfg_err_norm(cfg) == 'dP' else 'ΔP_i で割らない [count²]'}")
+        if self.multi:
+            log(f"最適化の単位: グループ {len(self.groups)} 個（{c.format_groups(self.groups)}）。グループごとに J_g = "
+                f"グループ内の J_i の平均 を最小化。途中の確認試行はなく、最大試行数で終わったときに各グループの best を"
+                f"組み合わせた FF を1回測ります")
+        if cfg.get('A_max_per_dof'):
+            log("A_max（自由度ごと）: " + ", ".join(f"DOF{d} {self.amax[d]:g}" for d in self.dofs))
         log("FF の可行域の表を用意しています（初回だけ十数秒かかります）…")
         table = self._compute(c.ffmap_table_cached, cfg['m'], cfg['sep'])
         table.save(os.path.join(self.folder, 'ffmap_table.npz'))
-        self.ffmap = c.FFMap(table, cfg['A_max'])
+        self._make_ffmaps(table)
         log(f"FF の写像: s1 ∈ [{table.s1min:.4f}, {table.s1max:.4f}], 位置の余裕 m = {cfg['m']}, 最小間隔 sep = {cfg['sep']}")
         # 1. 基準試行（FF=0）
         refs = []
@@ -1344,16 +1625,23 @@ class OptimizationRun:
         D = 4 * len(self.dofs)
         n_prior = len(seeds) + len(past)
         n_startup = n_prior + max(10, 2 * D)
-        self.study = c.FFStudy(self.folder, self.dofs, cfg['A_max'], cfg['sampler'], cfg['seed'], n_startup, self.ffmap,
-                               cfg['rho'], cfg['tabu_on'], resume=False, x0=x0, log=log)
+        n_startup_groups = None
+        if self.multi:                              # グループごとに n_prior + max(20, 2D_g)（2026-11-20 ユーザー指示）
+            n_startup_groups = [c.group_n_startup(n_prior, g) for g in self.groups]
+            n_startup = n_startup_groups[0] if len(set(n_startup_groups)) == 1 else None
+        self.study = c.FFStudy(self.folder, self.dofs, self.amax, cfg['sampler'], cfg['seed'], n_startup, self.ffmap,
+                               cfg['rho'], cfg['tabu_on'], resume=False, x0=x0, log=log,
+                               groups=self.groups if self.multi else None, n_startup_groups=n_startup_groups)
         self.run_meta = {'cond': cond, 'cond_hash': c.condition_hash(cond), 'target_hash': target_hash,
                          'sampler': cfg['sampler'], 'seed': cfg['seed'], 'seeds_used': [cfg['seed']],
                          'n_prior': n_prior, 'n_startup': n_startup, 'sampler_args': c._jsonable(self.study.sampler_args),
                          'J_ref': J_refs, 'sigma_J': sigma, 'J_noise': J_noise, 'J_quant': J_quant}
+        if self.multi:
+            self.run_meta['n_startup_groups'] = n_startup_groups
         c.write_json_atomic(os.path.join(self.folder, 'run.json'), self.run_meta)
         self.study.study.set_user_attr('cond_hash', self.run_meta['cond_hash'])
         self.study.study.set_user_attr('target_hash', target_hash)
-        self.trials_csv = c.TrialsCsv(self.path('trials.csv'), c.trial_columns(self.dofs, cfg_err_norm(self.cfg)))
+        self.trials_csv = c.TrialsCsv(self.path('trials.csv'), self._trial_columns())
         for u, attrs in seeds:
             self.study.enqueue(u, attrs)
         for u, J, attrs, row in past:
@@ -1363,10 +1651,27 @@ class OptimizationRun:
             self.trials_csv.append(row)
             self.hist.append({'n': ft.number, 'state': 'COMPLETE', 'J': J, 'J_i': attrs.get('J_i', {}),
                               'ext': attrs.get('ext_sent', {}), 'source': 'past'})
-        log(f"study を作りました: 事前の候補 enqueue {len(seeds)} 個・過去の試行 add_trial {len(past)} 個, "
-            f"n_startup = {n_startup}（= {n_prior} + max(10, 2×{D})）")
+        if self.multi:
+            log(f"study を作りました: 事前の候補 enqueue {len(seeds)} 個・過去の試行 add_trial {len(past)} 個, "
+                f"グループごとの n_startup = {n_startup_groups}（= {n_prior} + max({c.N_STARTUP_MIN_GROUP}, 2D_g)）, "
+                f"seed はグループ k で {cfg['seed']} + k")
+        else:
+            log(f"study を作りました: 事前の候補 enqueue {len(seeds)} 個・過去の試行 add_trial {len(past)} 個, "
+                f"n_startup = {n_startup}（= {n_prior} + max(10, 2×{D})）")
         c.write_kv_csv(self.path('conditions.csv'), self._conditions_rows())
         self._emit_setup()
+
+    def _make_ffmaps(self, table):
+        """写像（共通の self.ffmap と、自由度ごとの A_max を持つ self.ffmaps）を作る"""
+        self.ffmap = c.FFMap(table, self.cfg['A_max'])
+        self.ffmaps = {d: c.FFMap(table, self.amax[d]) for d in self.dofs}
+
+    def _trial_columns(self):
+        """trials.csv の列（2グループ以上ならグループごとの J_g の列を足す）"""
+        cols = c.trial_columns(self.dofs, cfg_err_norm(self.cfg))
+        if self.multi:
+            cols += [f'g{k}_J' for k in range(len(self.groups))]
+        return cols
 
     def _ff0_candidate(self):
         """全自由度 FF=0 の候補。A = 0 は写像で |A| の下限（A_MIN = 1 PWM）に寄せられるので、最大 1 PWM の FF になる
@@ -1377,7 +1682,7 @@ class OptimizationRun:
         if seeds:
             u = seeds[0][0]
         else:
-            u = {d: {'u1': 0.5, 'u2': 0.5, 'u3': 0.5, 'A': 0.25 * self.cfg['A_max']} for d in self.dofs}
+            u = {d: {'u1': 0.5, 'u2': 0.5, 'u3': 0.5, 'A': 0.25 * self.amax[d]} for d in self.dofs}
         return {f'd{d}_{k}': float(u[d][k]) for d in self.dofs for k in ('u1', 'u2', 'u3', 'A')}
 
     def _setup_resume(self):
@@ -1386,9 +1691,12 @@ class OptimizationRun:
         self.cfg = load_json(os.path.join(folder, 'config.json'), {})
         cfg = self.cfg
         self.dofs = list(cfg['dofs'])
+        self._set_units()
         self.safety = c.SafetyConfig(**cfg['safety'])
         self._open_folder(folder)
         log(f"=== 再開: {folder}")
+        if self.multi:
+            log(f"最適化の単位: グループ {len(self.groups)} 個（{c.format_groups(self.groups)}）")
         self.run_meta = load_json(os.path.join(folder, 'run.json'), {})
         with open(os.path.join(folder, 'target.json'), encoding='utf-8') as f:
             tj = json.load(f)
@@ -1397,18 +1705,23 @@ class OptimizationRun:
         if c.condition_hash(now) != self.run_meta.get('cond_hash'):
             raise RuntimeError("条件 hash が一致しないため再開できません")
         table = c.FFMapTable.load(os.path.join(folder, 'ffmap_table.npz'))
-        self.ffmap = c.FFMap(table, cfg['A_max'])
-        self.study = c.FFStudy(folder, self.dofs, cfg['A_max'], cfg['sampler'], cfg['seed'], self.run_meta['n_startup'],
+        self._make_ffmaps(table)
+        self.study = c.FFStudy(folder, self.dofs, self.amax, cfg['sampler'], cfg['seed'], self.run_meta['n_startup'],
                                self.ffmap, cfg['rho'], cfg['tabu_on'], resume=True,
-                               x0=self.study_params_x0([]), log=log)
+                               x0=self.study_params_x0([]), log=log, groups=self.groups if self.multi else None,
+                               n_startup_groups=self.run_meta.get('n_startup_groups'))
         self.run_meta.setdefault('seeds_used', []).append(self.study.seed)
         c.write_json_atomic(os.path.join(folder, 'run.json'), self.run_meta)
         n_orphan = self.study.handle_orphans()
-        log(f"Sampler {cfg['sampler']} を seed {self.study.seed} で作り直しました。孤立した試行 {n_orphan} 個を FAIL にしました")
+        if self.multi:
+            log(f"Sampler {cfg['sampler']} をグループごとに seed {self.study.gseeds} で作り直しました。"
+                f"孤立した試行 {n_orphan} 個を FAIL にしました")
+        else:
+            log(f"Sampler {cfg['sampler']} を seed {self.study.seed} で作り直しました。孤立した試行 {n_orphan} 個を FAIL にしました")
         if self.enqueue_ff0:
             self.study.enqueue(self._ff0_candidate(), {'source': 'seed_ff0'})
             log("  再開の最初の候補として、全自由度 FF=0（振幅は下限の 1 PWM）の試行を enqueue しました")
-        self.trials_csv = c.TrialsCsv(self.path('trials.csv'), c.trial_columns(self.dofs, cfg_err_norm(self.cfg)))
+        self.trials_csv = c.TrialsCsv(self.path('trials.csv'), self._trial_columns())
         for t in self.study.trials():
             if t.state.name in ('COMPLETE', 'FAIL'):
                 self.hist.append({'n': t.number, 'state': t.state.name, 'J': t.user_attrs.get('J'),
@@ -1468,12 +1781,13 @@ class OptimizationRun:
                              f"{np.round(p, 4).tolist()} → {np.round(q, 4).tolist()}")
                 s1, s2, y1, y2 = q
                 amp = max(abs(y1), abs(y2))
-                if amp > self.cfg['A_max']:
-                    y1, y2 = y1 * self.cfg['A_max'] / amp, y2 * self.cfg['A_max'] / amp
-                    self.log(f"  初期候補: DOF {d} の振幅を A_max = {self.cfg['A_max']:g} に縮めました")
-                ud, why = self.ffmap.inverse(s1, y1, s2, y2, 1.0)
+                Am = self.amax[d]
+                if amp > Am:
+                    y1, y2 = y1 * Am / amp, y2 * Am / amp
+                    self.log(f"  初期候補: DOF {d} の振幅を A_max = {Am:g} に縮めました")
+                ud, why = self.ffmaps[d].inverse(s1, y1, s2, y2, 1.0)
                 if ud is None:
-                    ud = self._inverse_clamped(s1, y1, s2, y2)
+                    ud = self._inverse_clamped(s1, y1, s2, y2, Am)
                     self.log(f"  初期候補: DOF {d} は写像の範囲の外（{why}）なので、範囲の端へ寄せました")
                 u[d] = ud
             if u:
@@ -1481,7 +1795,8 @@ class OptimizationRun:
                 self.log(f"  初期候補を enqueue します: {os.path.basename(path)}")
         return out
 
-    def _inverse_clamped(self, s1, y1, s2, y2):
+    def _inverse_clamped(self, s1, y1, s2, y2, A_max=None):
+        A_max = self.cfg['A_max'] if A_max is None else A_max
         tb = self.ffmap.table
         u1 = min(max((s1 - tb.s1min) / (tb.s1max - tb.s1min), 0.0), 1.0)
         lo, hi = tb.bounds(tb.s1min + u1 * (tb.s1max - tb.s1min))
@@ -1491,7 +1806,7 @@ class OptimizationRun:
         rl, rh = c.r_interval_margin(np.array([s1c]), np.array([s2c]))
         r = -y2 / y1 if y1 != 0 else 1.0
         u3 = min(max((math.log(max(r, 1e-12)) - math.log(rl[0])) / (math.log(rh[0]) - math.log(rl[0])), 0.0), 1.0)
-        A = math.copysign(min(max(abs(y1), abs(y2)), self.cfg['A_max']), y1 if y1 != 0 else 1.0)
+        A = math.copysign(min(max(abs(y1), abs(y2)), A_max), y1 if y1 != 0 else 1.0)
         return {'u1': u1, 'u2': u2, 'u3': u3, 'A': A}
 
     def _past_candidates(self, ref):
@@ -1523,7 +1838,7 @@ class OptimizationRun:
                     ok = False
                     break
                 t1, y1, t2, y2 = c.extrema_of(co, T_ff)
-                ud, why = self.ffmap.inverse(t1, y1, t2, y2, T_ff)
+                ud, why = self.ffmaps[d].inverse(t1, y1, t2, y2, T_ff)
                 if ud is None:
                     ok = False
                     break
@@ -1570,6 +1885,8 @@ class OptimizationRun:
             if st.n_complete() >= cfg['max_trials']:
                 self.status = ('completed', f"最大試行数（COMPLETE {cfg['max_trials']} 回）")
                 log(f"=== 最大試行数 {cfg['max_trials']} に達しました")
+                if self.multi:                          # 各グループの best を組み合わせた FF を1回測る（2026-11-20）
+                    self._final_combo()
                 break
             trial = st.ask()
             try:
@@ -1597,7 +1914,7 @@ class OptimizationRun:
             kind = res['kind']
             if kind == 'complete':
                 consec = {'norobot': 0, 'unsafe': 0, 'eval': 0}
-                if res['J'] <= cfg['J_thr']:
+                if not self.multi and res['J'] <= cfg['J_thr']:     # 2グループ以上では途中の確認試行・終了はしない
                     conv, stop_reason = self._confirm(trial, res)
                     if conv:
                         self.status = ('completed', '収束（確認試行も閾値以下）')
@@ -1676,7 +1993,7 @@ class OptimizationRun:
             designs[d] = self.ffmap.design(u[d]['u1'], u[d]['u2'], u[d]['u3'], u[d]['A'], T)
             ff_rows[c.FF_INDEX[d]] = designs[d]['coeffs']
         for d in self.dofs:
-            checks[d] = c.presend_check(ff_rows[c.FF_INDEX[d]], T, self.cfg['A_max'])
+            checks[d] = c.presend_check(ff_rows[c.FF_INDEX[d]], T, self.amax[d])
         sent = ff_rows.astype(np.float32).astype(float)
         return designs, checks, sent
 
@@ -1706,7 +2023,7 @@ class OptimizationRun:
         r.update(extra or {})
         self._add_best_cols(r)
         self.trials_csv.append(r)
-        self.hist.append({'n': n, 'state': 'FAIL', 'fail_class': fail_class})
+        self.hist.append({'n': n, 'state': 'FAIL', 'fail_class': fail_class, 'source': r.get('source')})
         self.emit('hist', list(self.hist))
 
     def _add_best_cols(self, r):
@@ -1800,6 +2117,7 @@ class OptimizationRun:
         attrs.update({'J_i': {str(d): v for d, v in J_i.items()}, 'files': files, 'remeasure': m.attempts,
                       'missing': {str(d): s.missing() for d, s in m.series.items()}, 'rest_ok': m.rest_ok,
                       'P0': {str(d): s.P0 for d, s in m.series.items()}})
+        self._group_cols(row, J_i)
         st.tell_complete(trial, J, attrs)
         row.update({'trial': n, 'state': 'COMPLETE', 'J': J, 'log10J': math.log10(max(J, 1e-12)),
                     c.rms_column(cfg_err_norm(cfg)): c.rms_value(J, cfg_err_norm(cfg)), 'remeasure': len(m.attempts),
@@ -1811,16 +2129,33 @@ class OptimizationRun:
             + (f"  測り直し {len(m.attempts)} 回" if m.attempts else ''))
         return {'kind': 'complete', 'J': J, 'sent': sent, 'params': dict(trial.params)}
 
+    def _group_cols(self, row, J_i):
+        """2グループ以上：trials.csv のグループごとの J_g の列"""
+        if self.multi:
+            for k, g in enumerate(self.groups):
+                row[f'g{k}_J'] = c.group_mean(J_i, g)
+
     def _after_complete(self, n, J, J_i, m, sent, designs, row, attrs):
-        b = self.study.best()
-        if b is not None and b.number == n:
-            self.best_mem = {'n': n, 'J': J, 'rec': m.rec, 'series': m.series, 'info': m.info, 'sent': sent}
-            self.best_pot = {d: s for d, s in m.series.items()}
-            self.log(f"  best を更新しました（試行 {n}）")
+        if self.multi:                                  # グループごとの best（2026-11-20）。g1 の best の線もそのグループの試行
+            upd = []
+            for k, (t, v) in enumerate(self.study.group_bests()):
+                if t is not None and t.number == n:
+                    for d in self.groups[k]:
+                        self.best_pot[d] = m.series[d]
+                    upd.append(f"{k}（J_g = {v:.4g}）")
+            if upd:
+                self.log(f"  グループの best を更新しました（試行 {n}）: グループ " + "、".join(upd))
+        else:
+            b = self.study.best()
+            if b is not None and b.number == n:
+                self.best_mem = {'n': n, 'J': J, 'rec': m.rec, 'series': m.series, 'info': m.info, 'sent': sent}
+                self.best_pot = {d: s for d, s in m.series.items()}
+                self.log(f"  best を更新しました（試行 {n}）")
         self._add_best_cols(row)
         self.trials_csv.append(row)
         self.hist.append({'n': n, 'state': 'COMPLETE', 'J': J, 'J_i': {str(d): v for d, v in J_i.items()},
-                          'ext': attrs.get('ext_sent', {}), 'confirm_of': row.get('confirm_of')})
+                          'ext': attrs.get('ext_sent', {}), 'confirm_of': row.get('confirm_of'),
+                          'source': row.get('source')})
         payload = self._payload(n, m, sent, designs)
         self.emit('trial', payload)
         self.emit('hist', list(self.hist))
@@ -1879,6 +2214,80 @@ class OptimizationRun:
         log(f"  確認試行（試行 {ft.number}）: J = {J2:.4g}。2回の平均 {mean:.4g}"
             f"{' ≤ ' if mean <= cfg['J_thr'] else ' > '}閾値 {cfg['J_thr']:.3g}")
         return mean <= cfg['J_thr'], None
+
+    def _final_combo(self):
+        """最大試行数で終わったとき（2グループ以上）：各グループの best を組み合わせた FF を1回だけ測る（2026-11-20 ユーザー指示）。
+        source='final' として記録用の study に残すが、最大試行数・best・グループの best には数えず、グループの study にも返さない。
+        閾値 J_thr は、測った J と比べて報告するだけに使う"""
+        cfg, log, st = self.cfg, self.log, self.study
+        bests = st.group_bests()
+        missing = [k for k, (t, _v) in enumerate(bests) if t is None]
+        if missing:
+            log(f"=== 最後の組み合わせの測定: best のないグループ {missing} があるので測りません")
+            return
+        u = st.combo_u(bests)
+        src = {d: t.number for g, (t, _v) in zip(self.groups, bests) for d in g}
+        J_i_pred = {d: float(t.user_attrs['J_i'][str(d)]) for g, (t, _v) in zip(self.groups, bests) for d in g}
+        J_pred = float(np.mean([J_i_pred[d] for d in self.dofs]))
+        log(f"=== 最後の組み合わせの測定（各グループの best を組み合わせた FF。J の予測 {J_pred:.4g} = best の J_i の平均）===")
+        log("  " + "、".join(f"グループ {k}: 試行 {t.number}（J_g = {v:.4g}）" for k, (t, v) in enumerate(bests)))
+        designs, checks, sent = self._design(u)
+        row, attrs = self._flat(u, designs, checks, sent)
+        row.update({'source': 'final', 'started_at': time.strftime('%Y-%m-%d %H:%M:%S')})
+        attrs.update({'combo_of': {str(d): n for d, n in src.items()}, 'J_pred': J_pred})
+        params = st.params_of(u)
+        bad = {d: ch['reasons'] for d, ch in checks.items() if not ch['ok']}
+        fail = ('presend', f"送信前の検証に不合格: {bad}", None) if bad else None
+        m = None
+        if fail is None:
+            rest_ref = {d: self.targets[d].P0_ref for d in self.dofs}
+            try:
+                m = c.measure_with_retries(self.link, cfg['initial'], cfg['target'], self.dofs, sent, cfg['T'],
+                                           cfg['wait'], self.safety, self.stop, log, rest_ref, T_ff=cfg_T_ff(cfg),
+                                           eval_min=cfg_eval_min(cfg))
+                J2, J_i2 = c.evaluate(m.series, self.targets, cfg_err_norm(self.cfg))
+                if not np.isfinite(J2):
+                    fail = ('eval', 'J を計算できません', None)
+            except c.StopRequested:
+                fail = ('stopped', '停止ボタン', ('stopped', '停止ボタン（最後の組み合わせの測定中）'))
+            except c.UnsafeAbort as exc:
+                fail = ('unsafe', str(exc), None)
+            except c.SensorFault as exc:
+                fail = ('sensor', str(exc), ('stopped', str(exc)))
+            except c.CommFail as exc:
+                fail = ('comm', str(exc), ('stopped', str(exc)))
+            except c.TrialIssue as exc:
+                fail = ('eval', exc.reason, None)
+        if fail is not None:
+            ft = st.add_confirm(params, attrs=dict(attrs, source='final'), fail_class=fail[0], reason=fail[1])
+            if fail[0] == 'unsafe':
+                st.add_tabu(u)
+            log(f"  最後の組み合わせの測定（試行 {ft.number}）は失敗しました（{fail[0]}）: {fail[1]}")
+            self._row_fail(ft.number, fail[0], fail[1], 'final', row)
+            if fail[2]:
+                self.status = fail[2]
+            return
+        J_g2 = [c.group_mean(J_i2, g) for g in self.groups]
+        ft = st.add_confirm(params, J2, attrs=dict(attrs, source='final', J_i={str(d): v for d, v in J_i2.items()},
+                                                   J_g=J_g2))
+        name = f'trial_{ft.number:03d}.npz'
+        c.save_trial_npz_ext(self.tpath(name), m.rec, dict(self._npz_extra(m, sent), J=J2, final=1))
+        for d, s in m.series.items():
+            row.update({f'd{d}_J_i': J_i2[d], f'd{d}_P0': s.P0, f'd{d}_delta_P0': s.P0 - self.targets[d].P0_ref,
+                        f'd{d}_missing': s.missing()})
+        row.update({'trial': ft.number, 'state': 'COMPLETE', 'J': J2, 'log10J': math.log10(max(J2, 1e-12)),
+                    c.rms_column(cfg_err_norm(cfg)): c.rms_value(J2, cfg_err_norm(cfg)), 'remeasure': len(m.attempts),
+                    'missing_max': max(s.missing() for s in m.series.values()),
+                    'finished_at': time.strftime('%Y-%m-%d %H:%M:%S')})
+        self._group_cols(row, J_i2)
+        self.final_mem = {'n': ft.number, 'J': J2, 'rec': m.rec, 'series': m.series, 'info': m.info, 'sent': sent}
+        self._after_complete(ft.number, J2, J_i2, m, sent, designs, row, attrs)
+        thr = cfg['J_thr']
+        log(f"  最後の組み合わせの測定（試行 {ft.number}）: J = {J2:.4g}（予測 {J_pred:.4g}）"
+            f"{' ≤ ' if J2 <= thr else ' > '}閾値 {thr:.3g}（RMS {c.rms_value(J2, cfg_err_norm(cfg)):.3g} "
+            f"{c.rms_unit(cfg_err_norm(cfg))}）")
+        log("  グループごとの J_g（この測定 / best）: " + "、".join(
+            f"{k}: {v:.4g} / {bv:.4g}" for k, (v, (_t, bv)) in enumerate(zip(J_g2, bests))))
 
     # ---------------- グラフ ----------------
     def _payload(self, n, m, sent, designs):
@@ -1952,7 +2361,8 @@ class OptimizationRun:
             ('写像', '版', c.MAP_VERSION, '案4（s1, s2 は正確な境界、r は閉形式、符号付き A）'),
             ('写像', '位置の余裕 m / 最小間隔 sep', f"{cfg['m']} / {cfg['sep']}", 's = t/T_FF'),
             ('写像', 'r の余裕 / 範囲', f"1.01 / [{c.R_MIN:g}, {c.R_MAX:g}]", 'r = −y2/y1'),
-            ('写像', 'A_max / |A| の下限', f"{cfg['A_max']} / {c.A_MIN}", '[PWM]'),
+            ('写像', 'A_max / |A| の下限', f"{cfg['A_max']} / {c.A_MIN}",
+             '[PWM]' if not cfg.get('A_max_per_dof') else '[PWM]（A_max は自由度ごと。下の行）'),
             ('目標軌道', 'ε', cfg['eps'], '完了: t ≥ T で |y| ≤ ε|ΔP|'),
             ('目標軌道', 'ξ の上限 / ωn の上限', f"{c.XI_CAP:.6g} / {c.WN_MAX:g}", 'ξ ≤ ln 10'),
             ('評価', '累積誤差', 'J_i = mean((POT − Target)/ΔP)²' if cfg_err_norm(cfg) == 'dP'
@@ -1965,8 +2375,15 @@ class OptimizationRun:
             ('評価', 'J_noise / 量子化の下限', f"{meta.get('J_noise')} / {meta.get('J_quant')}", ''),
             ('Optuna', 'Sampler', cfg['sampler'], json.dumps(meta.get('sampler_args'), ensure_ascii=False)),
             ('Optuna', 'seed（開始時・再開時）', cfg['seed'], str(meta.get('seeds_used'))),
-            ('Optuna', 'n_prior / n_startup', f"{meta.get('n_prior')} / {meta.get('n_startup')}",
-             'n_startup = n_prior + max(10, 2D)'),
+        ] + ([
+            ('Optuna', '最適化の単位', GROUP_MODE_LABELS.get(cfg.get('group_mode', 'all'), cfg.get('group_mode')),
+             f"グループ {len(self.groups)} 個（グループごとに J_g = グループ内の J_i の平均 を最小化）"),
+            ('Optuna', 'グループ', c.format_groups(self.groups), 'グループ k は study optuna_ff_g<k>（seed + k）'),
+        ] if self.multi else []) + [            # 1グループのときは従来と同じ行（2026-11-20）
+            ('Optuna', 'n_prior / n_startup',
+             f"{meta.get('n_prior')} / {meta.get('n_startup_groups') if self.multi else meta.get('n_startup')}",
+             f'グループごとに n_startup = n_prior + max({c.N_STARTUP_MIN_GROUP}, 2D_g)' if self.multi
+             else 'n_startup = n_prior + max(10, 2D)'),
             ('Optuna', '最大試行数', cfg['max_trials'], 'COMPLETE の数'),
             ('Optuna', 'study', f"{c.STUDY_NAME} / study.journal", 'JournalStorage(JournalFileBackend)'),
             ('Optuna', '近傍棄却', f"{'有効' if cfg['tabu_on'] else '無効'} ρ = {cfg['rho']}", ''),
@@ -1986,6 +2403,8 @@ class OptimizationRun:
             sp = self.targets.get(d)
             jr = cfg['safety']['joint'][d] if cfg['safety'].get('joint') else POT_RANGE[d]
             rows.append(('目標値', f'DOF {d}', f"{cfg['initial'][d]:g} -> {cfg['target'][d]:g}", f'可動範囲 {jr}'))
+            if cfg.get('A_max_per_dof'):
+                rows.append(('写像', f'A_max DOF {d}', self.amax[d], '[PWM]（自由度ごと）'))
             if sp is not None:
                 rows.append(('目標軌道', f'DOF {d}', f"T1={sp.T1:.6g} wn={sp.wn:.6g} kappa={sp.kappa:.6g} xi={sp.xi:.6g} "
                                                      f"active={sp.active} method={sp.method} cost={sp.cost:.6g}",
@@ -2002,11 +2421,79 @@ class OptimizationRun:
         return {d: {'J_i': list(self.targets[d].J_ref) if d in self.targets else []} for d in self.dofs}
 
     def _progress_info(self):
-        """分析フォルダの J_progress.png に書く条件"""
-        return {'J_ref': list(self.run_meta.get('J_ref') or []), 'J_thr': self.cfg['J_thr'],
+        """分析フォルダの J_progress.png に書く条件。2グループ以上なら、グループ・グループごとの n_startup・
+        自由度ごとの基準試行の J_i の平均も入れる（J過程タブ・J_progress_g<k>.png 用）"""
+        info = {'J_ref': list(self.run_meta.get('J_ref') or []), 'J_thr': self.cfg['J_thr'],
                 'rms_thr': self.cfg.get('rms_thr'), 'rms_unit': '%' if cfg_err_norm(self.cfg) == 'dP' else ' count',
                 'n_startup': self.run_meta.get('n_startup'), 'T': self.cfg['T'],
                 'T_ff': cfg_T_ff(self.cfg)}
+        if self.multi:
+            info['groups'] = [list(g) for g in self.groups]
+            info['n_startup_groups'] = self.run_meta.get('n_startup_groups')
+            info['ref_Ji'] = {str(d): float(np.mean(self.targets[d].J_ref)) for d in self.dofs
+                              if d in self.targets and self.targets[d].J_ref}
+        return info
+
+    def _load_trial(self, n):
+        """保存した試行の npz を読み、(rec, series, info, sent) を返す"""
+        path = self.tpath(f'trial_{n:03d}.npz')
+        rec = c.load_trial_npz(path)
+        with np.load(path, allow_pickle=False) as z:
+            sent = z['x_ff_sent_rows'].copy() if 'x_ff_sent_rows' in z.files else rec.ff
+        series, info = c.extract_series(rec.raw, self.cfg['initial'], self.cfg['target'], self.dofs,
+                                        rec.t_target, self.cfg['T'], eval_min=cfg_eval_min(self.cfg))
+        return rec, series, info, sent
+
+    def _save_groups(self):
+        """2グループ以上の結果の保存（2026-11-20 ユーザー指示）：
+        results.csv … 各グループの best を組み合わせた FF。group_best.csv … 自由度ごとのグループの best。
+        best_trial_g<k>.csv … グループ k の best の試行の受信データ。final_trial(_grid).csv … 最後の組み合わせの測定。
+        戻り値: 組み合わせを書けたか"""
+        log, st = self.log, self.study
+        bests = st.group_bests()
+        missing = [k for k, (t, _v) in enumerate(bests) if t is None]
+        if len(missing) == len(bests):
+            log("COMPLETE の試行がないので、結果 CSV は書きません")
+            return False
+        T_ff = cfg_T_ff(self.cfg)
+        rows = []
+        for k, (g, (t, v)) in enumerate(zip(self.groups, bests)):
+            for d in g:
+                r = {'group': k, 'group_dofs': c.format_groups([g]), 'DOF': d,
+                     'best_trial': t.number if t is not None else None, 'J_g': v if t is not None else None}
+                if t is not None:
+                    ji = float(t.user_attrs['J_i'][str(d)])
+                    ref = float(np.mean(self.targets[d].J_ref)) if self.targets[d].J_ref else float('nan')
+                    ext = (t.user_attrs.get('ext_sent') or {}).get(str(d)) or [None] * 4
+                    u = self.study.u_of(t.params)[d]
+                    r.update({'J_i': ji, 'J_i_ref': ref, 'J_i/J_i_ref': ji / ref if ref else None,
+                              't1': ext[0], 'y1': ext[1], 't2': ext[2], 'y2': ext[3], 'T_FF': T_ff,
+                              'u1': u['u1'], 'u2': u['u2'], 'u3': u['u3'], 'A': u['A'], 'A_max': self.amax[d]})
+                rows.append(r)
+        c.write_dict_rows(self.path('group_best.csv'), rows)
+        done = {}
+        for k, (t, _v) in enumerate(bests):
+            if t is None:
+                continue
+            if t.number not in done:
+                done[t.number] = self._load_trial(t.number)
+            rec, _series, info, _sent = done[t.number]
+            c.write_trial_timeseries(self.path(f'best_trial_g{k}.csv'), rec, c.ff_times_for_csv(rec, info))
+        if missing:
+            log(f"best のないグループ {missing} があるので、組み合わせの結果 CSV は書きません（group_best.csv は書きました）")
+            return False
+        _d, _ch, sent = self._design(st.combo_u(bests))
+        c.write_results_csv(self.path('results.csv'), self.cfg['initial'], self.cfg['target'], T_ff, sent)
+        if self.final_mem is not None:
+            fm = self.final_mem
+            c.write_trial_timeseries(self.path('final_trial.csv'), fm['rec'], c.ff_times_for_csv(fm['rec'], fm['info']))
+            c.write_grid_csv(self.path('final_trial_grid.csv'), fm['series'], self.targets, fm['sent'], T_ff)
+            log(f"保存: 最後の組み合わせの測定は試行 {fm['n']}（J = {fm['J']:.4g}）")
+        J_pred = float(np.mean([float(t.user_attrs['J_i'][str(d)]) for g, (t, _v) in zip(self.groups, bests)
+                                for d in g]))
+        log(f"保存: results.csv は各グループの best を組み合わせた FF（J の予測 {J_pred:.4g}）。"
+            f"グループごとの best: " + "、".join(f"{k}: 試行 {t.number}" for k, (t, _v) in enumerate(bests)))
+        return True
 
     def _save_all(self):
         if self.folder is None:
@@ -2018,7 +2505,9 @@ class OptimizationRun:
             if self.study is None:
                 return
             b = self.study.best()
-            if b is not None:
+            if self.multi:
+                self._save_groups()
+            elif b is not None:
                 if self.best_mem is not None and self.best_mem['n'] == b.number:
                     rec, series, info, sent = (self.best_mem[k] for k in ('rec', 'series', 'info', 'sent'))
                 else:
@@ -2044,7 +2533,10 @@ class OptimizationRun:
                 render_end_pngs(*end_args)
             if b is not None:
                 log(f"分析フォルダ: {analysis_folder(self.folder)}（J_progress.png・J_progress_ja.png・"
-                    f"J_share_FF0.png・J_share_best.png）")
+                    f"J_share_FF0.png・J_share_best.png"
+                    f"{'・J_progress_g<k>.png・J_progress_g<k>_ja.png' if self.multi else ''}）"
+                    + ("。最後の組み合わせの測定を載せた版は *_with_final.png（DOF/ の g2 も）"
+                       if self.multi and self.final_mem is not None else ''))
             log(f"保存先: {self.folder}")
         except Exception as exc:
             log(f"保存に失敗しました: {exc}\n{traceback.format_exc()}")
@@ -2099,6 +2591,48 @@ class JointTable:
         for (a, b), (lo, hi) in zip(self.vars, values):
             a.set(f"{lo:g}")
             b.set(f"{hi:g}")
+
+
+class AmaxTable:
+    """自由度ごとの FF の振幅の上限 A_max [PWM]（2026-11-20 ユーザー指示）。「自由度ごとに指定する」のときだけ使い、
+    そうでなければ欄を無効にして、全自由度で共通の A_max を使う"""
+
+    PER_ROW = 9
+
+    def __init__(self, parent, values):
+        self.frame = ttk.LabelFrame(parent, text="自由度ごとの A_max [PWM]（「A_max を自由度ごとに指定する」のときだけ使う。1〜255）")
+        self.frame.pack(fill=tk.X, padx=6, pady=4)
+        self.vars, self.entries = [], []
+        for d in range(c.N_DOF):
+            r, col = divmod(d, self.PER_ROW)
+            ttk.Label(self.frame, text=f"DOF {d}").grid(row=r, column=2 * col, padx=(6, 2), pady=2, sticky='e')
+            v = tk.StringVar(value=_fmt(values[d]))
+            e = ttk.Entry(self.frame, textvariable=v, width=6)
+            e.grid(row=r, column=2 * col + 1, padx=(0, 4), pady=2, sticky='w')
+            self.vars.append(v)
+            self.entries.append(e)
+
+    def get(self, dofs, default):
+        """26個の値。対象の自由度は 1〜255 の数値でなければ ValueError（対象外の自由度は読めなければ default）"""
+        out = []
+        for d, v in enumerate(self.vars):
+            if d in dofs:
+                out.append(parse_float(v.get(), f"DOF {d} の A_max", lo=1.0, hi=255.0))
+            else:
+                try:
+                    x = float(v.get())
+                    out.append(x if math.isfinite(x) else float(default))
+                except ValueError:
+                    out.append(float(default))
+        return out
+
+    def set(self, values):
+        for v, x in zip(self.vars, values):
+            v.set(_fmt(x))
+
+    def set_enabled(self, on):
+        for e in self.entries:
+            e.state(['!disabled'] if on else ['disabled'])
 
 
 class FileList:
@@ -2196,9 +2730,18 @@ class App:
         self._norm_changed()
         self.basic.add('eps', "完了の許容 ε [% of ΔP]", s.get('eps', 2.0), note="目標軌道は t ≥ T で |y| ≤ ε|ΔP|")
         self.basic.add('A_max', "FF の振幅の上限 A_max [PWM]", s.get('A_max', 255.0), note="≤ 255。最初の実機確認では小さく")
+        self.amax_var = tk.BooleanVar(value=bool(s.get('A_max_per_dof', False)))      # 2026-11-20
+        ttk.Checkbutton(self.basic.frame, text="A_max を自由度ごとに指定する（下の表。外すと全自由度で上の値）",
+                        variable=self.amax_var, command=self._refresh_states).grid(
+            row=self.basic.row, column=0, columnspan=3, sticky='w', padx=4)
+        self.basic.row += 1
         self.basic.add('base', "保存先フォルダ", s.get('base', os.path.expanduser('~/ArmRobot/optimize_data')), width=50)
         ttk.Button(self.basic.frame, text="参照…", command=self.ask_base).grid(
             row=self.basic.row - 1, column=2, sticky='w')
+        amax0 = s.get('A_max_dof')
+        if not isinstance(amax0, list) or len(amax0) != c.N_DOF:
+            amax0 = [s.get('A_max', 255.0)] * c.N_DOF
+        self.amax_table = AmaxTable(tab, amax0)
 
         tab_s = ttk.Frame(self.nb)
         self.nb.add(tab_s, text="探索")
@@ -2212,6 +2755,17 @@ class App:
         ttk.Label(fr, text=("TPE（multivariate）が既定。" + ("" if self.torch_ok else f"GP は選べません: {self.torch_why}")),
                   foreground='#555').grid(row=self.search.row, column=2, sticky='w')
         self.search.row += 1
+        ttk.Label(fr, text="最適化の単位").grid(row=self.search.row, column=0, sticky='w', padx=4)   # 2026-11-20
+        mode0 = s.get('group_mode') if s.get('group_mode') in GROUP_MODE_LABELS else 'all'
+        self.group_var = tk.StringVar(value=GROUP_MODE_LABELS[mode0])
+        self.group_cb = ttk.Combobox(fr, textvariable=self.group_var, values=list(GROUP_MODE_LABELS.values()),
+                                     state='readonly', width=58)
+        self.group_cb.grid(row=self.search.row, column=1, columnspan=2, sticky='w', padx=4)
+        self.group_cb.bind('<<ComboboxSelected>>', lambda e: self._refresh_states())
+        self.search.row += 1
+        self.group_entry = self.search.add(
+            'groups', "グループ（「グループを指定」のとき）", s.get('groups_text', ''), width=40,
+            note="例: 0-5; 6,7,8; 9 10（; で区切る。対象の自由度をちょうど1回ずつ）")
         self.search.add('seed', "乱数の seed", s.get('seed', 1))
         self.search.add('m', "極値の位置の余裕 m（s = t/T）", s.get('m', 0.02))
         self.search.add('sep', "極値の最小間隔 sep（s）", s.get('sep', 0.02))
@@ -2326,6 +2880,7 @@ class App:
         ttk.Button(ctrl, text="設定を保存", command=self.save_settings).pack(side=tk.LEFT, padx=4)
         self.status = ttk.Label(ctrl, text="待機中")
         self.status.pack(side=tk.LEFT, padx=12)
+        self._refresh_states()
         self.root.protocol('WM_DELETE_WINDOW', self.on_close)
         self._after = self.root.after(100, self.tick)
 
@@ -2402,6 +2957,10 @@ class App:
                 if not lo <= v <= hi:
                     raise ValueError(f"DOF {d} の{nm} {v:g} が関節の可動範囲 [{lo:g}, {hi:g}] の外です")
         A_max = parse_float(b.get('A_max'), 'A_max', lo=1.0, hi=255.0)
+        amax_per = bool(self.amax_var.get())
+        amax_dof = self.amax_table.get(dofs, A_max) if amax_per else None
+        group_mode = self.group_mode()
+        groups = c.resolve_groups(group_mode, sr.get('groups'), dofs)       # 重複・欠落などは ValueError
         return {
             'T': T, 'T_ff': T_ff, 'eval_min': E, 'dofs': dofs,
             'wait': parse_float(b.get('wait'), '待機時間', lo=0.0, hi=600.0),
@@ -2415,6 +2974,8 @@ class App:
             'rho': parse_float(sr.get('rho'), 'ρ', lo=0.0, hi=2.0), 'tabu_on': bool(self.tabu_var.get()),
             'seed_csv': self.seed_files.get(), 'past_npz': self.past_files.get(), 'use_past': bool(self.use_past_var.get()),
             'seed_ff0': bool(self.ff0_var.get()),
+            'group_mode': group_mode, 'groups_text': sr.get('groups'), 'groups': groups,
+            'A_max_per_dof': amax_per, 'A_max_dof': amax_dof,
             'safety': safety,
             'limits': {'norobot': int(parse_float(sa.get('lim_norobot'), '上限', lo=1, hi=10000)),
                        'unsafe': int(parse_float(sa.get('lim_unsafe'), '上限', lo=1, hi=10000)),
@@ -2476,6 +3037,8 @@ class App:
             'sampler': self.sampler_var.get(), 'seed': sr.get('seed'), 'm': sr.get('m'), 'sep': sr.get('sep'),
             'rho': sr.get('rho'), 'tabu_on': bool(self.tabu_var.get()), 'seed_csv': self.seed_files.get(),
             'use_past': bool(self.use_past_var.get()), 'past_npz': self.past_files.get(), 'seed_ff0': bool(self.ff0_var.get()),
+            'group_mode': self.group_mode(), 'groups_text': sr.get('groups'),
+            'A_max_per_dof': bool(self.amax_var.get()), 'A_max_dof': [v.get() for v in self.amax_table.vars],
             'safety': {k: sa.get(k) for k in ('sensor_lo', 'sensor_hi', 'dev_const', 'rest_tol', 'still_wait',
                                               'missing_tol', 'remeasure_max')}
             | {'joint': [[a.get(), b_.get()] for a, b_ in self.joint.vars]},
@@ -2508,6 +3071,17 @@ class App:
         """選んだ評価値の正規化（'dP' / 'none'）"""
         return next((k for k, v in ERR_NORM_LABELS.items() if v == self.norm_var.get()), 'dP')
 
+    def group_mode(self):
+        """選んだ最適化の単位（'all' / 'each' / 'custom'）"""
+        return next((k for k, v in GROUP_MODE_LABELS.items() if v == self.group_var.get()), 'all')
+
+    def _refresh_states(self):
+        """グループの欄は「グループを指定」のときだけ、自由度ごとの A_max の表はチェックしたときだけ使えるようにする
+        （実行中はすべて無効のまま）"""
+        running = self.worker is not None and self.worker.is_alive()
+        self.group_entry.state(['!disabled'] if (self.group_mode() == 'custom' and not running) else ['disabled'])
+        self.amax_table.set_enabled(bool(self.amax_var.get()) and not running)
+
     def _norm_changed(self):
         """評価値の選択に合わせて、終了閾値の単位の表示を変える（ΔP で割るなら % of ΔP、割らないなら count）"""
         if self.err_norm() == 'dP':
@@ -2530,6 +3104,11 @@ class App:
         for k in ('seed', 'm', 'sep', 'rho'):
             self.search.set(k, cfg[k])
         self.tabu_var.set(cfg['tabu_on'])
+        self.group_var.set(GROUP_MODE_LABELS.get(cfg.get('group_mode', 'all'), GROUP_MODE_LABELS['all']))
+        self.search.set('groups', cfg.get('groups_text') or (c.format_groups(cfg_groups(cfg)) if cfg_multi(cfg) else ''))
+        self.amax_var.set(bool(cfg.get('A_max_per_dof')))
+        if cfg.get('A_max_dof'):
+            self.amax_table.set(cfg['A_max_dof'])
         for k, v in cfg['safety'].items():
             if k != 'joint':
                 self.safe.set(k, v)
@@ -2566,6 +3145,8 @@ class App:
         for b in (self.btn_start, self.btn_resume):
             b.configure(state='disabled' if on else 'normal')
         self.btn_stop.configure(state='normal' if on else 'disabled')
+        if not on:
+            self._refresh_states()                      # グループの欄・自由度ごとの A_max の表は選択に合わせて戻す
 
     # ---------------- 開始・再開・停止 ----------------
     def _prechecks(self, dofs):
@@ -2613,13 +3194,20 @@ class App:
             return
         if not self._prechecks(cfg['dofs']):
             return
-        moves = "\n".join(f"  DOF {d}: {cfg['initial'][d]:g} → {cfg['target'][d]:g}" for d in cfg['dofs'])
+        moves = "\n".join(f"  DOF {d}: {cfg['initial'][d]:g} → {cfg['target'][d]:g}"
+                          + (f"（A_max {cfg['A_max_dof'][d]:g}）" if cfg.get('A_max_per_dof') else '')
+                          for d in cfg['dofs'])
+        unit = GROUP_MODE_LABELS[cfg['group_mode']]
+        if cfg_multi(cfg):
+            unit += f"：グループ {len(cfg['groups'])} 個（{c.format_groups(cfg['groups'])}）"
+        amax_txt = "自由度ごと（上の一覧）" if cfg.get('A_max_per_dof') else f"{cfg['A_max']:g} PWM"
         if not messagebox.askokcancel("Start", f"ロボットが動きます。\n\n最適化対象:\n{moves}\n\n"
                                                f"T = {cfg['T']} s, T_FF = {cfg['T_ff']} s, "
                                                f"評価区間 {cfg_eval_time(cfg):g} s, "
                                                f"評価値 {ERR_NORM_LABELS[cfg['err_norm']]}, "
                                                f"基準試行 {cfg['n_ref']} 回, 最大試行数 {cfg['max_trials']}, "
-                                               f"A_max = {cfg['A_max']:g} PWM, Sampler {cfg['sampler']}\n\n開始しますか？"):
+                                               f"A_max = {amax_txt}, Sampler {cfg['sampler']}\n"
+                                               f"最適化の単位: {unit}\n\n開始しますか？"):
             return
         self.save_settings(cfg)
         self._launch(cfg)
@@ -2733,8 +3321,9 @@ class App:
         J_thr = self.run_obj.cfg.get('J_thr') if self.run_obj else None
         width = max(800, (self.g_width or 1400) - 20)
         self.g_pending_n = self.last_payload['n'] if self.last_payload else None
+        groups = (self.progress_info or {}).get('groups')
         self.graph_future = self.offload.preview.submit(render_preview, self.last_payload, list(self.hist),
-                                                        list(self.fig_dofs), J_thr, width, self.refs)
+                                                        list(self.fig_dofs), J_thr, width, self.refs, groups)
         self.graph_dirty = False
 
     def _progress_update(self):
@@ -2745,7 +3334,9 @@ class App:
                 self.p_image = tk.PhotoImage(data=base64.b64encode(png).decode('ascii'), format='png')
                 self.p_label.configure(image=self.p_image)
                 n_c = sum(1 for h in self.hist if h['state'] == 'COMPLETE')
-                self.p_note.configure(text=f"COMPLETE {n_c} 回までの J の推移（{time.strftime('%H:%M:%S')} に更新）")
+                ng = len((self.progress_info or {}).get('groups') or [])
+                self.p_note.configure(text=f"COMPLETE {n_c} 回までの J の推移（{time.strftime('%H:%M:%S')} に更新）"
+                                           + (f"。一番上が全体の J、その下がグループごと（{ng} 個）の J_g" if ng >= 2 else ''))
             except Exception as exc:
                 self.log(f"J過程の更新に失敗しました: {exc}")
             self.p_future = None

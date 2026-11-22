@@ -25,6 +25,11 @@ EL2 との出力の一致は test/test_optuna_ff_port.py で確かめる。
   （φ は単調なので φ(T) ≤ ε|ΔP|/|y0| と同値）の拘束付きで基準試行（FF=0）に当てはめる。
 ■ 失敗
   評価に失敗した試行は TrialState.FAIL（値なし）。原因・段階・ファイル名は tell の前に user_attrs に書く。
+■ 最適化の単位（グループ。2026-11-20 ユーザー指示）
+  対象の自由度をグループに分け、グループ g の評価値 J_g = グループ内の J_i の平均 をそれぞれ最小化する。
+  全自由度で1グループ（既定）なら従来とまったく同じ処理（記録用の study の Sampler が全変数を提案し、J を学ぶ）。
+  2グループ以上なら、グループごとの study（同じ journal に optuna_ff_g<k> として保存）が自分の変数だけを提案して J_g だけを学び、
+  提案をまとめて記録用の study（optuna_ff。全変数・J・J_i）に入れる。FAIL・近傍棄却・再投入・best は記録用の study で扱う。
 """
 import csv
 import hashlib
@@ -495,6 +500,9 @@ WN_MAX = 100.0                      # 目標軌道の ωn の上限 [rad/s]（DE
 FAIL_CLASSES = ('presend', 'tabu', 'unsafe', 'comm', 'sensor', 'eval', 'stopped', 'orphan', 'error')
 RETRY_CLASSES = ('comm', 'eval', 'stopped', 'orphan')      # 同じ u を1回だけ再投入する失敗
 NO_ROBOT_CLASSES = ('presend', 'tabu')                      # 実機を動かさない失敗
+GROUP_MODES = ('all', 'each', 'custom')     # 最適化の単位: 全体（1グループ）/ 自由度ごと / グループを指定（2026-11-20）
+N_STARTUP_MIN_GROUP = 20                    # 2グループ以上のときの、グループごとの n_startup の下限（変数が多いグループは 2D_g）
+NOT_COUNTED_SOURCES = ('past', 'final')     # 最大試行数・best に数えない試行（過去の試行・最後の組み合わせの測定）
 
 
 EVAL_MIN_S = 5.0            # 評価時間の固定値の既定 [s]（2026-10-23 ユーザー指示: 1.5T が5秒に満たなければ5秒評価する。
@@ -2502,11 +2510,109 @@ def _jsonable(v):
     return v
 
 
+# ==============================================================================
+# 最適化の単位（グループ）と自由度ごとの A_max（2026-11-20 ユーザー指示）
+# ==============================================================================
+def parse_groups(text, dofs):
+    """グループの入力 → [[DOF, ...], ...]（入力の順）。例 `0-5; 6,7,8; 9 10` → [[0..5], [6, 7, 8], [9, 10]]。
+    「;」でグループを区切り、グループの中は「,」か空白で区切る。「a-b」は a〜b。
+    対象の自由度がちょうど1回ずつ入っていなければ（重複・欠落・対象外・存在しない番号）ValueError"""
+    import re
+    want = [int(d) for d in dofs]
+    s = str(text or '').replace('；', ';').replace('、', ',').replace('，', ',')
+    s = re.sub(r'\s*[-−〜~]\s*', '-', s)
+    groups, where = [], {}
+    for part in s.split(';'):
+        tokens = [t for t in re.split(r'[,\s]+', part) if t]
+        if not tokens:
+            continue
+        g = []
+        for t in tokens:
+            m = re.fullmatch(r'(\d+)(?:-(\d+))?', t)
+            if m is None:
+                raise ValueError(f"グループの入力「{t}」を読めません（例: 0-5; 6,7,8; 9 10）")
+            a = int(m.group(1))
+            b = int(m.group(2)) if m.group(2) is not None else a
+            if b < a:
+                raise ValueError(f"グループの入力「{t}」の範囲が逆です")
+            for d in range(a, b + 1):
+                if not 0 <= d < N_DOF:
+                    raise ValueError(f"DOF {d} は存在しません（0〜{N_DOF - 1}）")
+                if d not in want:
+                    raise ValueError(f"DOF {d} は最適化の対象ではありません（対象: {want}）")
+                if d in g:
+                    raise ValueError(f"DOF {d} がグループ {len(groups)} の中に2回入っています")
+                if d in where:
+                    raise ValueError(f"DOF {d} が2回入っています（グループ {where[d]} と グループ {len(groups)}）")
+                g.append(d)
+        for d in g:
+            where[d] = len(groups)
+        groups.append(g)
+    if not groups:
+        raise ValueError("グループを入力してください（例: 0-5; 6,7,8; 9 10）")
+    miss = [d for d in want if d not in where]
+    if miss:
+        raise ValueError(f"どのグループにも入っていない対象の自由度があります: DOF {miss}")
+    return groups
+
+
+def resolve_groups(mode, text, dofs):
+    """最適化の単位 → グループの並び。'all' は全自由度で1グループ、'each' は自由度ごと、'custom' は入力どおり"""
+    dofs = [int(d) for d in dofs]
+    if mode == 'each':
+        return [[d] for d in dofs]
+    if mode == 'custom':
+        return parse_groups(text, dofs)
+    return [list(dofs)]
+
+
+def format_groups(groups):
+    """グループの並び → 入力と同じ書式の文字列（連続する番号は a-b）"""
+    out = []
+    for g in groups:
+        parts, i = [], 0
+        while i < len(g):
+            j = i
+            while j + 1 < len(g) and g[j + 1] == g[j] + 1:
+                j += 1
+            parts.append(f"{g[i]}-{g[j]}" if j - i >= 2 else ", ".join(str(x) for x in g[i:j + 1]))
+            i = j + 1
+        out.append(", ".join(parts))
+    return "; ".join(out)
+
+
+def group_mean(J_i, group):
+    """グループの評価値 J_g = グループ内の J_i の平均（J_i は {DOF: 値} か {'DOF': 値}）。欠けた・有限でない値があれば NaN"""
+    vals = []
+    for d in group:
+        v = (J_i or {}).get(str(d), (J_i or {}).get(d))
+        if v is None or not np.isfinite(float(v)):
+            return float('nan')
+        vals.append(float(v))
+    return float(np.mean(vals)) if vals else float('nan')
+
+
+def group_n_startup(n_prior, group):
+    """2グループ以上のときの、グループの n_startup = n_prior + max(20, 2 D_g)（D_g = 4 × グループの自由度の数）"""
+    return int(n_prior) + max(N_STARTUP_MIN_GROUP, 2 * 4 * len(group))
+
+
+def amax_of(A_max, d):
+    """自由度 d の A_max [PWM]。A_max は全自由度で共通の数値か {DOF: 値}"""
+    if isinstance(A_max, dict):
+        return float(A_max[d] if d in A_max else A_max[str(d)])
+    return float(A_max)
+
+
 class FFStudy:
-    """journal に保存する study と、失敗試行の管理（§6.7）・近傍棄却（§6.8）・確認試行（§5.5）"""
+    """journal に保存する study と、失敗試行の管理（§6.7）・近傍棄却（§6.8）・確認試行（§5.5）。
+
+    groups（2つ以上）を与えると、グループごとの study（同じ journal、名前 optuna_ff_g<k>）が自分の変数だけを提案し、
+    グループの評価値 J_g だけを学ぶ（2026-11-20）。記録用の study（optuna_ff）には今までどおり全変数・J・J_i を残し、
+    FAIL・近傍棄却・再投入・best はこれで扱う。groups が None（1グループ）なら従来と同じ処理"""
 
     def __init__(self, folder, dofs, A_max, sampler_name, seed, n_startup, ffmap, rho=0.05, tabu_on=True,
-                 resume=False, x0=None, log=print):
+                 resume=False, x0=None, log=print, groups=None, n_startup_groups=None):
         import optuna
         from optuna.storages import JournalStorage
         from optuna.storages.journal import JournalFileBackend
@@ -2514,21 +2620,26 @@ class FFStudy:
         self.optuna = optuna
         self.folder = folder
         self.dofs = list(dofs)
-        self.A_max = float(A_max)
+        self.A_max_d = {d: amax_of(A_max, d) for d in self.dofs}     # 自由度ごとの A_max（共通なら全部同じ値）
+        self.A_max = max(self.A_max_d.values()) if self.A_max_d else float(A_max)
         self.ffmap = ffmap
         self.rho = float(rho)
         self.tabu_on = bool(tabu_on)
         self.log = log
         self.sampler_name = sampler_name
         self.seed0 = int(seed)
-        self.n_startup = int(n_startup)
+        self.n_startup = int(n_startup) if n_startup is not None else 0
+        self.groups = [[int(d) for d in g] for g in groups] if groups is not None and len(groups) >= 2 else None
         self.dists = {}
         for d in self.dofs:
             for k in ('u1', 'u2', 'u3'):
                 self.dists[f'd{d}_{k}'] = optuna.distributions.FloatDistribution(0.0, 1.0)
-            self.dists[f'd{d}_A'] = optuna.distributions.FloatDistribution(-self.A_max, self.A_max)
+            self.dists[f'd{d}_A'] = optuna.distributions.FloatDistribution(-self.A_max_d[d], self.A_max_d[d])
         self.storage = JournalStorage(JournalFileBackend(os.path.join(folder, 'study.journal')))
-        if resume:
+        self.gstudies, self.gdists, self.gseeds, self._gtrials = [], [], [], {}
+        if self.groups is not None:
+            self._init_groups(resume, n_startup_groups, x0)
+        elif resume:
             probe = optuna.load_study(study_name=STUDY_NAME, storage=self.storage)
             n_c = len(probe.get_trials(deepcopy=False, states=(optuna.trial.TrialState.COMPLETE,)))
             self.seed = resume_seed(sampler_name, seed, n_c)
@@ -2541,6 +2652,47 @@ class FFStudy:
                                              direction='minimize')
         self.tabu = []
         self._rebuild_tabu()
+
+    def _init_groups(self, resume, n_startup_groups, x0):
+        """2グループ以上：記録用の study と、グループごとの study（seed は seed + グループ番号）を作る・読み込む。
+        記録用の study は提案に使わない（全変数を enqueue で渡す）ので、計算の軽い RandomSampler にする"""
+        optuna = self.optuna
+        TS = optuna.trial.TrialState
+        if n_startup_groups is None or len(n_startup_groups) != len(self.groups):
+            raise ValueError("グループごとの n_startup がありません")
+        self.n_startup_groups = [int(v) for v in n_startup_groups]
+        self.sampler = optuna.samplers.RandomSampler(seed=self.seed0)
+        if resume:
+            self.study = optuna.load_study(study_name=STUDY_NAME, storage=self.storage, sampler=self.sampler)
+        else:
+            self.study = optuna.create_study(study_name=STUDY_NAME, storage=self.storage, sampler=self.sampler,
+                                             direction='minimize')
+        args_all = []
+        for k, g in enumerate(self.groups):
+            names = [f'd{d}_{q}' for d in g for q in ('u1', 'u2', 'u3', 'A')]
+            gd = {p: self.dists[p] for p in names}
+            x0g = {p: x0[p] for p in names} if x0 else None
+            name = f'{STUDY_NAME}_g{k}'
+            if resume:
+                probe = optuna.load_study(study_name=name, storage=self.storage)
+                n_c = len(probe.get_trials(deepcopy=False, states=(TS.COMPLETE,)))
+                sd = resume_seed(self.sampler_name, self.seed0 + k, n_c)
+                smp, args = make_sampler(self.sampler_name, sd, self.n_startup_groups[k], x0g)
+                gs = optuna.load_study(study_name=name, storage=self.storage, sampler=smp)
+            else:
+                sd = self.seed0 + k
+                smp, args = make_sampler(self.sampler_name, sd, self.n_startup_groups[k], x0g)
+                gs = optuna.create_study(study_name=name, storage=self.storage, sampler=smp, direction='minimize')
+            self.gstudies.append(gs)
+            self.gdists.append(gd)
+            self.gseeds.append(sd)
+            args_all.append(args)
+        self.seed = self.gseeds[0]
+        self.sampler_args = {'groups': args_all}
+
+    def group_list(self):
+        """グループの並び（1グループなら [全自由度]）"""
+        return self.groups if self.groups is not None else [list(self.dofs)]
 
     # ---------------- 補助 ----------------
     def TS(self):
@@ -2556,8 +2708,9 @@ class FFStudy:
         return self.study.get_trials(deepcopy=False, states=states)
 
     def n_complete(self):
-        """実機で測った COMPLETE の数（最大試行数の判定に使う。過去の試行の add_trial（source='past'）は数えない）"""
-        return sum(1 for t in self.trials((self.TS().COMPLETE,)) if t.user_attrs.get('source') != 'past')
+        """実機で測った COMPLETE の数（最大試行数の判定に使う。過去の試行の add_trial（source='past'）と、
+        最後の組み合わせの測定（source='final'）は数えない）"""
+        return sum(1 for t in self.trials((self.TS().COMPLETE,)) if t.user_attrs.get('source') not in NOT_COUNTED_SOURCES)
 
     def _rebuild_tabu(self):
         self.tabu = []
@@ -2565,14 +2718,19 @@ class FFStudy:
             if t.user_attrs.get('fail_class') == 'unsafe' and t.params:
                 self.add_tabu(self.u_of(t.params))
 
+    def _normalized(self, d, u):
+        """タブーの距離に使う正規化（u1〜u3 はそのまま、A は (A + A_max)/(2 A_max)。A_max はその自由度の値）"""
+        Am = self.A_max_d[d]
+        return np.array([u['u1'], u['u2'], u['u3'], (u['A'] + Am) / (2.0 * Am)])
+
     def add_tabu(self, u):
-        self.tabu.append({d: self.ffmap.normalized(u[d]) for d in self.dofs})
+        self.tabu.append({d: self._normalized(d, u[d]) for d in self.dofs})
 
     def tabu_hit(self, u):
         """正規化した空間で、DOF ごとのユークリッド距離の最大値が ρ 以下の登録点があれば、その距離を返す"""
         if not self.tabu_on:
             return None
-        x = {d: self.ffmap.normalized(u[d]) for d in self.dofs}
+        x = {d: self._normalized(d, u[d]) for d in self.dofs}
         for p in self.tabu:
             dist = max(float(np.linalg.norm(x[d] - p[d])) for d in self.dofs)
             if dist <= self.rho:
@@ -2581,30 +2739,70 @@ class FFStudy:
 
     # ---------------- ask / tell ----------------
     def ask(self):
-        trial = self.study.ask(fixed_distributions=self.dists)
+        if self.groups is not None:
+            trial = self._ask_groups()
+        else:
+            trial = self.study.ask(fixed_distributions=self.dists)
         trial.set_user_attr('u', _jsonable(self.u_of(trial.params)))
         trial.set_user_attr('stage', 'presend')
+        return trial
+
+    def _ask_groups(self):
+        """2グループ以上：グループごとの study に提案させ、まとめて記録用の study に enqueue してから ask する。
+        事前の候補・再投入は全グループに同じものを入れてあるので、グループ 0 の試行の属性（source など）を記録用に写す"""
+        gts = [gs.ask(fixed_distributions=gd) for gs, gd in zip(self.gstudies, self.gdists)]
+        params = {}
+        for gt in gts:
+            params.update(gt.params)
+        ua = {k: v for k, v in gts[0].user_attrs.items() if k != 'main_trial'}
+        self.study.enqueue_trial(params, user_attrs=ua)
+        trial = self.study.ask(fixed_distributions=self.dists)
+        bad = [p for p, v in params.items() if abs(float(trial.params[p]) - float(v)) > 1e-12]
+        if bad:
+            raise RuntimeError(f"記録用の study の試行 {trial.number} がグループの提案と一致しません: {bad[:4]}")
+        for gt in gts:
+            gt.set_user_attr('main_trial', trial.number)
+        self._gtrials[trial.number] = gts
         return trial
 
     def stage(self, trial, stage):
         trial.set_user_attr('stage', stage)
 
+    def group_values(self, J_i):
+        """グループごとの評価値 J_g（グループ内の J_i の平均）"""
+        return [group_mean(J_i, g) for g in self.group_list()]
+
     def tell_complete(self, trial, J, attrs):
+        gts = self._gtrials.pop(trial.number, None)
+        J_g = None
+        if self.groups is not None:
+            J_g = self.group_values(attrs.get('J_i'))
+            attrs = dict(attrs, J_g=J_g)
         for k, v in attrs.items():
             trial.set_user_attr(k, _jsonable(v))
         trial.set_user_attr('J', float(J))
         trial.set_user_attr('stage', 'done')
         self.study.tell(trial, math.log10(max(float(J), 1e-12)))
+        if gts is not None:
+            for gs, gt, v in zip(self.gstudies, gts, J_g):
+                if np.isfinite(v):
+                    gs.tell(gt, math.log10(max(float(v), 1e-12)))
+                else:
+                    gs.tell(gt, state=self.TS().FAIL)
 
     def tell_fail(self, trial, fail_class, reason, attrs=None):
-        """失敗（§6.7）。属性を先に書いてから tell(state=FAIL)（値は渡さない）"""
+        """失敗（§6.7）。属性を先に書いてから tell(state=FAIL)（値は渡さない）。2グループ以上なら全グループにも FAIL を返す"""
         assert fail_class in FAIL_CLASSES
+        gts = self._gtrials.pop(trial.number, None)
         trial.set_user_attr('fail_stage', trial.user_attrs.get('stage', ''))
         for k, v in (attrs or {}).items():
             trial.set_user_attr(k, _jsonable(v))
         trial.set_user_attr('fail_class', fail_class)
         trial.set_user_attr('fail_reason', str(reason)[:2000])
         self.study.tell(trial, state=self.TS().FAIL)
+        if gts is not None:
+            for gs, gt in zip(self.gstudies, gts):
+                gs.tell(gt, state=self.TS().FAIL)
         if fail_class == 'unsafe':
             self.add_tabu(self.u_of(trial.params))
 
@@ -2623,14 +2821,30 @@ class FFStudy:
         return self.trials()[-1]
 
     def enqueue(self, u, attrs):
+        if self.groups is not None:
+            self._enqueue_groups(self.params_of(u), attrs)
+            return
         self.study.enqueue_trial(self.params_of(u), user_attrs={k: _jsonable(v) for k, v in attrs.items()})
+
+    def _enqueue_groups(self, params, attrs):
+        """2グループ以上：同じ候補を、全グループの study に自分の変数だけ enqueue する（次の ask でそろって出てくる）"""
+        ua = {k: _jsonable(v) for k, v in attrs.items()}
+        for gs, gd in zip(self.gstudies, self.gdists):
+            gs.enqueue_trial({p: float(params[p]) for p in gd}, user_attrs=dict(ua))
 
     def add_past(self, u, J, attrs):
         ua = {k: _jsonable(v) for k, v in attrs.items()}
         ua['J'] = float(J)
         ua['source'] = 'past'
-        self.study.add_trial(self.optuna.trial.create_trial(params=self.params_of(u), distributions=self.dists,
+        params = self.params_of(u)
+        self.study.add_trial(self.optuna.trial.create_trial(params=params, distributions=self.dists,
                                                             value=math.log10(max(float(J), 1e-12)), user_attrs=ua))
+        if self.groups is not None:                       # グループの study にも、その J_g を学習データとして入れる
+            for gs, gd, v in zip(self.gstudies, self.gdists, self.group_values(attrs.get('J_i'))):
+                if np.isfinite(v):
+                    gs.add_trial(self.optuna.trial.create_trial(
+                        params={p: params[p] for p in gd}, distributions=gd, value=math.log10(max(float(v), 1e-12)),
+                        user_attrs={'source': 'past', 'past_file': ua.get('past_file')}))
 
     # ---------------- 再投入（同じ u を1回だけ） ----------------
     def retry(self, frozen, reason):
@@ -2638,10 +2852,15 @@ class FFStudy:
             return False
         if frozen.user_attrs.get('retry_of') is not None:
             return False                                  # 再投入した試行が再び失敗したら、もう入れない
+        if frozen.user_attrs.get('source') == 'final':
+            return False                                  # 最後の組み合わせの測定は探索の試行ではない
         done = set(self.study.user_attrs.get('retried', []))
         if frozen.number in done:
             return False
-        self.study.enqueue_trial(dict(frozen.params), user_attrs={'retry_of': frozen.number, 'source': 'retry'})
+        if self.groups is not None:
+            self._enqueue_groups(dict(frozen.params), {'retry_of': frozen.number, 'source': 'retry'})
+        else:
+            self.study.enqueue_trial(dict(frozen.params), user_attrs={'retry_of': frozen.number, 'source': 'retry'})
         done.add(frozen.number)
         self.study.set_user_attr('retried', sorted(done))
         self.log(f"  試行 {frozen.number} と同じ u を再投入しました（{reason}）")
@@ -2657,10 +2876,31 @@ class FFStudy:
             tr.set_user_attr('fail_reason', '異常終了で RUNNING のまま残っていた')
             self.study.tell(t.number, state=self.TS().FAIL)
             n += 1
+        if self.groups is not None:
+            self._repair_groups()
         for t in self.trials((self.TS().FAIL,)):
             if t.user_attrs.get('fail_class') in ('orphan', 'stopped', 'comm'):
                 self.retry(t, f"再開時（{t.user_attrs.get('fail_class')}）")
         return n
+
+    def _repair_groups(self):
+        """再開時（2グループ以上）：グループの study に RUNNING のまま残った試行を片付ける。対応する記録用の試行が
+        COMPLETE ならその J_g を返し（記録用への tell の後で止まった場合）、そうでなければ FAIL にする"""
+        TS = self.TS()
+        main = {t.number: t for t in self.trials()}
+        n_fix = 0
+        for gs, g in zip(self.gstudies, self.groups):
+            for t in gs.get_trials(deepcopy=False, states=(TS.RUNNING,)):
+                mt = main.get(t.user_attrs.get('main_trial'))
+                v = group_mean(mt.user_attrs.get('J_i'), g) if mt is not None and mt.state == TS.COMPLETE \
+                    else float('nan')
+                if np.isfinite(v):
+                    gs.tell(t.number, math.log10(max(float(v), 1e-12)))
+                else:
+                    gs.tell(t.number, state=TS.FAIL)
+                n_fix += 1
+        if n_fix:
+            self.log(f"  グループの study に残っていた途中の試行 {n_fix} 個を片付けました")
 
     # ---------------- 結果 ----------------
     def completed(self):
@@ -2668,6 +2908,33 @@ class FFStudy:
 
     def best(self):
         """COMPLETE で J を持つ試行の中で J が最小のもの（FAIL は構造的に入らない）。
-        過去の試行（source='past'）は測定データがこの保存先にないので除く"""
-        done = [t for t in self.completed() if t.user_attrs.get('source') != 'past']
+        過去の試行（source='past'）は測定データがこの保存先にないので除く。最後の組み合わせの測定（source='final'）も除く"""
+        done = [t for t in self.completed() if t.user_attrs.get('source') not in NOT_COUNTED_SOURCES]
         return min(done, key=lambda t: t.user_attrs['J']) if done else None
+
+    def group_bests(self):
+        """グループごとの best: [(試行, J_g), ...]。記録用の study の COMPLETE で J_i を持つ試行のうち J_g が最小のもの
+        （過去の試行・最後の組み合わせの測定は除く）。試行がなければ (None, nan)"""
+        done = [t for t in self.completed() if t.user_attrs.get('source') not in NOT_COUNTED_SOURCES
+                and t.user_attrs.get('J_i')]
+        out = []
+        for g in self.group_list():
+            best, bv = None, float('inf')
+            for t in done:
+                v = group_mean(t.user_attrs['J_i'], g)
+                if np.isfinite(v) and v < bv:
+                    best, bv = t, v
+            out.append((best, bv if best is not None else float('nan')))
+        return out
+
+    def combo_u(self, bests=None):
+        """グループごとの best を組み合わせた u（best のないグループがあれば None）"""
+        bests = self.group_bests() if bests is None else bests
+        u = {}
+        for g, (t, _v) in zip(self.group_list(), bests):
+            if t is None:
+                return None
+            tu = self.u_of(t.params)
+            for d in g:
+                u[d] = tu[d]
+        return u
