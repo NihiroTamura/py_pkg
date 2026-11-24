@@ -12,7 +12,7 @@ EL2 との出力の一致は test/test_optuna_ff_port.py で確かめる。
   目標値のエコーが新しい値になった配信を j0 として t_j = (j − j0)·0.010 [s] とする。
   配信値は直近に終わった制御周回の値（0〜11 ms 古い）。PWM・z1・z2・z3 は POT よりさらに1周回古い。
 ■ 2つの時間（2026-11-04 に分けた。それまでは同じ値）
-  動作完了時間 T  … 目標軌道（T までに目標値の ±ε に入る）と、評価区間 max(1.5T, 評価時間の固定値) に使う。
+  動作完了時間 T  … 目標軌道（T ちょうどに目標値の ±ε に入る）と、評価区間 max(1.5T, 評価時間の固定値) に使う。
   FF 入力時間 T_FF … FF を与える時間。写像・係数・送信前の検証・送信する [a,b,c,d,e,T]・ファームの再現に使う。
   FF の関数（quintic_from_extrema・ff_eval・extrema_of・presend_check・firmware_ff・FFMap.design・send_ff など）の
   引数 T には T_FF を渡す（移植した関数なので引数名は T のまま）。
@@ -21,8 +21,10 @@ EL2 との出力の一致は test/test_optuna_ff_port.py で確かめる。
   → 極値 (s1·T_FF, y1), (s2·T_FF, y2) → f(t) = a t⁵ + b t⁴ + c t³ + d t² + e t（f(0) = f(T_FF) = 0）
   ファーム（.ino:1207-1246）は t = (millis() − t_start)/1000 [s] で、t ≥ T_FF では 0。
 ■ 目標軌道（study の前に1回だけ作って固定する。数列も全試行で同一）
-  ζ=1 の3次遅れ (T1 s+1)(s+ωn)² の自由応答 y0·φ(t) を、「T までに |y| ≤ ε|ΔP| に入り以後も維持」
-  （φ は単調なので φ(T) ≤ ε|ΔP|/|y0| と同値）の拘束付きで基準試行（FF=0）に当てはめる。
+  臨界減衰の3次遅れ（3重極 (s+ωn)³）の自由応答 y0·φ(t) が、T ちょうどに |y| ≤ ε|ΔP| の帯に入り以後も維持する
+  （φ は単調なので φ(T) = ε|ΔP|/|y0|）ように ωn を決める。基準試行（FF=0）から取るのは始点 y0 だけ（2026-11-24 ユーザー指示。
+  それまでは ζ=1 の3次遅れ (T1 s+1)(s+ωn)² を「T までに入る」拘束付きで当てはめ、基準が T より速い自由度は自由フィットの
+  ままだった。再開時は保存した target.json を使うので、以前の study の目標軌道は変わらない）。
 ■ 失敗
   評価に失敗した試行は TrialState.FAIL（値なし）。原因・段階・ファイル名は tell の前に user_attrs に書く。
 ■ 最適化の単位（グループ。2026-11-20 ユーザー指示）
@@ -495,7 +497,8 @@ STUDY_NAME = 'optuna_ff'
 MAP_VERSION = 'case4-v2-exact'      # 写像の版（条件 hash に入る）
 R_MIN, R_MAX = 1e-3, 1e3            # 高さの比 r = −y2/y1 の探索範囲
 A_MIN = 1.0                         # |A| の下限 [PWM]（A = 0 は極値が0個になるので、|A| < 1 は ±1 に寄せる）
-XI_CAP = math.log(10.0)             # 目標軌道の完了を T/10 より早くはしない（ξ ≤ ln 10）
+XI_CAP = math.log(10.0)             # 2026-11-24 より前の規則で、目標軌道の完了を T/10 より早くはしなかった（ξ ≤ ln 10）。
+                                    # 今の規則では使わないが、以前の study を再開できるように条件 hash には残す
 WN_MAX = 100.0                      # 目標軌道の ωn の上限 [rad/s]（DEFAULT_ID_BOUNDS の tgt_wn と同じ）
 FAIL_CLASSES = ('presend', 'tabu', 'unsafe', 'comm', 'sensor', 'eval', 'stopped', 'orphan', 'error')
 RETRY_CLASSES = ('comm', 'eval', 'stopped', 'orphan')      # 同じ u を1回だけ再投入する失敗
@@ -976,6 +979,7 @@ class TargetSpec:
     J_noise: float = float('nan')
     J_quant: float = float('nan')
     J_ref: list = field(default_factory=list)
+    rule: str = ''          # 目標軌道の決め方（TARGET_RULE。2026-11-24 より前の target.json にはないので ''）
 
     @property
     def dP(self):
@@ -1018,8 +1022,22 @@ def _fit_free_multi(ys, ms, y0, dt, bounds):
     return (float(np.exp(best.x[0])), float(np.exp(best.x[1])))
 
 
+TARGET_RULE = 'triple_pole_at_T'
+TARGET_RULE_LABEL = {
+    TARGET_RULE: '臨界減衰の3次遅れ（3重極 κ = 1）が T ちょうどに ±ε|ΔP| の帯に入る（2026-11-24 から）',
+    '': 'T までに ±ε|ΔP| の帯に入る拘束付きの当てはめ（基準が T より速い自由度は自由フィット。2026-11-24 より前）',
+}
+
+
 def fit_target_constrained(dof, ys, valids, P0s, Pi, Pf, T, eps, bounds=None, dt=TICK_DT, log=None):
-    """基準試行（y = P − Pf, j − j0 = 0..N_e）に、完了拘束 φ(T) ≤ ε_eff 付きで ζ=1 の3次遅れ系を当てはめる（計画書 §4）"""
+    """基準試行（y = P − Pf, j − j0 = 0..N_e）から目標軌道を作る（計画書 §4 を 2026-11-24 のユーザー指示で変更）。
+
+    目標軌道は臨界減衰の3次遅れ（3重極 (s+ωn)³。κ = T1·ωn = 1）の自由応答 y0·φ(t) で、T ちょうどに |y| ≤ ε|ΔP| の帯に
+    入る（φ は単調なので φ(T) = ε_eff）ように ωn = θ(1, ε_eff)/T、T1 = 1/ωn とする。基準試行から取るのは始点 y0
+    （静止位置 P0_ref − Pf）だけ。変更前は「T までに入る」拘束付きの当てはめで、基準が T より速い自由度は自由フィットの
+    まま（T より早く完了する目標軌道）になっていた。
+    自由フィットは比べるための記録（free_T1・free_wn・free_t_eps）と警告にだけ使う。
+    始点がすでに帯の中（ε_eff ≥ 1）のときは、どの ωn でも t = 0 で帯の中なので、従来どおり自由フィットにして警告する"""
     bounds = bounds or DEFAULT_ID_BOUNDS
     ys = [np.asarray(y, dtype=float) for y in ys]
     ms = [np.asarray(v, dtype=bool) & np.isfinite(y) for y, v in zip(ys, valids)]
@@ -1030,7 +1048,6 @@ def fit_target_constrained(dof, ys, valids, P0s, Pi, Pf, T, eps, bounds=None, dt
     if dP == 0.0 or y0 == 0.0:
         raise ValueError(f"DOF {dof}: ΔP または y0 が 0 なので目標軌道を作れません")
     eps_eff = float(eps) * abs(dP) / abs(y0)
-    n_res = int(sum(m.sum() for m in ms))
     warnings = []
 
     def resid(T1, wn):
@@ -1053,78 +1070,25 @@ def fit_target_constrained(dof, ys, valids, P0s, Pi, Pf, T, eps, bounds=None, dt
         T1f, wnf = _fit_free_multi(ys, ms, y0, dt, bounds)
     t_meas = [measured_completion(y, m, eps * abs(dP), dt) for y, m in zip(ys, ms)]
     common = dict(dof=dof, Pi=float(Pi), Pf=float(Pf), T=float(T), eps=float(eps), N_e=N, dt=dt, y0_ref=y0,
-                  P0_ref=P0_ref, eps_eff=eps_eff, free_T1=T1f, free_wn=wnf, t_eps_meas=t_meas, n_runs=len(ys))
+                  P0_ref=P0_ref, eps_eff=eps_eff, free_T1=T1f, free_wn=wnf, t_eps_meas=t_meas, n_runs=len(ys),
+                  rule=TARGET_RULE)
     if eps_eff >= 1.0:
         warnings.append(f"始点がすでに許容帯の中（ε_eff = {eps_eff:.3g} ≥ 1）なので拘束なし（自由フィット）にしました")
         return TargetSpec(T1=T1f, wn=wnf, kappa=T1f * wnf, xi=float('nan'), theta=0.0, active=False, method='free',
                           cost=cost(T1f, wnf), free_t_eps=0.0, warnings=warnings, **common)
     t_free = completion_time(T1f, wnf, eps_eff)
-    if t_free <= T:
-        warnings.append(f"基準の応答（自由フィット）がすでに T 以内に完了しています（{t_free:.3f} s ≤ T = {T:g} s）。"
-                        f"拘束は効かず、FF で改善できる余地は小さいと考えられます")
-        th = completion_theta(T1f * wnf, eps_eff)
-        return TargetSpec(T1=T1f, wn=wnf, kappa=T1f * wnf, xi=float(np.log(wnf * T / th)) if th > 0 else float('nan'),
-                          theta=th, active=False, method='free', cost=cost(T1f, wnf), free_t_eps=t_free,
-                          warnings=warnings, **common)
-
-    cands = []
-    # 3. 境界 ξ = 0（ωn = θ(κ)/T）上の1次元探索：log κ の121点格子 → 有界 Brent 法
-    def bnd_cost(lk):
-        kappa = math.exp(lk)
-        th = completion_theta(kappa, eps_eff)
-        wn = th / T
-        T1 = kappa / wn
-        return cost(T1, wn) if in_bounds(T1, wn) else float('inf')
-
-    grid = np.linspace(math.log(1e-3), math.log(1e3), 121)
-    gc = np.array([bnd_cost(lk) for lk in grid])
-    if np.isfinite(gc).any():
-        i = int(np.nanargmin(gc))
-        a, b = grid[max(i - 1, 0)], grid[min(i + 1, len(grid) - 1)]
-        r = scipy.optimize.minimize_scalar(bnd_cost, bounds=(a, b), method='bounded', options={'xatol': 1e-7})
-        lk = float(r.x) if np.isfinite(r.fun) and r.fun <= gc[i] else float(grid[i])
-        kappa = math.exp(lk)
-        th = completion_theta(kappa, eps_eff)
-        cands.append((bnd_cost(lk), kappa, 0.0, th, 'boundary'))
-
-    # 4. (log κ, σ) の箱付き least_squares（ξ = σ·ξ_max(κ)、ξ_max = min(ln 10, ln(ωn_max T/θ))）を多点から
-    def unpack(q):
-        kappa = math.exp(q[0])
-        th = completion_theta(kappa, eps_eff)
-        xmax = min(XI_CAP, math.log(WN_MAX * T / th))
-        if xmax < 0:
-            return None
-        xi = float(q[1]) * xmax
-        wn = th / T * math.exp(xi)
-        T1 = kappa / wn
-        return (kappa, xi, th, T1, wn) if in_bounds(T1, wn) else None
-
-    def resid2(q):
-        u = unpack(q)
-        return resid(u[3], u[4]) if u is not None else np.full(n_res, 1e3)
-
-    lo_b, hi_b = [math.log(1e-3), 0.0], [math.log(1e3), 1.0]
-    for k0 in (0.03, 0.1, 0.3, 1.0, 3.0, 10.0, 30.0):
-        for s0 in (0.0, 0.3, 0.7):
-            try:
-                r = scipy.optimize.least_squares(resid2, [math.log(k0), s0], bounds=(lo_b, hi_b), method='trf',
-                                                 x_scale='jac')
-            except Exception:
-                continue
-            u = unpack(r.x)
-            if u is not None:
-                cands.append((cost(u[3], u[4]), u[0], u[1], u[2], 'interior'))
-    cands = [c for c in cands if np.isfinite(c[0])]
-    if not cands:
-        raise ValueError(f"DOF {dof}: 拘束を満たす目標軌道が見つかりません（T・ε・上下限を見直してください）")
-    c_best = min(cands, key=lambda c: c[0])
-    _cst, kappa, xi, th, how = c_best
-    wn = th / T * math.exp(xi)
-    T1 = kappa / wn
-    if abs(kappa - 1.0) < 0.02:
-        warnings.append("拘束付きフィットは κ ≈ 1（3重極）になりました。基準が T より遅いとき、T に完了する族の中で"
-                        "3重極がすべての時刻で最も緩やかなので、実測の形によらずこの解になります（仕様どおり）")
-    return TargetSpec(T1=T1, wn=wn, kappa=kappa, xi=xi, theta=th, active=True, method=how, cost=cost(T1, wn),
+    # 2. 臨界減衰の3次遅れ（3重極）を T ちょうどに完了させる：φ(T; κ=1, ωn) = ε_eff ⇔ ωn·T = θ(1, ε_eff)
+    th = completion_theta(1.0, eps_eff)
+    wn = th / float(T)
+    T1 = 1.0 / wn
+    if not in_bounds(T1, wn):
+        raise ValueError(f"DOF {dof}: T = {T:g} s で完了する3重極の ωn = {wn:.4g} rad/s・T1 = {T1:.4g} s が上下限"
+                         f"（ωn ≤ {WN_MAX:g}、T1 ∈ [{bounds['tgt_T1'][0]:g}, {bounds['tgt_T1'][1]:g}]）の外なので"
+                         f"目標軌道を作れません（T を見直してください）")
+    if t_free < T:
+        warnings.append(f"基準の応答（自由フィット）は T より早く完了しています（{t_free:.3f} s < T = {T:g} s）。"
+                        f"目標軌道は T ちょうどに完了するので、この自由度は FF で応答を遅らせる必要があります")
+    return TargetSpec(T1=T1, wn=wn, kappa=1.0, xi=0.0, theta=th, active=True, method='triple_T', cost=cost(T1, wn),
                       free_t_eps=t_free, warnings=warnings, **common)
 
 

@@ -138,22 +138,45 @@ def test_theta_monotone_and_large_kappa():
     assert c.completion_theta(1.0, 1.5) == 0.0                        # ε_eff ≥ 1
 
 
-def test_constrained_fit_active():
+def _check_triple_at_T(sp, T, band):
+    """3重極（κ = 1）で、T ちょうどに許容帯に入り（T の1配信前は帯の外）、以後は帯の中"""
+    assert sp.active and sp.method == 'triple_T' and sp.rule == c.TARGET_RULE
+    assert sp.kappa == 1.0 and abs(sp.T1 * sp.wn - 1.0) < 1e-12
+    assert abs(c.completion_time(sp.T1, sp.wn, sp.eps_eff) - T) < 1e-6 * T
+    seq = sp.seq() - sp.Pf
+    k = int(round(T / c.TICK_DT))
+    assert np.all(np.abs(seq[k:]) <= band + 1e-9)                    # T 以後は許容帯の中
+    assert abs(seq[k - 1]) > band                                     # T の直前はまだ帯の外（T より早く完了しない）
+
+
+def test_target_triple_pole_at_T_slow_reference():
+    """基準が T より遅い：3重極で T ちょうどに完了（2026-11-24 の規則）"""
     T = 1.0
     ys = [_synthetic(0.25, 6.0, -100.0, T, seed=s) for s in range(2)]
     sp = c.fit_target_constrained(0, ys, [np.isfinite(y) for y in ys], [200.0, 200.0], 200.0, 300.0, T, 0.02)
-    assert sp.active
-    assert c.completion_time(sp.T1, sp.wn, sp.eps_eff) <= T * (1 + 1e-6)
-    seq = sp.seq() - sp.Pf
-    k = int(np.ceil(T / c.TICK_DT))
-    assert np.all(np.abs(seq[k:]) <= 0.02 * 100.0 + 1e-9)            # T 以後は許容帯の中
+    assert sp.free_t_eps > T
+    _check_triple_at_T(sp, T, 0.02 * 100.0)
 
 
-def test_constrained_fit_inactive():
+def test_target_triple_pole_at_T_fast_reference():
+    """基準が T より速い：自由フィットではなく、3重極で T ちょうどに完了し、FF で遅らせる必要がある旨を警告する"""
     T = 2.0
     ys = [_synthetic(0.05, 12.0, -100.0, T)]
     sp = c.fit_target_constrained(0, ys, [np.isfinite(ys[0])], [200.0], 200.0, 300.0, T, 0.02)
-    assert not sp.active and sp.method == 'free' and sp.warnings
+    assert sp.free_t_eps < T and any('遅らせる' in w for w in sp.warnings)
+    _check_triple_at_T(sp, T, 0.02 * 100.0)
+
+
+def test_target_triple_pole_T_too_short():
+    """T が短すぎて3重極の ωn が上限 WN_MAX を超えるときは目標軌道を作らない"""
+    T = 0.05
+    ys = [_synthetic(0.05, 12.0, -100.0, T)]
+    try:
+        c.fit_target_constrained(0, ys, [np.isfinite(ys[0])], [200.0], 200.0, 300.0, T, 0.02)
+    except ValueError as exc:
+        assert 'ωn' in str(exc)
+    else:
+        raise AssertionError('ValueError が出ない')
 
 
 def test_constrained_fit_eps_eff_ge_1():

@@ -3,12 +3,13 @@
 Optuna で5次関数FF（a t⁵ + b t⁴ + c t³ + d t² + e t, 0 ≤ t < T_FF）を実機試行により探索するプログラム（GUI）
 
 <時間>（2026-11-04 に T と T_FF を分け、評価時間の固定値 E を GUI で変えられるようにした。それまでは T_FF = T, E = 5 秒）
-  動作完了時間 T    … 目標軌道（T までに目標値の ±ε に入る）と評価区間 max(1.5T, E) に使う。
+  動作完了時間 T    … 目標軌道（T ちょうどに目標値の ±ε に入る）と評価区間 max(1.5T, E) に使う。
   FF 入力時間 T_FF  … FF を与える時間（写像・係数・送信前の検証・ファームへ送る T）。T_FF ≤ max(1.5T, E)。
 <処理の流れ>（計画書 第4版, 2026-10-23）
   1. 基準試行：FF=0（ADRC のみ）で目標値を送り、評価区間 max(1.5T, E) のあいだ記録する（回数は GUI で指定、既定 2）。
      終わるたびに FF を2段で止め（T=0 → 係数0）、静止を待ってから初期姿勢へ戻し、待機時間だけ待つ。
-  2. 目標軌道：基準試行に ζ=1 の3次遅れ系を「T までに |y| ≤ ε|ΔP| に入り以後も維持」の拘束付きで当てはめ、固定する。
+  2. 目標軌道：臨界減衰の3次遅れ（3重極）を、T ちょうどに |y| ≤ ε|ΔP| の帯に入り以後も維持するように作り、固定する
+     （始点は基準試行の静止位置。2026-11-24 から。それまでは「T までに入る」拘束付きの当てはめ）。
   3. Optuna：u = (u1,u2,u3,A)（自由度ごと）を選ぶ → 写像で FF（0 ≤ t < T_FF）を作る → float32 でファームの計算を再現して
      検証 → 近傍棄却 → 実機で max(1.5T, E) 測定 → J = mean_i mean((POT − 目標軌道)/ΔP)² を tell（log10 J）。
      J ≤ 閾値なら同じ FF で確認試行をし、2回の平均も閾値以下なら終了する。
@@ -1583,13 +1584,13 @@ class OptimizationRun:
             ys = [m.series[d].pot[m.series[d].win()] - m.series[d].Pf for m in refs]
             vs = [np.isfinite(y) for y in ys]
             ys_by[d], vs_by[d] = ys, vs
-            log(f"  DOF {d}: 目標軌道を当てはめています…")
+            log(f"  DOF {d}: 目標軌道を作っています…")
             sp = self._compute(c.fit_target_constrained, d, ys, vs, [m.series[d].P0 for m in refs], cfg['initial'][d],
                                cfg['target'][d], T, cfg['eps'])
             self.targets[d] = sp
-            log(f"  DOF {d}: 目標軌道 T1 = {sp.T1:.4f} s, ωn = {sp.wn:.3f} rad/s, κ = {sp.kappa:.3f}, "
-                f"拘束 {'あり' if sp.active else 'なし'}（{sp.method}）, フィット誤差 {sp.cost:.3g}, "
-                f"自由フィットの完了 {sp.free_t_eps:.3f} s, 実測の完了 {sp.t_eps_meas}")
+            log(f"  DOF {d}: 目標軌道（{sp.method}）T1 = {sp.T1:.4f} s, ωn = {sp.wn:.3f} rad/s, κ = {sp.kappa:.3f}, "
+                f"完了 {c.completion_time(sp.T1, sp.wn, sp.eps_eff) if sp.eps_eff < 1.0 else 0.0:.3f} s, "
+                f"基準との誤差 {sp.cost:.3g}, 自由フィットの完了 {sp.free_t_eps:.3f} s, 実測の完了 {sp.t_eps_meas}")
             for w in sp.warnings:
                 log(f"  DOF {d}: 警告: {w}")
         J_refs = []
@@ -2351,7 +2352,7 @@ class OptimizationRun:
             ('実行', 'プログラム', 'optimize_optuna_ff_ROS2.py', '計算は optuna_ff_common.py'),
             ('実行', 'ライブラリ', f"python {sys.version.split()[0]}, numpy {np.__version__}, scipy {scipy.__version__}, "
                                f"optuna {optuna.__version__}, cmaes {cm}, matplotlib {matplotlib.__version__}", ''),
-            ('時間', 'T', cfg['T'], '動作完了時間 [s]（目標軌道は T までに目標値の ±ε に入る。評価区間にも使う）'),
+            ('時間', 'T', cfg['T'], '動作完了時間 [s]（目標軌道は T ちょうどに目標値の ±ε に入る。評価区間にも使う）'),
             ('時間', 'T_FF', cfg_T_ff(cfg), 'FF 入力時間 [s]（FF は 0 ≤ t < T_FF。ファームへ送る T）'),
             ('時間', '評価時間の固定値 E', cfg_eval_min(cfg), '[s]'),
             ('時間', '評価区間', cfg_eval_time(cfg), f'max(1.5T, {cfg_eval_min(cfg):g} s) [s]'),
@@ -2363,8 +2364,11 @@ class OptimizationRun:
             ('写像', 'r の余裕 / 範囲', f"1.01 / [{c.R_MIN:g}, {c.R_MAX:g}]", 'r = −y2/y1'),
             ('写像', 'A_max / |A| の下限', f"{cfg['A_max']} / {c.A_MIN}",
              '[PWM]' if not cfg.get('A_max_per_dof') else '[PWM]（A_max は自由度ごと。下の行）'),
-            ('目標軌道', 'ε', cfg['eps'], '完了: t ≥ T で |y| ≤ ε|ΔP|'),
-            ('目標軌道', 'ξ の上限 / ωn の上限', f"{c.XI_CAP:.6g} / {c.WN_MAX:g}", 'ξ ≤ ln 10'),
+            ('目標軌道', '決め方', '; '.join(sorted({c.TARGET_RULE_LABEL.get(sp.rule, sp.rule)
+                                                    for sp in self.targets.values()})), 'rule'),
+            ('目標軌道', 'ε', cfg['eps'], '完了: t ≥ T で |y| ≤ ε|ΔP|（T ちょうどに帯に入る）'),
+            ('目標軌道', 'ξ の上限 / ωn の上限', f"{c.XI_CAP:.6g} / {c.WN_MAX:g}",
+             'ξ ≤ ln 10 は 2026-11-24 より前の規則だけで使う（条件 hash の互換のため記録）'),
             ('評価', '累積誤差', 'J_i = mean((POT − Target)/ΔP)²' if cfg_err_norm(cfg) == 'dP'
              else 'J_i = mean(POT − Target)² [count²]', 'J = 対象自由度の平均'),
             ('評価', '評価値の正規化', cfg_err_norm(cfg),
@@ -2407,7 +2411,8 @@ class OptimizationRun:
                 rows.append(('写像', f'A_max DOF {d}', self.amax[d], '[PWM]（自由度ごと）'))
             if sp is not None:
                 rows.append(('目標軌道', f'DOF {d}', f"T1={sp.T1:.6g} wn={sp.wn:.6g} kappa={sp.kappa:.6g} xi={sp.xi:.6g} "
-                                                     f"active={sp.active} method={sp.method} cost={sp.cost:.6g}",
+                                                     f"active={sp.active} method={sp.method} cost={sp.cost:.6g} "
+                                                     f"rule={sp.rule or 'before_20261124'}",
                              f"y0_ref={sp.y0_ref:.6g} P0_ref={sp.P0_ref:.6g} eps_eff={sp.eps_eff:.6g} "
                              f"t_eps_meas={sp.t_eps_meas}"))
             adrc = (meta.get('cond') or {}).get('adrc', {}).get(str(d))
@@ -2728,7 +2733,7 @@ class App:
         self.basic.add('rms_thr', "終了閾値 RMS [% of ΔP]", s.get('rms_thr', 1.0), note="J_thr = (RMS/100)²（1% → 1e−4）")
         self.norm_var.trace_add('write', lambda *a: self._norm_changed())
         self._norm_changed()
-        self.basic.add('eps', "完了の許容 ε [% of ΔP]", s.get('eps', 2.0), note="目標軌道は t ≥ T で |y| ≤ ε|ΔP|")
+        self.basic.add('eps', "完了の許容 ε [% of ΔP]", s.get('eps', 2.0), note="目標軌道（3重極）は T ちょうどに |y| ≤ ε|ΔP| に入る")
         self.basic.add('A_max', "FF の振幅の上限 A_max [PWM]", s.get('A_max', 255.0), note="≤ 255。最初の実機確認では小さく")
         self.amax_var = tk.BooleanVar(value=bool(s.get('A_max_per_dof', False)))      # 2026-11-20
         ttk.Checkbutton(self.basic.frame, text="A_max を自由度ごとに指定する（下の表。外すと全自由度で上の値）",
